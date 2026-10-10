@@ -1,0 +1,75 @@
+# Kenwood XS8 interface: working engineering specification
+
+**Scope.** This documents the observed Kenwood KR-V6070 receiver and connected CD changer, and the working Arduino Micro transmitter. It is an implementation reference for this setup, not a complete or universal XS8 protocol definition. “Observed” means either an archived waveform or a reported bench response; where only a note survives, that limit is stated. See the [command registry](../research/COMMAND_REGISTRY.md) and [research history](../research/RESEARCH_HISTORY.md) for the full evidence and conflicting observations.
+
+## Electrical interface
+
+| TRS contact | Observed line | Arduino Micro connection in the working setup |
+|---|---|---|
+| Sleeve | Ground | Common ground |
+| Tip | BUSY / control envelope | D3 TX through 2.2 kΩ; A5 RX |
+| Ring | DATA | D2 TX through 2.2 kΩ; A0 RX |
+
+Both lines idle LOW in the tested setup. The working transmitter drives HIGH using `OUTPUT HIGH` and produces LOW by changing its TX pin to `INPUT` (high impedance); it releases both pins after a frame. It does not actively drive LOW. Its BUSY receiver uses an ADC threshold of 500 and requires BUSY LOW for 500 µs before starting a frame, with a 100 ms bus-free timeout. These are implementation settings, not measured electrical limits or proof of compatibility with other XS equipment. [Electrical observations](../research/notes/kenwood-xs-reverse-engineering-reviewed.md), [current transmitter](../xs8-bridge/xs8-bridge.ino)
+
+## Frame timing and byte encoding
+
+The archived [edge capture](../research/captures/xs-session2.csv) and live experiments support this nominal frame shape:
+
+1. Assert BUSY HIGH.
+2. About **1,150 µs** later, assert DATA HIGH for a **9,800 µs** start pulse.
+3. Send eight data bits. Each bit is DATA LOW for about **4,900 or 9,800 µs**, then DATA HIGH for about **4,900 µs**.
+4. In the current firmware, release DATA, wait **750 µs**, then release BUSY. This tail is an experimental working choice and differs from the originally observed Kenwood tail.
+
+The current **logical TX** convention sends bit 0 first (LSB first): a short LOW is logical `0`; a long LOW is logical `1`. The transmitter loops over bits `0..7`, using 4,900 µs for `0` and 9,800 µs for `1`. [Timing and tail](../xs8-bridge/xs8-bridge.ino), [research timing summary](../research/notes/kenwood-xs-reverse-engineering-reviewed.md)
+
+## TX and RX byte notation
+
+All `xNN` **TX** values below use the current logical convention. Earlier TX sketches printed an MSB-first **legacy TX** byte with short LOW = `1` and long LOW = `0`. For the same waveform, `logical = reverse8(~legacy)`; for example, legacy TX `DE` is logical TX `x84`, and legacy `60/68` are logical `xF9/xE9`. [Mapper conversion](../research/sketches/xs-tx-test1.ino)
+
+**RX** byte labels are retained as decoded in their source. The later TX/RX test sketch deliberately decodes RX MSB first with short LOW = `1` while it sends logical TX bytes, so `TX x84 → RX 7D` mixes two named conventions. The early passive note prints some front-panel source RX labels that are bitwise complements of later labels (early CD `82`, later CD `7D`). A decoder polarity change is plausible, but its exact historical cause has not been verified. Do not silently transform RX bytes. [Later RX decoder](../research/sketches/xs-tx-test2.ino), [early passive source table](../research/notes/kenwood-xs8-sniffing-notes.md), [later source broadcasts](../research/notes/kenwood-xs-reverse-engineering-reviewed.md)
+
+## Context and observed state dependence
+
+In the tested ROOT state, logical TX `x13` elicited two receiver RX frames: a source-dependent first byte and a monitor-dependent second byte about 110–120 ms later. After TX `x17`, `x13` was silent and TX `x84`, which selected CD in ROOT, selected tuner preset CH8. TX `x07` restored the tested ROOT interpretation and `x13` responses; logical TX `x1F` did not. The higher-level meaning of the `x17` context is unknown: tuner controls are prominent, yet selected CD transport commands continued to work there. Audio input and command context must be tracked separately. [Context probes](../research/notes/kenwood-xs-reverse-engineering-reviewed.md), [targeted `x17` tests](../research/notes/kenwood-xs-reverse-engineering-v18.md)
+
+The same TX value can have different observed effects by context. For example, `x15` released an observed control-lock state in ROOT but started tuner preset scan after `x17`; `x75` produced a lock effect in the ROOT+CD sweep but entered direct frequency mode after `x17`. These are observations, not proof of formal command names or equivalence across states. [Cross-context observations](../research/notes/kenwood-xs-reverse-engineering-v18.md)
+
+## Working control sequences
+
+These are **logical TX bytes in exact order**. Each byte is a separate XS8 frame; the current firmware waits for BUSY to be free before each frame. The volume and mute actions were reported from hardware tests, and the sequences are implemented by the working bridge. No archived end-to-end CEC/serial/XS capture independently verifies every complete bridge transaction. [Observed controls](../research/notes/kenwood-xs-reverse-engineering-v18.md), [bridge implementation](../xs8-bridge/xs8-bridge.ino)
+
+| Operation | Exact TX order | Observed behavior and required handling |
+|---|---|---|
+| Start volume up | `x17 → xF9` | Enter the observed alternate context, then begin **continuous** volume increase. |
+| Start volume down | `x17 → xE9` | Enter the context, then begin **continuous** volume decrease. |
+| Stop active volume and return to ROOT | `x09 → x07` | **Send STOP before context exit.** `x09` stops the continuous change; `x07` restores ROOT. Do not reverse or omit this order. |
+| Change volume direction | `x09 → x07 → x17 → xE9` or `x09 → x07 → x17 → xF9` | Finish the prior hold before starting the other direction. |
+| Mute toggle | `x17 → xD8 → x07` | Toggle MUTE in the observed context, then return to ROOT. If volume is active, first send `x09 → x07`. |
+
+The firmware tracks an outstanding volume stop and retries STOP/ROOT transmission after BUSY failures. It uses a 1,200 ms heartbeat watchdog, but a permanently busy bus can prevent a STOP frame. A host should explicitly request stop on key release and shutdown; the watchdog is a fallback. [Failure handling](../xs8-bridge/xs8-bridge.ino)
+
+**CD STOP is different:** in ROOT with a connected, active changer, logical TX `x9C` was observed to stop playback; RX `D6` followed after about 330 ms. `x09` is the observed continuous-volume STOP in the `x17` context, not an interchangeable CD STOP. Other ROOT STOP-like bytes were reported, but `x9C` has a clearer documented CD test. RX `D6` also appeared after other commands, so its semantics are unresolved. [CD STOP observations](../research/notes/kenwood-xs-reverse-engineering-reviewed.md)
+
+## Conservative application subset
+
+Use these only with the stated preconditions and an application-maintained context state. Their inclusion means the action was observed in this setup; it does **not** claim universal safety across receiver states. A lost frame or unknown context calls for a verified recovery procedure, not an assumed NOP.
+
+| Operation | Logical TX | Tested precondition / limit |
+|---|---|---|
+| Query source and monitor response | `x13` | ROOT; response interpretation established for the tested receiver sources and monitor states. Silent after `x17`. |
+| Select CD input | `x84` | ROOT; RX `7D` observed. After `x17`, the same byte selected tuner CH8. |
+| Select TUNER or PHONO | `x82` or `x83` | ROOT; RX `7B` or `73` observed in the controlled sweep. |
+| Select TAPE1 | `x85` or `x86` | ROOT; RX `79` observed. The distinction between the two TX bytes is unknown. |
+| Stop CD playback | `x9C` | ROOT, CD selected and changer active in the reported tests. Delayed RX `D6` is not a proven acknowledgment. |
+| Volume and mute | Sequences above | Receiver on; track whether `x17` is open, guarantee ordered `x09 → x07` after volume start, and handle BUSY failure. |
+
+This subset deliberately excludes the ROOT lock-producing family and bytes whose only evidence is silence, a library name, or an uncontrolled historical state. [Controlled ROOT map and lock family](../research/notes/kenwood-xs-reverse-engineering-reviewed.md)
+
+## Hazards and limits of evidence
+
+- Continuous volume can persist after one start frame. A lost `x09` can leave the receiver changing volume; a BUSY line that never clears defeats the bridge watchdog’s attempt to transmit STOP.
+- In ROOT, `x35 x36 x45 x46 x55 x56 x65 x66 x67 x75 x76 x77 xA5 xA6 xD5 xD6` produced an observed persistent front-panel control lock. Their protocol semantics are unknown. They are **not** in the application subset. [Lock tests](../research/notes/kenwood-xs-reverse-engineering-reviewed.md)
+- RX silence or no recorded visible action is not evidence that a byte is a NOP. The broad ROOT sweep was performed with CD selected and playing; the `x17` sweep was targeted, and other states remain incompletely tested. [Sweep conditions](../research/notes/kenwood-xs-reverse-engineering-reviewed.md), [targeted-sweep caveat](../research/notes/kenwood-xs-reverse-engineering-v18.md)
+- Changer RX `D6`, `D8`, `DA`, and `DE` have observed associations, not established field meanings. Passive PAUSE was labeled RX `D2`, while active pause yielded RX `DA`; this contradiction remains open. [Changer reports](../research/notes/kenwood-xs-reverse-engineering-reviewed.md), [passive pause](../research/notes/kenwood-xs8-sniffing-notes.md)
+- The CSV captures support waveform timing, and the retained serial scan shows a state change at legacy TX `17`; the later full command matrices primarily survive as written bench observations rather than raw, labeled traces. The bridge source records the implemented behavior, but no archived end-to-end CEC trace proves every transaction. [Partial scan](../research/captures/kenwood-xs-scan.txt), [evidence inventory](../research/RESEARCH_HISTORY.md)
