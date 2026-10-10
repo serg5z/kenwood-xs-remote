@@ -1,0 +1,515 @@
+picocom v2023-04
+
+port is        : /dev/cu.usbmodem101
+flowcontrol    : none
+baudrate is    : 115200
+parity is      : none
+databits are   : 8
+stopbits are   : 1
+txdelay is     : 0 ns
+escape is      : C-a
+local echo is  : no
+noinit is      : no
+noreset is     : no
+hangup is      : no
+nolock is      : no
+send_cmd is    : sz -vv
+receive_cmd is : rz -vv -E
+imap is        : 
+omap is        : 
+emap is        : crcrlf,delbs,
+logfile is     : none
+initstring     : none
+exit_after is  : not set
+exit is        : no
+
+Type [C-a] [C-h] to see available commands
+Terminal ready
+
+======================================
+# STATE-AWARE CONTROLLED SCAN 00..FF
+#
+# PREP:    57 -> DE, require RX 7D
+# TEST:    candidate
+# PROBE:   DE, look for RX 7D
+# RECOVER: 57 -> DE, require RX 7D
+======================================
+
+--------------------------------------
+CANDIDATE 0x00
+  PREP TX 0x57 [source recovery]
+    RX +1.4 ms: 0x1D
+    RX +110.5 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +2.9 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x00
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.2 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +2.0 ms: 0x1D
+    RX +111.1 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +2.9 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x01
+  PREP TX 0x57 [source recovery]
+    RX +1.6 ms: 0x1D
+    RX +110.6 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +3.3 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x01
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +2.9 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.6 ms: 0x1D
+    RX +110.6 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.1 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x02
+  PREP TX 0x57 [source recovery]
+    RX +1.8 ms: 0x1D
+    RX +110.9 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +2.9 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x02
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.3 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.9 ms: 0x1D
+    RX +110.9 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.1 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x03
+  PREP TX 0x57 [source recovery]
+    RX +1.9 ms: 0x1D
+    RX +110.9 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +2.9 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x03
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +2.8 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.6 ms: 0x1D
+    RX +110.7 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.1 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x04
+  PREP TX 0x57 [source recovery]
+    RX +1.7 ms: 0x1D
+    RX +110.9 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +2.7 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x04
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.1 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.9 ms: 0x1D
+    RX +111.0 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +2.8 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x05
+  PREP TX 0x57 [source recovery]
+    RX +2.0 ms: 0x1D
+    RX +111.1 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +3.0 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x05
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.1 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.7 ms: 0x1D
+    RX +110.8 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.3 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x06
+  PREP TX 0x57 [source recovery]
+    RX +2.0 ms: 0x1D
+    RX +111.1 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +3.0 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x06
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.1 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.9 ms: 0x1D
+    RX +111.0 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +2.8 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x07
+  PREP TX 0x57 [source recovery]
+    RX +2.0 ms: 0x1D
+    RX +111.1 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +3.0 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x07
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.0 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.7 ms: 0x1D
+    RX +110.8 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +2.8 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x08
+  PREP TX 0x57 [source recovery]
+    RX +1.6 ms: 0x1D
+    RX +110.7 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +2.7 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x08
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.3 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.9 ms: 0x1D
+    RX +111.0 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.1 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x09
+  PREP TX 0x57 [source recovery]
+    RX +1.6 ms: 0x1D
+    RX +110.7 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +3.3 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x09
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.0 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.6 ms: 0x1D
+    RX +110.6 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +2.7 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x0A
+  PREP TX 0x57 [source recovery]
+    RX +1.9 ms: 0x1D
+    RX +111.0 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +2.9 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x0A
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.1 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.8 ms: 0x1D
+    RX +111.0 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.0 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x0B
+  PREP TX 0x57 [source recovery]
+    RX +1.8 ms: 0x1D
+    RX +110.9 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +2.8 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x0B
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.2 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.9 ms: 0x1D
+    RX +111.0 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.1 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x0C
+  PREP TX 0x57 [source recovery]
+    RX +1.8 ms: 0x1D
+    RX +110.8 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +2.8 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x0C
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +2.7 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.5 ms: 0x1D
+    RX +110.5 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +2.7 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x0D
+  PREP TX 0x57 [source recovery]
+    RX +1.3 ms: 0x1D
+    RX +110.5 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +3.1 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x0D
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +2.8 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.8 ms: 0x1D
+    RX +110.9 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.0 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x0E
+  PREP TX 0x57 [source recovery]
+    RX +1.8 ms: 0x1D
+    RX +110.8 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +3.1 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x0E
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +2.9 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.5 ms: 0x1D
+    RX +110.7 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +2.9 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x0F
+  PREP TX 0x57 [source recovery]
+    RX +1.6 ms: 0x1D
+    RX +110.6 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +3.1 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x0F
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.3 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.9 ms: 0x1D
+    RX +111.1 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.3 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x10
+  PREP TX 0x57 [source recovery]
+    RX +1.5 ms: 0x1D
+    RX +110.6 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +3.1 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x10
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.3 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.9 ms: 0x1D
+    RX +110.9 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.3 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x11
+  PREP TX 0x57 [source recovery]
+    RX +1.5 ms: 0x1D
+    RX +110.6 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +3.0 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x11
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX: --
+  RESULT: *** SOURCE CONTROL BLOCKED / STATE CHANGED ***
+  RECOVER TX 0x57
+    RX +1.6 ms: 0x1D
+    RX +110.7 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +2.8 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x12
+  PREP TX 0x57 [source recovery]
+    RX +1.9 ms: 0x1D
+    RX +111.0 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +2.9 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x12
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.4 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.9 ms: 0x1D
+    RX +111.0 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.1 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x13
+  PREP TX 0x57 [source recovery]
+    RX +1.5 ms: 0x1D
+    RX +110.6 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +3.3 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x13
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +2.7 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.9 ms: 0x1D
+    RX +111.1 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.1 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x14
+  PREP TX 0x57 [source recovery]
+    RX +1.9 ms: 0x1D
+    RX +111.0 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +2.9 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x14
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.3 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.8 ms: 0x1D
+    RX +111.0 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.0 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x15
+  PREP TX 0x57 [source recovery]
+    RX +1.8 ms: 0x1D
+    RX +110.8 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +2.8 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x15
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.3 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +2.0 ms: 0x1D
+    RX +111.1 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.3 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x16
+  PREP TX 0x57 [source recovery]
+    RX +1.8 ms: 0x1D
+    RX +110.9 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +2.9 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x16
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX +3.1 ms: 0x7D [CD]
+  RESULT: SOURCE CONTROL OK
+  RECOVER TX 0x57
+    RX +1.5 ms: 0x1D
+    RX +110.5 ms: 0x18
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX +3.2 ms: 0x7D [CD]
+  *** RECOVERY OK ***
+
+--------------------------------------
+CANDIDATE 0x17
+  PREP TX 0x57 [source recovery]
+    RX +2.0 ms: 0x1D
+    RX +111.1 ms: 0x18
+  VERIFY TX 0xDE [expect CD / 7D]
+    RX +2.8 ms: 0x7D [CD]
+  *** BASELINE OK ***
+  TEST TX 0x17
+    RX: --
+  PROBE TX 0xDE [expect CD / 7D]
+    RX: --
+  RESULT: *** SOURCE CONTROL BLOCKED / STATE CHANGED ***
+  RECOVER TX 0x57
+    RX: --
+  RECOVERY VERIFY TX 0xDE [expect 7D]
+    RX: --
+  *** RECOVERY FAILED: STOPPING SCAN ***
