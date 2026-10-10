@@ -1,56 +1,56 @@
-# Архитектура Kenwood XS Remote
+# Kenwood XS Remote architecture
 
-Система переносит команды громкости и отключения звука из HDMI-CEC на шину SYSTEM CONTROL (XS8) ресивера Kenwood. Текущая реализация состоит из процесса на Raspberry Pi и прошивки Arduino Micro. Схема ниже отражает **реальный путь команд в исходном коде**; описание сигналов XS8 и границы экспериментального подтверждения приведены в [спецификации интерфейса](xs8-protocol.md).
+The system carries volume and mute commands from HDMI-CEC to the Kenwood receiver's SYSTEM CONTROL (XS8) bus. The current implementation consists of a process on the Raspberry Pi and Arduino Micro firmware. The diagram below shows the **actual command path in the source code**; XS8 signals and the limits of experimental validation are described in the [interface specification](xs8-protocol.md).
 
 ```mermaid
 flowchart LR
-    R[Пульт / устройство HDMI-CEC] -->|CEC keypress| A[CEC-адаптер]
+    R[Remote / HDMI-CEC device] -->|CEC keypress| A[CEC adapter]
     A -->|libCEC callback| P[Raspberry Pi<br/>main.cpp]
-    P -->|USB CDC: один ASCII-символ<br/>U / D / H / S / M| M[Arduino Micro<br/>xs8-bridge.ino]
-    M -->|XS8: BUSY + DATA<br/>логические TX-байты| K[Kenwood KR-V6070]
-    K <-->|SYSTEM CONTROL| C[CD-чейнджер, если подключён]
-    K -.->|BUSY считывается через A5| M
-    M -.->|диагностический текст в Serial<br/>Pi его не читает| P
+    P -->|USB CDC: one ASCII character<br/>U / D / H / S / M| M[Arduino Micro<br/>xs8-bridge.ino]
+    M -->|XS8: BUSY + DATA<br/>logical TX bytes| K[Kenwood KR-V6070]
+    K <-->|SYSTEM CONTROL| C[CD changer, if connected]
+    K -.->|BUSY sensed via A5| M
+    M -.->|diagnostic text over Serial<br/>Pi does not read it| P
 ```
 
-## Компоненты и границы ответственности
+## Components and responsibilities
 
-| Компонент | Что делает сейчас |
+| Component | What it currently does |
 |---|---|
-| [Raspberry Pi: `main.cpp`](../main.cpp) | Открывает `/dev/ttyACM0`, подключается к первому найденному CEC-адаптеру через libCEC, принимает события кнопок, отслеживает нажатие/отпускание и посылает однобайтовые serial-команды Arduino. Обрабатываются только `VOLUME_UP`, `VOLUME_DOWN` и `MUTE`. |
-| [Arduino Micro: `xs8-bridge.ino`](../xs8-bridge/xs8-bridge.ino) | Принимает символы по USB CDC, управляет состояниями `active`, `stopPending` и `contextOpen`, формирует отдельные кадры XS8 и следит за занятостью BUSY перед передачей. |
-| Ресивер Kenwood | Принимает кадры XS8. Наблюдаемые команды громкости и MUTE работают после `x17`; `x09` останавливает непрерывное изменение громкости, `x07` возвращает проверенную интерпретацию ROOT. Семантическое имя контекста `x17` не установлено. |
-| CD-чейнджер | Участвует в общей шине и может генерировать собственные сообщения. Он не нужен для текущего сопоставления CEC-громкости, но его присутствие и состояние влияли на часть исследовательских наблюдений. |
+| [Raspberry Pi: `main.cpp`](../main.cpp) | Opens `/dev/ttyACM0`, connects to the first detected CEC adapter through libCEC, receives key events, tracks presses and releases, and sends one-byte serial commands to the Arduino. Only `VOLUME_UP`, `VOLUME_DOWN`, and `MUTE` are handled. |
+| [Arduino Micro: `xs8-bridge.ino`](../xs8-bridge/xs8-bridge.ino) | Receives characters over USB CDC, manages `active`, `stopPending`, and `contextOpen`, generates separate XS8 frames, and checks whether BUSY is occupied before transmitting. |
+| Kenwood receiver | Receives XS8 frames. The observed volume and MUTE commands work after `x17`; `x09` stops continuous volume changes, and `x07` restores the tested ROOT interpretation. The semantic name of the `x17` context is not established. |
+| CD changer | Participates in the shared bus and can generate its own messages. It is not needed for the current CEC volume mapping, but its presence and state affected some research observations. |
 
-Arduino передаёт BUSY через D3 и DATA через D2, оба через резисторы 2,2 кОм; A5 считывает BUSY, A0 подключён к DATA, земля общая. В текущей прошивке A0 настроен как вход, но не используется для разбора ответных XS8-кадров. Передача HIGH выполняется выходом Arduino, LOW — отпусканием линии в высокоимпедансный вход. Это проверенная конфигурация данного стенда, а не универсальная электрическая спецификация Kenwood. [Код передачи](../xs8-bridge/xs8-bridge.ino), [исследовательские заметки](../research/notes/kenwood-xs-reverse-engineering-reviewed.md)
+The Arduino transmits BUSY through D3 and DATA through D2, each through a 2.2 kΩ resistor; A5 senses BUSY, A0 is connected to DATA, and ground is shared. In the current firmware, A0 is configured as an input but is not used to decode received XS8 frames. The Arduino drives HIGH with an output and produces LOW by releasing the line to a high-impedance input. This is the verified configuration of this test setup, not a universal Kenwood electrical specification. [Transmit code](../xs8-bridge/xs8-bridge.ino), [research notes](../research/notes/kenwood-xs-reverse-engineering-reviewed.md)
 
-## Инициализация и сопоставление кодов
+## Initialization and code mapping
 
-При старте Arduino отпускает обе линии XS8, включает USB Serial и печатает `XS8 BRIDGE 1.0 READY`. Процесс Pi открывает `/dev/ttyACM0` в raw-режиме с номинальной скоростью 115200, **до запуска libCEC** отправляет символ `S`, затем регистрирует себя как CEC `AUDIO_SYSTEM` с именем `Kenwood Bridge`. Код не активирует источник (`bActivateSource = 0`), не задаёт пробуждение устройств, открывает первый найденный адаптер и вызывает `SetInactiveView()`. [Инициализация Pi](../main.cpp), [инициализация Arduino](../xs8-bridge/xs8-bridge.ino)
+At startup, the Arduino releases both XS8 lines, starts USB Serial, and prints `XS8 BRIDGE 1.0 READY`. The Pi process opens `/dev/ttyACM0` in raw mode at a nominal 115200 baud, sends the character `S` **before starting libCEC**, then registers as a CEC `AUDIO_SYSTEM` named `Kenwood Bridge`. The code does not activate the source (`bActivateSource = 0`) or configure device wake-up; it opens the first detected adapter and calls `SetInactiveView()`. [Pi initialization](../main.cpp), [Arduino initialization](../xs8-bridge/xs8-bridge.ino)
 
-Начальный `S` вызывает `finishVolume()` на Arduino. Эта функция отправляет XS8 `x09` только при сохранённом `active` или `stopPending`, а `x07` — только при `contextOpen`. Поэтому `S` синхронизирует **известное прошивке состояние**; после её чистого старта он может не породить ни одного кадра XS8 и не доказывает, что ресивер уже в ROOT. [Условия `finishVolume()`](../xs8-bridge/xs8-bridge.ino)
+The initial `S` calls `finishVolume()` on the Arduino. That function sends XS8 `x09` only if `active` or `stopPending` is set, and `x07` only if `contextOpen` is set. Thus `S` synchronizes the **state known to the firmware**; after a clean firmware start, it may produce no XS8 frames and does not prove that the receiver is already in ROOT. [`finishVolume()` conditions](../xs8-bridge/xs8-bridge.ino)
 
-В таблице `xNN` — **текущие логические TX-байты XS8**, а буквы — ASCII-символы USB serial, не XS8-байты. `sendXS8()` в `main.cpp` сопоставляет `xF9 → U`, `xE9 → D`, `x09 → S`, `xD8 → M`; последовательности XS8 собирает Arduino. [Сопоставление в Pi](../main.cpp), [разбор в Arduino](../xs8-bridge/xs8-bridge.ino)
+In the table, `xNN` denotes **current logical XS8 TX bytes**, while the letters are USB serial ASCII characters, not XS8 bytes. `sendXS8()` in `main.cpp` maps `xF9 → U`, `xE9 → D`, `x09 → S`, and `xD8 → M`; the Arduino assembles the XS8 sequences. [Pi mapping](../main.cpp), [Arduino command parsing](../xs8-bridge/xs8-bridge.ino)
 
-| Событие / источник | Pi → Arduino | Arduino → XS8, точный порядок | Условие |
+| Event / source | Pi → Arduino | Arduino → XS8, exact order | Condition |
 |---|---|---|---|
-| CEC `VOLUME_UP`, начало нажатия | `U` | `x17 → xF9` | Если уже удерживается то же направление, новая XS8-передача не нужна. |
-| CEC `VOLUME_DOWN`, начало нажатия | `D` | `x17 → xE9` | Смена направления сначала завершает прежнее удержание: `x09 → x07`, затем начинает новое. |
-| Повтор/удержание громкости | `H` каждые ~300 мс | Нового кадра XS8 нет | Pi посылает heartbeat, пока считает громкость активной; Arduino обновляет свой таймер. |
-| Отпускание активной кнопки, остановка или завершение процесса | `S` | `x09 → x07`, если состояние Arduino требует обоих кадров | **Сначала STOP, затем выход из контекста.** |
-| CEC `MUTE`, начало нажатия | `M` | `x17 → xD8 → x07` | Если громкость активна, Arduino сначала выполняет `x09 → x07`. Отпускание MUTE не посылает нового действия. |
-| Ручной запрос состояния serial | `?` | XS8-кадров нет | Arduino печатает `active`, `context`, `stopPending`; текущий Pi-код `?` не посылает. |
+| CEC `VOLUME_UP`, start of press | `U` | `x17 → xF9` | If the same direction is already held, another XS8 transmission is unnecessary. |
+| CEC `VOLUME_DOWN`, start of press | `D` | `x17 → xE9` | A direction change first ends the previous hold with `x09 → x07`, then starts the new one. |
+| Volume repeat/hold | `H` every ~300 ms | No new XS8 frame | The Pi sends a heartbeat while it considers volume active; the Arduino updates its timer. |
+| Release of the active button, stop, or process shutdown | `S` | `x09 → x07` if the Arduino state requires both frames | **STOP first, then context exit.** |
+| CEC `MUTE`, start of press | `M` | `x17 → xD8 → x07` | If volume is active, the Arduino first performs `x09 → x07`. Releasing MUTE sends no new action. |
+| Manual serial status query | `?` | No XS8 frames | The Arduino prints `active`, `context`, and `stopPending`; the current Pi code does not send `?`. |
 
-USB-протокол — поток **одиночных символов без обязательного перевода строки**. Arduino игнорирует пробелы и CR/LF, печатает `OK ...` или `ERR ...`, но Pi читает только результат системного `write()` и **не разбирает ответы Arduino**. Следовательно, успешная запись в serial не является подтверждением передачи XS8 или реакции ресивера. [Запись serial в Pi](../main.cpp), [ответы Arduino](../xs8-bridge/xs8-bridge.ino)
+The USB protocol is a stream of **single characters without a required newline**. The Arduino ignores spaces and CR/LF and prints `OK ...` or `ERR ...`, but the Pi reads only the system `write()` result and **does not parse Arduino responses**. Therefore, a successful serial write is not confirmation of XS8 transmission or receiver response. [Pi serial write](../main.cpp), [Arduino responses](../xs8-bridge/xs8-bridge.ino)
 
-## Временная логика и отказы
+## Timing and failures
 
-CEC callback помещает события в очередь; основной цикл Pi обрабатывает её примерно каждые 20 мс. В текущем коде `duration > 0` трактуется как отпускание. Pi посылает `S` при отпускании, смене направления, завершении процесса или отсутствии событий громкости более 1200 мс. Пока удержание активно, он посылает `H` примерно каждые 300 мс. Arduino имеет собственный тайм-аут 1200 мс с последующим `x09 → x07`. [Цикл событий](../main.cpp), [watchdog прошивки](../xs8-bridge/xs8-bridge.ino)
+The CEC callback puts events in a queue; the Pi's main loop processes it about every 20 ms. In the current code, `duration > 0` is interpreted as a release. The Pi sends `S` on release, direction change, process shutdown, or when no volume event has arrived for more than 1200 ms. While a hold is active, it sends `H` about every 300 ms. The Arduino has its own 1200 ms timeout followed by `x09 → x07`. [Event loop](../main.cpp), [firmware watchdog](../xs8-bridge/xs8-bridge.ino)
 
-Каждый XS8-байт передаётся отдельным кадром после проверки свободной BUSY-линии. Arduino ждёт BUSY LOW не менее 500 мкс, но прекращает ожидание через 100 мс. Если STOP или выход в ROOT не удалось отправить, прошивка сохраняет флаги для повторной попытки. Если BUSY остаётся занятой постоянно, ни watchdog Pi, ни watchdog Arduino не гарантируют, что STOP дойдёт до ресивера. [Ожидание BUSY и повтор](../xs8-bridge/xs8-bridge.ino)
+Each XS8 byte is transmitted as a separate frame after checking that BUSY is free. The Arduino requires BUSY LOW for at least 500 µs but stops waiting after 100 ms. If STOP or the return to ROOT cannot be sent, the firmware retains flags for another attempt. If BUSY remains occupied indefinitely, neither the Pi watchdog nor the Arduino watchdog can guarantee that STOP reaches the receiver. [BUSY wait and retry](../xs8-bridge/xs8-bridge.ino)
 
-## Границы реализации и доказательств
+## Implementation and evidence limits
 
-- Сейчас CEC-путь управляет только громкостью и MUTE. Команды выбора источника, CD и запрос статуса описаны в [реестре команд](../research/COMMAND_REGISTRY.md), но `main.cpp` их не выдаёт.
-- `x17`/`x07` демонстрируют переключение и восстановление наблюдаемой интерпретации команд; формальная семантика контекста неизвестна. Не следует считать одинаковые байты эквивалентными во всех состояниях ресивера.
-- Код фиксирует фактическое сопоставление CEC → serial → XS8. В архиве нет полного синхронного лога этого пути, поэтому утверждение об аппаратной проверке моста нельзя независимо восстановить по всем этапам. [История исследования](../research/RESEARCH_HISTORY.md), [спецификация XS8](xs8-protocol.md)
+- The current CEC path controls only volume and MUTE. Source-selection, CD, and status-query commands are described in the [command registry](../research/COMMAND_REGISTRY.md), but `main.cpp` does not send them.
+- `x17`/`x07` demonstrate a change and restoration of the observed command interpretation; the context's formal semantics are unknown. Identical byte values should not be assumed equivalent in every receiver state.
+- The code establishes the actual CEC → serial → XS8 mapping. The archive contains no complete synchronized trace of that path, so the bridge's reported hardware validation cannot be independently reconstructed at every stage. [Research history](../research/RESEARCH_HISTORY.md), [XS8 specification](xs8-protocol.md)
