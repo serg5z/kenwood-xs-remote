@@ -1,15 +1,21 @@
 #define _POSIX_C_SOURCE 200809L
 #include <gpiod.h>
 #include <errno.h>
+#include <pthread.h>
+#include <poll.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #define CHIP "/dev/gpiochip0"
 #define DATA_TX 4
 #define BUSY_TX 22
 #define BUSY_RX 23
+#define DATA_RX 27
 
 #define LEAD_US 1150
 #define START_US 9800
@@ -19,8 +25,107 @@
 #define BUS_FREE_TIMEOUT_US 100000
 #define BUS_FREE_GUARD_US 500
 #define END_GUARD_US 750
+#define CAPTURE_NS 1000000000LL
+#define EVENT_BATCH 256
+#define INITIAL_EDGES 4096
 
-static struct gpiod_line_request *req;
+static struct gpiod_line_request *tx_req;
+static struct gpiod_line_request *rx_req;
+/* The TX BUSY check and capture reader share one RX request. */
+static pthread_mutex_t rx_lock = PTHREAD_MUTEX_INITIALIZER;
+
+struct captured_edge {
+    uint64_t timestamp_ns;
+    unsigned int gpio;
+    enum gpiod_edge_event_type type;
+};
+
+struct capture {
+    int event_fd;
+    struct gpiod_edge_event_buffer *buffer;
+    struct captured_edge *edges;
+    size_t count, capacity;
+    unsigned long last_seqno, lost;
+    int error;
+    bool out_of_memory;
+    int64_t end_ns;
+    atomic_bool stop;
+};
+
+static void *capture_events(void *arg)
+{
+    struct capture *cap = arg;
+
+    for (;;) {
+        bool stopping = atomic_load(&cap->stop);
+        /* Poll the fd outside libgpiod so BUSY reads need only lock reads. */
+        struct pollfd fd = {.fd = cap->event_fd, .events = POLLIN};
+        int ready = poll(&fd, 1, stopping ? 0 : 20);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            cap->error = errno;
+            break;
+        }
+        if (!ready) {
+            if (stopping) break;
+            continue;
+        }
+        if (!(fd.revents & POLLIN)) {
+            cap->error = EIO;
+            break;
+        }
+
+        pthread_mutex_lock(&rx_lock);
+        int n = gpiod_line_request_read_edge_events(
+            rx_req, cap->buffer, EVENT_BATCH);
+        int read_error = errno;
+        pthread_mutex_unlock(&rx_lock);
+        if (n < 0) {
+            if (read_error == EINTR) continue;
+            cap->error = read_error;
+            break;
+        }
+
+        bool past_end = false;
+        for (int i = 0; i < n; ++i) {
+            struct gpiod_edge_event *event =
+                gpiod_edge_event_buffer_get_event(cap->buffer, i);
+            uint64_t timestamp = gpiod_edge_event_get_timestamp_ns(event);
+            if (stopping && timestamp > (uint64_t)cap->end_ns) {
+                past_end = true;
+                break;
+            }
+            unsigned long seqno = gpiod_edge_event_get_global_seqno(event);
+            if (seqno > cap->last_seqno + 1)
+                cap->lost += seqno - cap->last_seqno - 1;
+            cap->last_seqno = seqno;
+            if (cap->out_of_memory) continue;
+            if (cap->count == cap->capacity) {
+                size_t next = cap->capacity ? cap->capacity * 2 : EVENT_BATCH;
+                if (next < cap->capacity ||
+                    next > SIZE_MAX / sizeof(*cap->edges)) {
+                    cap->out_of_memory = true;
+                    continue;
+                }
+                struct captured_edge *grown = realloc(
+                    cap->edges, next * sizeof(*cap->edges));
+                if (!grown) {
+                    cap->out_of_memory = true;
+                    continue;
+                }
+                cap->edges = grown;
+                cap->capacity = next;
+            }
+            cap->edges[cap->count++] = (struct captured_edge){
+                timestamp,
+                gpiod_edge_event_get_line_offset(event),
+                gpiod_edge_event_get_event_type(event)
+            };
+        }
+        if (past_end) break;
+    }
+    return NULL;
+}
 
 static int64_t now_ns(void)
 {
@@ -46,7 +151,7 @@ static int wait_until(int64_t deadline)
 static int tx(unsigned int pin, int high)
 {
     return gpiod_line_request_set_value(
-        req, pin, high ? GPIOD_LINE_VALUE_ACTIVE
+        tx_req, pin, high ? GPIOD_LINE_VALUE_ACTIVE
                        : GPIOD_LINE_VALUE_INACTIVE);
 }
 
@@ -56,7 +161,9 @@ static int wait_bus_free(void)
     int64_t free_since = 0;
 
     while (now_ns() - start < BUS_FREE_TIMEOUT_US * 1000LL) {
-        int busy = gpiod_line_request_get_value(req, BUSY_RX);
+        pthread_mutex_lock(&rx_lock);
+        int busy = gpiod_line_request_get_value(rx_req, BUSY_RX);
+        pthread_mutex_unlock(&rx_lock);
         if (busy < 0) return -1;
 
         int64_t now = now_ns();
@@ -71,7 +178,7 @@ static int wait_bus_free(void)
     return -1;
 }
 
-static int send_xs(uint8_t value)
+static int send_xs(uint8_t value, int64_t *tx_start_ns)
 {
     int64_t deadline;
 
@@ -84,6 +191,7 @@ static int send_xs(uint8_t value)
     }
 
     deadline = now_ns();
+    *tx_start_ns = deadline;
 
 #define STEP(pin, level, duration) do {                         \
     if (tx((pin), (level)) < 0) return -1;                       \
@@ -111,14 +219,17 @@ static int send_xs(uint8_t value)
 
 int main(int argc, char **argv)
 {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s 0xNN\n", argv[0]);
+    bool capturing = argc == 3 && strcmp(argv[1], "--capture") == 0;
+    if ((argc != 2 && !capturing) ||
+        (argc == 2 && argv[1][0] == '-')) {
+        fprintf(stderr, "Usage: %s [--capture] 0xNN\n", argv[0]);
         return 2;
     }
 
     char *end;
-    unsigned long parsed = strtoul(argv[1], &end, 0);
-    if (*end || parsed > 255) {
+    const char *byte_arg = argv[capturing ? 2 : 1];
+    unsigned long parsed = strtoul(byte_arg, &end, 0);
+    if (end == byte_arg || *end || parsed > 255) {
         fprintf(stderr, "Invalid byte\n");
         return 2;
     }
@@ -126,55 +237,159 @@ int main(int argc, char **argv)
     struct gpiod_chip *chip = gpiod_chip_open(CHIP);
     struct gpiod_line_settings *out = gpiod_line_settings_new();
     struct gpiod_line_settings *in = gpiod_line_settings_new();
-    struct gpiod_line_config *cfg = gpiod_line_config_new();
+    struct gpiod_line_config *tx_cfg = gpiod_line_config_new();
+    struct gpiod_line_config *rx_cfg = gpiod_line_config_new();
+    struct gpiod_request_config *rx_req_cfg =
+        capturing ? gpiod_request_config_new() : NULL;
+    struct capture cap = {0};
+    pthread_t capture_thread;
+    bool thread_started = false;
+    int64_t tx_start_ns = 0;
+    int result = -1;
 
-    if (!chip || !out || !in || !cfg) {
+    if (!chip || !out || !in || !tx_cfg || !rx_cfg ||
+        (capturing && !rx_req_cfg)) {
         fprintf(stderr, "GPIO setup failed\n");
-        return 1;
+        goto cleanup;
     }
 
     unsigned int outputs[] = {DATA_TX, BUSY_TX};
-    unsigned int inputs[] = {BUSY_RX};
+    unsigned int inputs[] = {BUSY_RX, DATA_RX};
 
-    gpiod_line_settings_set_direction(
-        out, GPIOD_LINE_DIRECTION_OUTPUT);
-    gpiod_line_settings_set_output_value(
-        out, GPIOD_LINE_VALUE_INACTIVE);
-    gpiod_line_settings_set_direction(
-        in, GPIOD_LINE_DIRECTION_INPUT);
+    if (gpiod_line_settings_set_direction(
+            out, GPIOD_LINE_DIRECTION_OUTPUT) < 0 ||
+        gpiod_line_settings_set_output_value(
+            out, GPIOD_LINE_VALUE_INACTIVE) < 0 ||
+        gpiod_line_settings_set_direction(
+            in, GPIOD_LINE_DIRECTION_INPUT) < 0) {
+        fprintf(stderr, "Line settings failed\n");
+        goto cleanup;
+    }
+    if (capturing &&
+        (gpiod_line_settings_set_edge_detection(
+             in, GPIOD_LINE_EDGE_BOTH) < 0 ||
+         gpiod_line_settings_set_event_clock(
+             in, GPIOD_LINE_CLOCK_MONOTONIC) < 0)) {
+        fprintf(stderr, "Capture settings failed\n");
+        goto cleanup;
+    }
 
-    if (gpiod_line_config_add_line_settings(cfg, outputs, 2, out) < 0 ||
-        gpiod_line_config_add_line_settings(cfg, inputs, 1, in) < 0) {
+    if (gpiod_line_config_add_line_settings(
+            tx_cfg, outputs, 2, out) < 0 ||
+        gpiod_line_config_add_line_settings(
+            rx_cfg, inputs, capturing ? 2 : 1, in) < 0) {
         fprintf(stderr, "Line configuration failed\n");
-        return 1;
+        goto cleanup;
     }
 
-    req = gpiod_chip_request_lines(chip, NULL, cfg);
-    if (!req) {
-        perror("GPIO request");
-        return 1;
+    if (capturing)
+        gpiod_request_config_set_event_buffer_size(rx_req_cfg, 4096);
+    tx_req = gpiod_chip_request_lines(chip, NULL, tx_cfg);
+    if (!tx_req) {
+        perror("GPIO TX request");
+        goto cleanup;
+    }
+    rx_req = gpiod_chip_request_lines(chip, rx_req_cfg, rx_cfg);
+    if (!rx_req) {
+        perror("GPIO RX request");
+        goto cleanup;
     }
 
-    printf("XS8 TX: 0x%02lX\n", parsed);
-    fflush(stdout);
+    if (capturing) {
+        cap.event_fd = gpiod_line_request_get_fd(rx_req);
+        cap.buffer = gpiod_edge_event_buffer_new(EVENT_BATCH);
+        cap.edges = malloc(INITIAL_EDGES * sizeof(*cap.edges));
+        if (!cap.buffer || !cap.edges) {
+            perror("Capture allocation");
+            goto cleanup;
+        }
+        cap.capacity = INITIAL_EDGES;
+        atomic_init(&cap.stop, false);
+        int thread_error = pthread_create(
+            &capture_thread, NULL, capture_events, &cap);
+        if (thread_error) {
+            errno = thread_error;
+            perror("Capture thread");
+            goto cleanup;
+        }
+        thread_started = true;
+    } else {
+        printf("XS8 TX: 0x%02lX\n", parsed);
+        fflush(stdout);
+    }
 
-    int result = send_xs((uint8_t)parsed);
+    result = send_xs((uint8_t)parsed, &tx_start_ns);
+    int64_t tx_complete_ns = now_ns();
 
     /* Always release both transistor outputs. */
-    if (tx(DATA_TX, 0) < 0 || tx(BUSY_TX, 0) < 0)
+    int data_release = tx(DATA_TX, 0);
+    int busy_release = tx(BUSY_TX, 0);
+    if (data_release < 0 || busy_release < 0)
         result = -1;
 
-    gpiod_line_request_release(req);
-    gpiod_line_config_free(cfg);
-    gpiod_line_settings_free(out);
-    gpiod_line_settings_free(in);
-    gpiod_chip_close(chip);
+    if (capturing) {
+        if (result == 0) {
+            cap.end_ns = tx_complete_ns + CAPTURE_NS;
+            if (wait_until(cap.end_ns) != 0)
+                result = -1;
+        } else {
+            cap.end_ns = now_ns();
+        }
+        atomic_store(&cap.stop, true);
+        pthread_join(capture_thread, NULL);
+        thread_started = false;
+        if (cap.error || cap.out_of_memory || cap.lost) {
+            fprintf(stderr, "Capture incomplete: read error=%d, "
+                    "allocation failure=%d, missing events=%lu\n",
+                    cap.error, cap.out_of_memory, cap.lost);
+            result = -1;
+        }
+        if (tx_start_ns) {
+            puts("time_us,gpio,edge");
+            for (size_t i = 0; i < cap.count; ++i) {
+                const struct captured_edge *edge = &cap.edges[i];
+                if (edge->timestamp_ns > (uint64_t)cap.end_ns)
+                    continue;
+                printf("%lld,%u,%s\n",
+                       (long long)((int64_t)edge->timestamp_ns -
+                                   tx_start_ns) / 1000,
+                       edge->gpio,
+                       edge->type == GPIOD_EDGE_EVENT_RISING_EDGE
+                           ? "rising" : "falling");
+            }
+            if (ferror(stdout)) result = -1;
+        }
+    }
+
+cleanup:
+    if (thread_started) {
+        cap.end_ns = now_ns();
+        atomic_store(&cap.stop, true);
+        pthread_join(capture_thread, NULL);
+    }
+    if (tx_req) {
+        /* Release both lines even if the first operation fails. */
+        int data_release = tx(DATA_TX, 0);
+        int busy_release = tx(BUSY_TX, 0);
+        if (data_release < 0 || busy_release < 0)
+            result = -1;
+    }
+    if (rx_req) gpiod_line_request_release(rx_req);
+    if (tx_req) gpiod_line_request_release(tx_req);
+    if (cap.buffer) gpiod_edge_event_buffer_free(cap.buffer);
+    free(cap.edges);
+    if (rx_req_cfg) gpiod_request_config_free(rx_req_cfg);
+    if (rx_cfg) gpiod_line_config_free(rx_cfg);
+    if (tx_cfg) gpiod_line_config_free(tx_cfg);
+    if (in) gpiod_line_settings_free(in);
+    if (out) gpiod_line_settings_free(out);
+    if (chip) gpiod_chip_close(chip);
 
     if (result < 0) {
         fprintf(stderr, "XS8 transmission failed\n");
         return 1;
     }
 
-    puts("XS8 transmission complete");
+    if (!capturing) puts("XS8 transmission complete");
     return 0;
 }
