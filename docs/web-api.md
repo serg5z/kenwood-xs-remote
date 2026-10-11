@@ -10,7 +10,17 @@ Prerequisite: Python 3 with the standard library. From the repository root:
 python3 xs8_gateway.py
 ```
 
-Open `http://127.0.0.1:8080/` on the Raspberry Pi. The page still loads when `xs8-service` is unavailable and shows the connection failure. Start `xs8-service` separately if live status is needed, and run the gateway as a local user permitted to open its socket. The service's default socket is `/tmp/kenwood-xs8.sock`. Use `--socket PATH` for a different local socket or `--port PORT` for a different loopback port. The gateway always binds to `127.0.0.1`; this phase does not expose it to the LAN.
+Open `http://127.0.0.1:8080/` on the Raspberry Pi. The page still loads when `xs8-service` is unavailable and shows the connection failure. Start `xs8-service` separately if live status is needed, and run the gateway as a local user permitted to open its socket. The service's default socket is `/tmp/kenwood-xs8.sock`. Use `--socket PATH` for a different local socket or `--port PORT` for a different port. By default, the gateway binds only to `127.0.0.1`.
+
+## Temporary read-only LAN preview
+
+To open the page in iPhone Safari on the same home Wi-Fi, find the Pi's specific LAN IPv4 address and start the gateway explicitly, for example:
+
+```sh
+python3 xs8_gateway.py --bind 192.168.1.20 --allow-insecure-readonly-lan
+```
+
+Replace `192.168.1.20` with the Pi's actual address, then open `http://192.168.1.20:8080/` on the iPhone. This mode is **unauthenticated, unencrypted HTTP**. Use it only as a temporary read-only preview on the home LAN. Do not forward the port through the router or expose it to the public internet. The gateway rejects wildcard addresses (`0.0.0.0`, `::`) and requires a literal IPv4 address; a non-loopback address requires the explicit opt-in flag. The flag is rejected with a loopback address to avoid a misleading startup configuration. All controls stay disabled and every POST returns HTTP 501 without accessing the XS8 service.
 
 Offline tests (no GPIO or receiver access):
 
@@ -42,4 +52,4 @@ No new XS8 byte values are assigned by this API design. Future iOS clients can u
 
 ## LAN access plan
 
-Keep the gateway on loopback until authentication is implemented. For LAN use, put it behind a small HTTPS reverse proxy with authenticated access, restrict the listener to the trusted LAN, and require protection against cross-site requests on every future mutating endpoint. Browser clients can use a secure same-origin session; a future SwiftUI app can store its credential in Keychain. Do not forward this API to the public internet. Unix socket filesystem permissions remain a separate local access boundary.
+The direct LAN mode above is a temporary read-only exception. Before adding active controls, return the gateway to loopback behind an authenticated HTTPS reverse proxy, restrict the listener to the intended LAN, and protect every future mutating endpoint against cross-site requests. Browser clients can use a secure same-origin session; a future SwiftUI app can store its credential in Keychain. Do not forward this API to the public internet. Unix socket filesystem permissions remain a separate local access boundary.

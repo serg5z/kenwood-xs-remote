@@ -2,8 +2,10 @@
 """Local, read-only HTTP gateway for the XS8 control service."""
 
 import argparse
+import ipaddress
 import json
 import socket
+import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -129,16 +131,38 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_json(501, {"error": "Control endpoints are not implemented"})
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--socket", default=DEFAULT_SOCKET,
                         help="local XS8 service Unix socket")
-    args = parser.parse_args()
+    parser.add_argument("--bind", default="127.0.0.1",
+                        help="literal IPv4 address (default: 127.0.0.1)")
+    parser.add_argument("--allow-insecure-readonly-lan", action="store_true",
+                        help="explicitly allow unauthenticated read-only LAN HTTP")
+    args = parser.parse_args(argv)
+    if args.bind in ("0.0.0.0", "::"):
+        parser.error("wildcard binding is not allowed; use the Pi's specific LAN IPv4 address")
+    try:
+        address = ipaddress.IPv4Address(args.bind)
+    except ipaddress.AddressValueError:
+        parser.error("--bind requires a literal IPv4 address")
+    if address.is_loopback and args.allow_insecure_readonly_lan:
+        parser.error("--allow-insecure-readonly-lan requires a non-loopback --bind address")
+    if not address.is_loopback and not args.allow_insecure_readonly_lan:
+        parser.error("non-loopback --bind requires --allow-insecure-readonly-lan")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.allow_insecure_readonly_lan:
+        print("WARNING: unauthenticated, unencrypted read-only LAN preview; "
+              "do not forward this port to the internet", file=sys.stderr)
     handler = type("ConfiguredGatewayHandler", (GatewayHandler,),
                    {"socket_path": args.socket})
-    server = HTTPServer(("127.0.0.1", args.port), handler)
-    print(f"XS8 gateway listening on http://127.0.0.1:{server.server_port}")
+    server = HTTPServer((args.bind, args.port), handler)
+    print(f"XS8 gateway listening on http://{args.bind}:{server.server_port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
