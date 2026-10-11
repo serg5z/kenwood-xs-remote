@@ -137,7 +137,42 @@ static void test_self_capture(void)
     captured_frame(&fixture, 0xE9);
     result = verify_self_capture(&fixture.capture, 0x09, true,
                                  500000, 150000000, false);
+    assert(result.capture == CAPTURE_COMPLETE && result.match == MATCH);
+    assert(result.additional_frames == 1);
+
+    /* The observed ROOT 0x13 exchange has two immediate follow-on frames.
+     * The first follow-on may begin before the TX function returns. */
+    struct capture_fixture response = new_capture();
+    captured_frame(&response, 0x13);
+    uint64_t tx_frame_end_ns = response.time_ns;
+    captured_frame(&response, 0x37);
+    captured_frame(&response, 0xE7);
+    response.capture.edges = response.edges;
+    result = verify_self_capture(&response.capture, 0x13, true,
+                                 500000, tx_frame_end_ns + 2000000, false);
+    assert(result.capture == CAPTURE_COMPLETE && result.match == MATCH);
+    assert(result.observed_lsb == 0x13 && result.additional_frames == 2);
+
+    result = verify_self_capture(&response.capture, 0x14, true,
+                                 500000, tx_frame_end_ns + 2000000, false);
+    assert(result.capture == CAPTURE_COMPLETE && result.match == MISMATCH);
+    assert(result.additional_frames == 2);
+
+    struct capture_fixture overlapping = new_capture();
+    captured_frame(&overlapping, 0x13);
+    overlapping.capture.edges = overlapping.edges;
+    result = verify_self_capture(&overlapping.capture, 0x13, true,
+                                 20000000, 150000000, false);
     assert(result.capture == CAPTURE_INVALID && result.match == MATCH_UNKNOWN);
+
+    struct capture_fixture incomplete_response = new_capture();
+    captured_frame(&incomplete_response, 0x13);
+    captured_edge(&incomplete_response, 23, XS8_RISING, 1000000);
+    captured_edge(&incomplete_response, 27, XS8_RISING, 1150000);
+    incomplete_response.capture.edges = incomplete_response.edges;
+    result = verify_self_capture(&incomplete_response.capture, 0x13, true,
+                                 500000, 150000000, false);
+    assert(result.capture == CAPTURE_INCOMPLETE && result.match == MATCH_UNKNOWN);
     assert(result.additional_frames == 1);
 
     struct capture_fixture later = new_capture();

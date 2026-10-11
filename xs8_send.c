@@ -149,8 +149,11 @@ static void *capture_events(void *arg)
 
 struct tx_verification {
     uint64_t start_ns, end_ns;
-    unsigned int candidate_frames, valid_frames, other_frames;
+    uint64_t current_event_ns;
+    unsigned int additional_frames;
     uint8_t observed_lsb, observed_legacy;
+    bool candidate_seen, candidate_valid;
+    bool ambiguous, incomplete_additional;
     bool log_frames;
 };
 
@@ -180,18 +183,22 @@ static void inspect_frame(void *user, const struct xs8_decoded *decoded)
                         "status=INCOMPLETE bits=%u reason=%s\n",
                 (unsigned long long)(decoded->time_ns / 1000),
                 decoded->bits, decoded->reason);
-    if (decoded->time_ns < verification->start_ns ||
-        decoded->time_ns > verification->end_ns) {
-        ++verification->other_frames;
+    if (decoded->time_ns < verification->start_ns) {
+        if (verification->current_event_ns > verification->start_ns)
+            verification->ambiguous = true;
         return;
     }
-    ++verification->candidate_frames;
-    if (!decoded->valid) return;
-    ++verification->valid_frames;
-    if (verification->valid_frames == 1) {
+    if (!verification->candidate_seen) {
+        if (decoded->time_ns > verification->end_ns) return;
+        verification->candidate_seen = true;
+        verification->candidate_valid = decoded->valid;
+        if (!decoded->valid) return;
         verification->observed_lsb = decoded->waveform_lsb;
         verification->observed_legacy = decoded->legacy_msb_short1;
+        return;
     }
+    ++verification->additional_frames;
+    if (!decoded->valid) verification->incomplete_additional = true;
 }
 
 static struct self_capture_result verify_self_capture(
@@ -214,23 +221,23 @@ static struct self_capture_result verify_self_capture(
             .gpio = captured->gpio,
             .kind = captured->type
         };
+        verification.current_event_ns = edge.time_ns;
         xs8_decoder_edge(&decoder, &edge, inspect_frame, &verification);
     }
     xs8_decoder_flush(&decoder, inspect_frame, &verification);
 
     bool invalid = !cap->started || cap->window_error || cap->error ||
                    cap->out_of_memory || cap->lost || cap->regressions ||
-                   cap->timestamp_regressions || verification.candidate_frames > 1;
+                   cap->timestamp_regressions || verification.ambiguous;
     struct self_capture_result result = {
         .capture = invalid ? CAPTURE_INVALID :
-            verification.valid_frames == 1 ? CAPTURE_COMPLETE : CAPTURE_INCOMPLETE,
+            verification.candidate_valid && !verification.incomplete_additional
+                ? CAPTURE_COMPLETE : CAPTURE_INCOMPLETE,
         .match = MATCH_UNKNOWN,
-        .additional_frames = verification.other_frames +
-            (verification.candidate_frames > 1 ?
-             verification.candidate_frames - 1 : 0),
+        .additional_frames = verification.additional_frames,
         .observed_lsb = verification.observed_lsb,
         .observed_legacy = verification.observed_legacy,
-        .observed_byte = verification.valid_frames == 1
+        .observed_byte = verification.candidate_valid
     };
     if (tx_ok && result.capture == CAPTURE_COMPLETE)
         result.match = result.observed_lsb == requested ? MATCH : MISMATCH;
