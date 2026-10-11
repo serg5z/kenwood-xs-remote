@@ -22,6 +22,8 @@ python3 xs8_gateway.py --bind 192.168.1.20 --allow-insecure-readonly-lan
 
 Replace `192.168.1.20` with the Pi's actual address, then open `http://192.168.1.20:8080/` on the iPhone. This mode is **unauthenticated, unencrypted HTTP**. Use it only as a temporary read-only preview on the home LAN. Do not forward the port through the router or expose it to the public internet. The gateway rejects wildcard addresses (`0.0.0.0`, `::`) and requires a literal IPv4 address; a non-loopback address requires the explicit opt-in flag. The flag is rejected with a loopback address to avoid a misleading startup configuration. All controls stay disabled and every POST returns HTTP 501 without accessing the XS8 service.
 
+For authenticated HTTPS on the LAN, use the [nginx setup guide](https-lan.md) and return the gateway to its default loopback binding.
+
 Offline tests (no GPIO or receiver access):
 
 ```sh
