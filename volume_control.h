@@ -42,9 +42,16 @@ public:
     bool rearm_blocked() const { return rearm_blocked_; }
 
 private:
+    enum class StopReason {
+        CEC_RELEASE, INACTIVITY, MAX_HOLD, DIRECTION_CHANGE,
+        SHUTDOWN, CANCELLED, TX_ERROR, STARTUP_RECOVERY, NONE
+    };
     bool start(Direction direction, Time received, Time now);
-    bool finish(Time now);
-    bool send_retry(uint8_t byte, bool& any_failure);
+    bool finish(Time now, StopReason reason);
+    bool send_retry(uint8_t byte, bool& any_failure, unsigned int& retries);
+    static void log_tx_outcome(uint8_t byte, StopReason reason, bool success,
+                               unsigned int retries, Time completed);
+    static const char* stop_reason_name(StopReason reason);
     void fault();
     bool cancelled() const { return stopping_ && stopping_(); }
 

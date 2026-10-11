@@ -1,8 +1,15 @@
 #include "volume_control.h"
+#include <cstdio>
 #include <utility>
 
 namespace {
 constexpr unsigned int kCleanupAttempts = 3;
+
+long long monotonic_us(VolumeControl::Time time)
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        time.time_since_epoch()).count();
+}
 }
 
 VolumeControl::VolumeControl(VolumeTransmitter& tx, Ms inactivity, Ms max_hold,
@@ -13,16 +20,56 @@ VolumeControl::VolumeControl(VolumeTransmitter& tx, Ms inactivity, Ms max_hold,
 
 void VolumeControl::fault()
 {
+    if (state_ != State::FAULT_LATCHED)
+        std::fprintf(stderr, "mono_us=%lld XS8 state=FAULT_LATCHED "
+                             "stop_owed=%d context_may_be_open=%d\n",
+                     monotonic_us(now_()), stop_owed_, context_may_be_open_);
     state_ = State::FAULT_LATCHED;
 }
 
-bool VolumeControl::send_retry(uint8_t byte, bool& any_failure)
+bool VolumeControl::send_retry(uint8_t byte, bool& any_failure,
+                               unsigned int& retries)
 {
     for (unsigned int i = 0; i < kCleanupAttempts; ++i) {
-        if (tx_.send(byte)) return true;
+        if (tx_.send(byte)) {
+            retries = i;
+            return true;
+        }
         any_failure = true;
     }
+    retries = kCleanupAttempts - 1;
     return false;
+}
+
+void VolumeControl::log_tx_outcome(uint8_t byte, StopReason reason,
+                                   bool success, unsigned int retries,
+                                   Time completed)
+{
+    if (byte == 0x09)
+        std::fprintf(stderr, "mono_us=%lld XS8 STOP reason=%s result=%s "
+                             "retries=%u\n", monotonic_us(completed),
+                     stop_reason_name(reason), success ? "TX_OK" : "TX_FAIL",
+                     retries);
+    else
+        std::fprintf(stderr, "mono_us=%lld XS8 ROOT result=%s retries=%u\n",
+                     monotonic_us(completed), success ? "TX_OK" : "TX_FAIL",
+                     retries);
+}
+
+const char* VolumeControl::stop_reason_name(StopReason reason)
+{
+    switch (reason) {
+    case StopReason::CEC_RELEASE: return "CEC_RELEASE";
+    case StopReason::INACTIVITY: return "INACTIVITY";
+    case StopReason::MAX_HOLD: return "MAX_HOLD";
+    case StopReason::DIRECTION_CHANGE: return "DIRECTION_CHANGE";
+    case StopReason::SHUTDOWN: return "SHUTDOWN";
+    case StopReason::CANCELLED: return "CANCELLED";
+    case StopReason::TX_ERROR: return "TX_ERROR";
+    case StopReason::STARTUP_RECOVERY: return "STARTUP_RECOVERY";
+    case StopReason::NONE: return "NONE";
+    }
+    return "UNKNOWN";
 }
 
 bool VolumeControl::startup(bool recovery_enabled, bool operator_authorized)
@@ -40,30 +87,69 @@ bool VolumeControl::startup(bool recovery_enabled, bool operator_authorized)
     stop_owed_ = true;
     bool any_failure = !tx_.send(0x17);
     state_ = State::STOP_PENDING;
-    if (!send_retry(0x09, any_failure)) { fault(); return false; }
+    unsigned int stop_retries = 0;
+    const bool stop_ok = send_retry(0x09, any_failure, stop_retries);
+    const Time stop_completed = now_();
+    if (!stop_ok) {
+        log_tx_outcome(0x09, StopReason::STARTUP_RECOVERY, false,
+                       stop_retries, stop_completed);
+        fault();
+        return false;
+    }
     stop_owed_ = false;
     state_ = State::EXIT_PENDING;
-    if (!send_retry(0x07, any_failure)) { fault(); return false; }
+    unsigned int root_retries = 0;
+    const bool root_ok = send_retry(0x07, any_failure, root_retries);
+    const Time root_completed = now_();
+    log_tx_outcome(0x09, StopReason::STARTUP_RECOVERY, true,
+                   stop_retries, stop_completed);
+    log_tx_outcome(0x07, StopReason::NONE, root_ok,
+                   root_retries, root_completed);
+    if (!root_ok) { fault(); return false; }
     context_may_be_open_ = false;
     if (any_failure) { fault(); return false; }
     state_ = State::IDLE;
     return true;
 }
 
-bool VolumeControl::finish(Time now)
+bool VolumeControl::finish(Time now, StopReason reason)
 {
     bool any_failure = false;
+    bool sent_stop = false;
+    unsigned int stop_retries = 0;
+    Time stop_completed{};
     if (stop_owed_) {
         state_ = State::STOP_PENDING;
-        if (!send_retry(0x09, any_failure)) { fault(); return false; }
+        const bool stop_ok = send_retry(0x09, any_failure, stop_retries);
+        stop_completed = now_();
+        if (!stop_ok) {
+            log_tx_outcome(0x09, reason, false, stop_retries, stop_completed);
+            fault();
+            return false;
+        }
+        sent_stop = true;
         stop_owed_ = false;
     }
+    bool sent_root = false;
+    unsigned int root_retries = 0;
+    Time root_completed{};
+    Time completed{};
     if (context_may_be_open_) {
         state_ = State::EXIT_PENDING;
-        if (!send_retry(0x07, any_failure)) { fault(); return false; }
+        const bool root_ok = send_retry(0x07, any_failure, root_retries);
+        root_completed = now_();
+        completed = root_completed;
+        if (sent_stop)
+            log_tx_outcome(0x09, reason, true, stop_retries, stop_completed);
+        log_tx_outcome(0x07, StopReason::NONE, root_ok,
+                       root_retries, root_completed);
+        if (!root_ok) { fault(); return false; }
+        sent_root = true;
         context_may_be_open_ = false;
     }
-    Time completed = now_();
+    if (!sent_root) completed = now_();
+    if (sent_stop && !sent_root)
+        log_tx_outcome(0x09, reason, true, stop_retries, stop_completed);
     stale_before_ = completed > now ? completed : now;
     if (any_failure) { fault(); return false; }
     state_ = State::IDLE;
@@ -75,25 +161,29 @@ bool VolumeControl::start(Direction direction, Time received, Time now)
     state_ = State::ENTERING;
     context_may_be_open_ = true;
     if (!tx_.send(0x17)) {
-        finish(now);
+        finish(now, StopReason::TX_ERROR);
         fault();
         return false;
     }
     if (cancelled()) {
-        finish(now);
+        finish(now, StopReason::CANCELLED);
         return false;
     }
 
     // Set before TX: a frame can reach the receiver before a GPIO failure.
     state_ = State::START_UNCERTAIN;
     stop_owed_ = true;
-    if (!tx_.send(direction == Direction::UP ? 0xF9 : 0xE9)) {
-        finish(now);
+    const bool started = tx_.send(direction == Direction::UP ? 0xF9 : 0xE9);
+    std::fprintf(stderr, "mono_us=%lld XS8 START direction=%s result=%s\n",
+                 monotonic_us(now_()), direction == Direction::UP ? "UP" : "DOWN",
+                 started ? "TX_OK" : "TX_FAIL");
+    if (!started) {
+        finish(now, StopReason::TX_ERROR);
         fault();
         return false;
     }
     if (cancelled()) {
-        finish(now);
+        finish(now, StopReason::CANCELLED);
         return false;
     }
     direction_ = direction;
@@ -118,7 +208,7 @@ bool VolumeControl::press(Direction direction, Time received, Time now)
             if (received > last_volume_event_) last_volume_event_ = received;
             return true;
         }
-        if (!finish(now)) return false;
+        if (!finish(now, StopReason::DIRECTION_CHANGE)) return false;
         if (cancelled()) return false;
     }
     if (state_ != State::IDLE) return false;
@@ -131,7 +221,7 @@ bool VolumeControl::release(Direction direction, Time now)
         rearm_blocked_ = false;
     if ((state_ == State::HOLDING_UP || state_ == State::HOLDING_DOWN) &&
         direction == direction_)
-        return finish(now);
+        return finish(now, StopReason::CEC_RELEASE);
     return state_ == State::IDLE;
 }
 
@@ -140,23 +230,23 @@ bool VolumeControl::mute(Time now)
     if (state_ == State::BOOT_INHIBIT || state_ == State::FAULT_LATCHED ||
         cancelled()) return false;
     if (state_ == State::HOLDING_UP || state_ == State::HOLDING_DOWN) {
-        if (!finish(now)) return false;
+        if (!finish(now, StopReason::CANCELLED)) return false;
     }
     if (state_ != State::IDLE) return false;
     state_ = State::ENTERING;
     context_may_be_open_ = true;
     if (!tx_.send(0x17)) {
-        finish(now);
+        finish(now, StopReason::TX_ERROR);
         fault();
         return false;
     }
-    if (cancelled()) return finish(now);
+    if (cancelled()) return finish(now, StopReason::CANCELLED);
     if (!tx_.send(0xD8)) {
-        finish(now);
+        finish(now, StopReason::TX_ERROR);
         fault();
         return false;
     }
-    if (!finish(now)) return false;
+    if (!finish(now, StopReason::NONE)) return false;
     return true;
 }
 
@@ -167,7 +257,8 @@ void VolumeControl::tick(Time now)
         now - hold_started_ >= max_hold_) {
         rearm_blocked_ = true;
         blocked_direction_ = direction_;
-        finish(now);
+        finish(now, now - last_volume_event_ >= inactivity_
+                        ? StopReason::INACTIVITY : StopReason::MAX_HOLD);
     }
 }
 
@@ -175,7 +266,7 @@ bool VolumeControl::shutdown(Time now)
 {
     if (stop_owed_ || context_may_be_open_) {
         bool was_fault = state_ == State::FAULT_LATCHED;
-        bool cleaned = finish(now);
+        bool cleaned = finish(now, StopReason::SHUTDOWN);
         if (was_fault) fault();
         return cleaned && !was_fault;
     }

@@ -163,8 +163,20 @@ int main(int argc, char** argv) {
                 event.code == CEC_USER_CONTROL_CODE_VOLUME_DOWN) {
                 auto direction = event.code == CEC_USER_CONTROL_CODE_VOLUME_UP
                     ? VolumeControl::Direction::UP : VolumeControl::Direction::DOWN;
+                const auto processed = Clock::now();
+                const auto mono_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    processed.time_since_epoch()).count();
+                const auto age_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    processed - event.received).count();
                 if (released) volume.release(direction, now);
                 else volume.press(direction, event.received, now);
+                std::fprintf(stderr, "mono_us=%lld CEC volume=%s direction=%s "
+                                     "duration_ms=%u event_age_us=%lld\n",
+                             static_cast<long long>(mono_us),
+                             released ? "RELEASE" : "PRESS",
+                             direction == VolumeControl::Direction::UP ? "UP" : "DOWN",
+                             static_cast<unsigned int>(event.duration),
+                             static_cast<long long>(age_us));
             } else if (event.code == CEC_USER_CONTROL_CODE_MUTE && !released &&
                        event.received <= now && now - event.received < WATCHDOG) {
                 volume.mute(now);
