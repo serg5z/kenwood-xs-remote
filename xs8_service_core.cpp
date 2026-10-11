@@ -105,7 +105,7 @@ void Xs8ServiceCore::disconnected(Time now)
     client_connected_ = false;
     if (volume_.state() == VolumeControl::State::HOLDING_UP ||
         volume_.state() == VolumeControl::State::HOLDING_DOWN)
-        volume_.release(owner_direction_, now);
+        volume_.disconnect(owner_direction_, now);
     else if (volume_.stop_owed() || volume_.context_may_be_open())
         volume_.shutdown(now);
 }

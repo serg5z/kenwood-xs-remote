@@ -76,6 +76,21 @@ static void test_serialized_commands_and_disconnect()
            "ERR NO_CLIENT\n");
 }
 
+static void test_down_hold_disconnect_before_max_hold()
+{
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(20); });
+    core.connected();
+    assert(core.command("VOLUME_PRESS DOWN", at(10), at(10)) ==
+           "OK VOLUME_PRESS_TX\n");
+    core.disconnected(at(20));
+    assert(tx.sent == (std::vector<uint8_t>{0x17, 0xE9, 0x09, 0x07}));
+    assert(core.state() == VolumeControl::State::IDLE);
+    assert(!core.stop_owed());
+    assert(core.command("STATUS", at(21), at(21)).find(
+               "last_stop_waveform=MATCH") != std::string::npos);
+}
+
 static void test_release_and_mute_order()
 {
     FakeTx tx;
@@ -129,11 +144,13 @@ static void test_failed_stop_verification_and_monitor()
     Xs8ServiceCore disconnected(disconnected_tx, Ms(2000), true,
                                 {}, [] { return at(20); });
     disconnected.connected();
-    disconnected.command("VOLUME_PRESS UP", at(10), at(10));
+    disconnected.command("VOLUME_PRESS DOWN", at(10), at(10));
     disconnected_tx.stop_matches = {false, false, false};
     disconnected.disconnected(at(20));
     assert(disconnected.state() == VolumeControl::State::FAULT_LATCHED);
     assert(disconnected.stop_owed());
+    assert(disconnected_tx.sent == (std::vector<uint8_t>{
+        0x17, 0xE9, 0x09, 0x09, 0x09}));
 
     FakeTx tx2;
     Xs8ServiceCore core2(tx2, Ms(2000), true, {}, [] { return at(1); });
@@ -160,6 +177,7 @@ int main()
 {
     test_startup_and_parsing();
     test_serialized_commands_and_disconnect();
+    test_down_hold_disconnect_before_max_hold();
     test_release_and_mute_order();
     test_release_and_watchdog();
     test_failed_stop_verification_and_monitor();

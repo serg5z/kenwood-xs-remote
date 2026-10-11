@@ -60,6 +60,7 @@ const char* VolumeControl::stop_reason_name(StopReason reason)
 {
     switch (reason) {
     case StopReason::CEC_RELEASE: return "CEC_RELEASE";
+    case StopReason::CLIENT_DISCONNECT: return "CLIENT_DISCONNECT";
     case StopReason::INACTIVITY: return "INACTIVITY";
     case StopReason::MAX_HOLD: return "MAX_HOLD";
     case StopReason::DIRECTION_CHANGE: return "DIRECTION_CHANGE";
@@ -222,6 +223,16 @@ bool VolumeControl::release(Direction direction, Time now)
     if ((state_ == State::HOLDING_UP || state_ == State::HOLDING_DOWN) &&
         direction == direction_)
         return finish(now, StopReason::CEC_RELEASE);
+    return state_ == State::IDLE;
+}
+
+bool VolumeControl::disconnect(Direction direction, Time now)
+{
+    if (rearm_blocked_ && direction == blocked_direction_)
+        rearm_blocked_ = false;
+    if ((state_ == State::HOLDING_UP || state_ == State::HOLDING_DOWN) &&
+        direction == direction_)
+        return finish(now, StopReason::CLIENT_DISCONNECT);
     return state_ == State::IDLE;
 }
 

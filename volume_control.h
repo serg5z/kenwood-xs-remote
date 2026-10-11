@@ -32,6 +32,7 @@ public:
     bool startup(bool recovery_enabled, bool operator_authorized);
     bool press(Direction direction, Time received, Time now);
     bool release(Direction direction, Time now);
+    bool disconnect(Direction direction, Time now);
     bool mute(Time now);
     void tick(Time now);
     bool shutdown(Time now);
@@ -43,7 +44,7 @@ public:
 
 private:
     enum class StopReason {
-        CEC_RELEASE, INACTIVITY, MAX_HOLD, DIRECTION_CHANGE,
+        CEC_RELEASE, CLIENT_DISCONNECT, INACTIVITY, MAX_HOLD, DIRECTION_CHANGE,
         SHUTDOWN, CANCELLED, TX_ERROR, STARTUP_RECOVERY, NONE
     };
     bool start(Direction direction, Time received, Time now);
