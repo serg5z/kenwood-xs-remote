@@ -1,0 +1,27 @@
+[Unit]
+Description=Kenwood XS Remote read-only Web Gateway
+# The gateway binds loopback; it does not require an assigned LAN address.
+After=network.target
+
+[Service]
+Type=simple
+User=__GATEWAY_USER__
+Group=__GATEWAY_GROUP__
+WorkingDirectory=__REPO_DIR__
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 __REPO_DIR__/xs8_gateway.py --bind 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+PrivateDevices=true
+# Do not isolate /tmp: xs8-service uses /tmp/kenwood-xs8.sock by default.
+PrivateTmp=false
+RestrictAddressFamilies=AF_UNIX AF_INET
+
+[Install]
+WantedBy=multi-user.target

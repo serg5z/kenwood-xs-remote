@@ -24,6 +24,8 @@ Replace `192.168.1.20` with the Pi's actual address, then open `http://192.168.1
 
 For authenticated HTTPS on the LAN, use the [nginx setup guide](https-lan.md) and return the gateway to its default loopback binding.
 
+For optional gateway autostart after reboot, see the [systemd unit guide](gateway-systemd.md). It starts only the read-only gateway; `xs8-service` remains separate.
+
 Offline tests (no GPIO or receiver access):
 
 ```sh
