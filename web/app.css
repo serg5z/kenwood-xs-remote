@@ -24,6 +24,8 @@
   min-width: 0;
   padding: 4px;
 }
+
+.mute:not(:disabled) { background:#a64532; border-color:#a64532; color:#fff; cursor:pointer; }
 .transport-grid svg {
   display: block;
   width: 22px;

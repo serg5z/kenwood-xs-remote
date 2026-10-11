@@ -1,6 +1,6 @@
-# Web Remote preview and HTTP API v0.1
+# Web Remote and HTTP API v0.1
 
-The Web Remote remains a **read-only preview**. It displays XS8 Service status and capabilities. Every control button is disabled. Phase 2A rejects the MUTE development gate at startup; the running Gateway sends only `STATUS` to the local XS8 Service socket.
+The Gateway remains **read-only by default**. An explicit production `--enable-mute` option can enable only MUTE through the authenticated HTTPS and systemd Unix-socket route. Volume, input selection, and CD transport remain disabled. The checked-in systemd unit does not enable MUTE. See [MUTE deployment and rollback](mute-control.md) before opting in.
 
 ## Run locally
 
@@ -37,15 +37,15 @@ python3 -m unittest discover -s tests -p 'test_gateway.py'
 | Endpoint | Result |
 | --- | --- |
 | `GET /api/v1/status` | JSON with `gateway`, `xs8_service`, and parsed service `status`. Returns HTTP 503 when the service is unavailable or its reply is invalid. |
-| `GET /api/v1/capabilities` | JSON classifications (`supported`, `unverified`, `unsupported`) and explicit `enabled` flags. Only status is enabled in Phase 2A. |
-| `GET /api/v1/session` | Returns 404 while the MUTE gate is disabled. Session and CSRF logic is retained for future review. |
-| `POST /api/v1/mute` | Returns 501 without sending a control command. Other POST paths also return 501. |
+| `GET /api/v1/capabilities` | JSON classifications and enabled flags. MUTE is enabled only when its gate, session and XS8 eligibility checks pass. |
+| `GET /api/v1/session` | Returns 404 with MUTE disabled; otherwise issues a secure session cookie and one-use CSRF token. |
+| `POST /api/v1/mute` | Returns 501 with MUTE disabled. With the production gate, a valid request checks fresh XS8 eligibility and sends one `MUTE` to the local service. Other POST paths remain 501. |
 
 `status` preserves the service's `last_gpio_tx`, `last_waveform`, and `receiver_execution` fields. `TX_OK` and `MATCH` do not prove that the Kenwood executed a command. The gateway opens one short-lived Unix socket connection per status request. It does not modify XS8 state.
 
 ## Isolated offline MUTE test path
 
-The legacy `--enable-dev-mute` flag remains rejected. `--enable-offline-mute` is a default-off test gate. It requires `--systemd-socket`, a verified nginx worker UID, an exact `--https-origin`, and an explicit non-default fake `--socket`. TCP and LAN-preview modes cannot enable it. Before sending `MUTE`, the Gateway requires a random `OFFLINE_TEST` challenge response from the fake service **on the same connection**. The real XS8 Service does not implement that response. The production systemd unit has no offline gate or alternate service socket, so it remains read-only. A non-default pathname by itself is not proof that a service is fake; retain the challenge and never point test tooling at a live service.
+The legacy `--enable-dev-mute` flag remains rejected. `--enable-offline-mute` is a default-off test gate. It requires `--systemd-socket`, a verified nginx worker UID, an exact `--https-origin`, and an explicit non-default fake `--socket`. TCP and LAN-preview modes cannot enable it. Before sending `MUTE`, the Gateway requires a random `OFFLINE_TEST` challenge response from the fake service **on the same connection**. The real XS8 Service does not implement that response. A non-default pathname by itself is not proof that a service is fake; retain the challenge and never point test tooling at a live service.
 
 Run isolated tests from the repository root without changing the deployed nginx or systemd units:
 
@@ -55,9 +55,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_gateway
 
 The suite creates temporary Gateway and fake XS8 Unix sockets, then closes them. It uses an nginx-like authenticated request model; on Linux it exercises real `SO_PEERCRED`. It does not inspect the deployed nginx instance, terminate the live Gateway, or contact `/tmp/kenwood-xs8.sock`. Review `sudo nginx -T` and independently test forged identity headers against an **isolated** nginx instance before treating header replacement as deployed evidence. Do not start an offline-gated Gateway on the live `/run/kenwood-gateway.sock`.
 
-The offline path uses a 30-minute, Secure, HttpOnly, SameSite=Strict session cookie and a one-use CSRF token. It checks an exact HTTPS Origin, method, content type and body; it does not treat a fake service `OK MUTE_TX` reply as proof of receiver execution. A future release must explicitly reauthorize physical control after the trust-boundary tests pass.
+Both MUTE modes use a 30-minute, Secure, HttpOnly, SameSite=Strict session cookie and a one-use CSRF token. They check exact HTTPS Origin, method, content type and body. Production mode additionally requires the default real XS8 Service socket and a fresh eligible STATUS before the one MUTE dispatch. A service `OK MUTE_TX` reply is transmission evidence, never proof of receiver execution.
 
-The MUTE button stays disabled in Phase 2A. The XS8 Service retains final authorization, including BOOT_INHIBIT. A process running as the nginx worker UID can reach the Gateway Unix socket directly; verify that account is not shared by unrelated local applications. HTTPS, Basic Auth, restricted socket permissions, peer UID validation, Origin and CSRF checks are all required before physical Web control is enabled.
+The XS8 Service retains final authorization, including BOOT_INHIBIT and FAULT_LATCHED. A process running as the nginx worker UID can reach the Gateway Unix socket directly; verify that account is not shared by unrelated local applications. HTTPS, Basic Auth, restricted socket permissions, peer UID validation, Origin and CSRF checks remain required for physical Web control.
 
 ## Future control API design (not implemented)
 

@@ -19,7 +19,7 @@
       <div class="remote-heading">
         <p class="eyebrow">SYSTEM CONTROL / XS8</p>
         <h1>Receiver control</h1>
-        <p class="intro">A quiet place for your hi-fi controls. Control actions are unavailable in this read-only preview.</p>
+        <p class="intro">A quiet place for your hi-fi controls. Controls are disabled in the standard read-only preview.</p>
       </div>
 
       <div class="control-layout">
@@ -67,11 +67,11 @@
             <span class="rocker-seam" aria-hidden="true"></span>
             <button disabled type="button" aria-label="Volume down">−</button>
           </div>
-          <button class="mute" disabled type="button">MUTE</button>
+          <button class="mute" id="mute-button" disabled type="button">MUTE</button>
         </section>
       </div>
 
-      <p class="availability"><span class="availability-dot" aria-hidden="true"></span>CONTROL DISABLED · READ-ONLY PREVIEW</p>
+      <p class="availability" role="status" aria-live="polite"><span class="availability-dot" aria-hidden="true"></span><span id="availability-text">CONTROL DISABLED · READ-ONLY PREVIEW</span></p>
     </section>
 
     <details class="diagnostics">

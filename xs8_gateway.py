@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local HTTP gateway; MUTE requires an explicit offline development gate."""
+"""Local HTTP gateway; MUTE requires an explicit socket-activated control gate."""
 
 import argparse
 import ipaddress
@@ -36,7 +36,7 @@ class MuteServiceError(Exception):
         self.result = result
 
 
-def send_mute(socket_path, timeout=1.0):
+def send_mute(socket_path, timeout=1.0, fake_only=True):
     """One socket request, one command, no retry after an uncertain outcome."""
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
@@ -47,22 +47,23 @@ def send_mute(socket_path, timeout=1.0):
                 raise MuteServiceError("TIMEOUT", "XS8 service connection timed out") from exc
             except OSError as exc:
                 raise MuteServiceError("UNAVAILABLE", "XS8 service unavailable") from exc
-            challenge_complete = False
+            challenge_complete = not fake_only
             try:
-                # Keep the fake-only challenge and MUTE on one connection.
-                challenge = secrets.token_hex(16).encode("ascii")
-                client.sendall(b"OFFLINE_TEST " + challenge + b"\n")
-                reply = bytearray()
-                while b"\n" not in reply:
-                    chunk = client.recv(128)
-                    if not chunk:
+                if fake_only:
+                    # Keep the fake-only challenge and MUTE on one connection.
+                    challenge = secrets.token_hex(16).encode("ascii")
+                    client.sendall(b"OFFLINE_TEST " + challenge + b"\n")
+                    reply = bytearray()
+                    while b"\n" not in reply:
+                        chunk = client.recv(128)
+                        if not chunk:
+                            raise MuteServiceError("UNSAFE_SERVICE", "Fake service challenge failed")
+                        reply.extend(chunk)
+                        if len(reply) > 256:
+                            raise MuteServiceError("UNSAFE_SERVICE", "Fake service challenge failed")
+                    if bytes(reply) != b"OK OFFLINE_TEST " + challenge + b"\n":
                         raise MuteServiceError("UNSAFE_SERVICE", "Fake service challenge failed")
-                    reply.extend(chunk)
-                    if len(reply) > 256:
-                        raise MuteServiceError("UNSAFE_SERVICE", "Fake service challenge failed")
-                if bytes(reply) != b"OK OFFLINE_TEST " + challenge + b"\n":
-                    raise MuteServiceError("UNSAFE_SERVICE", "Fake service challenge failed")
-                challenge_complete = True
+                    challenge_complete = True
                 client.sendall(b"MUTE\n")
                 response = bytearray()
                 while b"\n" not in response:
@@ -137,7 +138,7 @@ def capabilities(mute_available=False):
             "status": {"classification": "supported", "enabled": True},
             "mute": {
                 "classification": "unverified", "enabled": mute_available,
-                "reason": "Development gate only; receiver execution is unverified",
+                "reason": "Receiver execution is unverified",
             },
             "volume_step": {
                 "classification": "unsupported", "enabled": False,
@@ -158,8 +159,12 @@ def capabilities(mute_available=False):
 class GatewayHandler(BaseHTTPRequestHandler):
     socket_path = DEFAULT_SOCKET
     dev_mute_enabled = False
+    production_mute_enabled = False
     https_origin = None
     sessions = None
+
+    def mute_enabled(self):
+        return self.dev_mute_enabled or self.production_mute_enabled
 
     def authenticated_user(self):
         # nginx overwrites this header with $remote_user after Basic Auth.
@@ -190,6 +195,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
             status = read_status(self.socket_path)
         except ServiceError:
             return False
+        return self.status_allows_mute(status)
+
+    @staticmethod
+    def status_allows_mute(status):
         return (status["state"] == "IDLE" and status["monitor"] == "HEALTHY"
                 and status["stop_owed"] == "0" and status["context_may_be_open"] == "0")
 
@@ -222,11 +231,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                  "status": status})
             return
         if path == "/api/v1/capabilities":
-            enabled = (self.dev_mute_enabled and self.current_session() is not None
+            enabled = (self.mute_enabled() and self.current_session() is not None
                        and self.service_ready())
             self.send_json(200, capabilities(enabled))
             return
-        if path == "/api/v1/session" and self.dev_mute_enabled:
+        if path == "/api/v1/session" and self.mute_enabled():
             user = self.authenticated_user()
             if not user:
                 self.send_json(401, {"error": "Authentication required"})
@@ -255,7 +264,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if (urlsplit(self.path).path != "/api/v1/mute" or
-                not self.dev_mute_enabled or
+                not self.mute_enabled() or
                 not getattr(self.server, "proxy_peer_verified", False)):
             length = self.headers.get("Content-Length", "")
             if len(length) <= 4 and length.isdecimal() and 0 < int(length) <= 4096:
@@ -284,13 +293,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 types != ["application/json"] or self.headers.get("Transfer-Encoding")):
             self.send_json(400, {"error": "Expected Content-Type application/json and body {}"})
             return
-        if self.rfile.read(2) != b"{}":
+        self.connection.settimeout(2)
+        try:
+            body = self.rfile.read(2)
+        except (OSError, TimeoutError):
+            return
+        if body != b"{}":
             self.send_json(400, {"error": "Expected JSON body {}"})
             return
         # Single use: a repeated request with the same token cannot dispatch again.
         session["csrf"] = secrets.token_urlsafe(32)
+        if self.production_mute_enabled:
+            try:
+                status = read_status(self.socket_path)
+            except ServiceError:
+                self.send_json(503, {"result": "UNAVAILABLE", "receiver_execution": "UNVERIFIED"})
+                return
+            if not self.status_allows_mute(status):
+                self.send_json(409, {"result": "NOT_ELIGIBLE", "receiver_execution": "UNVERIFIED"})
+                return
         try:
-            reply = send_mute(self.socket_path)
+            reply = send_mute(self.socket_path, fake_only=not self.production_mute_enabled)
         except MuteServiceError as exc:
             code = {"UNAVAILABLE": 503, "REJECTED": 409, "TIMEOUT": 504}.get(exc.result, 502)
             self.send_json(code, {"result": exc.result, "error": str(exc),
@@ -345,7 +368,9 @@ def parse_args(argv=None):
                         help="reserved: legacy development gate remains disabled")
     parser.add_argument("--enable-offline-mute", action="store_true",
                         help="allow MUTE only after a fake service challenge")
-    parser.add_argument("--https-origin", help="required HTTPS Origin for offline MUTE tests")
+    parser.add_argument("--enable-mute", action="store_true",
+                        help="enable production MUTE through the real local XS8 Service")
+    parser.add_argument("--https-origin", help="required exact HTTPS Origin for MUTE")
     parser.add_argument("--systemd-socket", action="store_true",
                         help="serve read-only HTTP using the systemd Unix listener")
     parser.add_argument("--nginx-uid", type=int,
@@ -353,9 +378,11 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.enable_dev_mute:
         parser.error("MUTE development gate is disabled in phase 2A")
-    if args.enable_offline_mute:
-        if not args.systemd_socket or args.socket == DEFAULT_SOCKET or not args.https_origin:
-            parser.error("offline MUTE requires --systemd-socket, --https-origin, and an explicit non-default --socket")
+    if args.enable_offline_mute and args.enable_mute:
+        parser.error("offline and production MUTE modes are mutually exclusive")
+    if args.enable_offline_mute or args.enable_mute:
+        if not args.systemd_socket or not args.https_origin:
+            parser.error("MUTE requires --systemd-socket and --https-origin")
         try:
             origin = urlsplit(args.https_origin)
             origin.port  # Reject malformed port syntax before accepting the origin.
@@ -365,15 +392,19 @@ def parse_args(argv=None):
                 origin.password or origin.netloc.endswith(":") or
                 args.https_origin != f"https://{origin.netloc}"):
             parser.error("--https-origin must be an exact HTTPS origin without path or credentials")
-        if Path(args.socket).resolve() == Path(DEFAULT_SOCKET).resolve():
-            parser.error("offline MUTE socket must not resolve to the real XS8 Service socket")
-        try:
-            if os.path.samefile(args.socket, DEFAULT_SOCKET):
-                parser.error("offline MUTE socket must not be the real XS8 Service socket")
-        except FileNotFoundError:
-            pass
+        if args.enable_offline_mute:
+            if (args.socket == DEFAULT_SOCKET or
+                    Path(args.socket).resolve() == Path(DEFAULT_SOCKET).resolve()):
+                parser.error("offline MUTE requires a non-default fake XS8 socket")
+            try:
+                if os.path.samefile(args.socket, DEFAULT_SOCKET):
+                    parser.error("offline MUTE socket must not be the real XS8 Service socket")
+            except FileNotFoundError:
+                pass
+        elif args.socket != DEFAULT_SOCKET:
+            parser.error("production MUTE requires the default XS8 Service socket")
     elif args.https_origin:
-        parser.error("--https-origin requires --enable-offline-mute")
+        parser.error("--https-origin requires an enabled MUTE mode")
     if args.systemd_socket:
         if (args.nginx_uid is None or args.nginx_uid <= 0 or
                 args.allow_insecure_readonly_lan or args.bind is not None or
@@ -404,6 +435,7 @@ def main(argv=None):
               "do not forward this port to the internet", file=sys.stderr)
     handler = type("ConfiguredGatewayHandler", (GatewayHandler,),
                    {"socket_path": args.socket, "dev_mute_enabled": args.enable_offline_mute,
+                    "production_mute_enabled": args.enable_mute,
                     "https_origin": args.https_origin, "sessions": {}})
     if args.systemd_socket:
         try:
@@ -411,7 +443,8 @@ def main(argv=None):
         except (OSError, ValueError) as exc:
             print(f"XS8 gateway socket activation failed: {exc}", file=sys.stderr)
             return 1
-        mode = "OFFLINE FAKE MUTE TEST" if args.enable_offline_mute else "read-only"
+        mode = ("PRODUCTION MUTE" if args.enable_mute else
+                "OFFLINE FAKE MUTE TEST" if args.enable_offline_mute else "read-only")
         print(f"XS8 gateway listening on {GATEWAY_SOCKET} ({mode})")
     else:
         server = HTTPServer((args.bind, args.port), handler)

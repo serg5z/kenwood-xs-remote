@@ -87,6 +87,47 @@ class OfflineFakeService(FakeService):
                     pass
 
 
+class RecordingService:
+    """Multi-connection fake for production-mode STATUS and MUTE requests."""
+
+    def __init__(self, path, status=STATUS, mute_reply=b"OK MUTE_TX\n"):
+        self.path = path
+        self.status = status
+        self.mute_reply = mute_reply
+        self.commands = []
+        self.stop = threading.Event()
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(path)
+        self.listener.listen(4)
+        self.listener.settimeout(0.1)
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        while not self.stop.is_set():
+            try:
+                client, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            with client:
+                command = client.recv(128)
+                self.commands.append(command)
+                reply = self.status if command == b"STATUS\n" else self.mute_reply
+                if reply is not None:
+                    try:
+                        client.sendall(reply)
+                    except BrokenPipeError:
+                        pass
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=2)
+        self.listener.close()
+        Path(self.path).unlink(missing_ok=True)
+        if self.thread.is_alive():
+            raise AssertionError("recording fake service did not stop")
+
+
 class DisabledControls(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -421,6 +462,21 @@ class BindingTest(unittest.TestCase):
                 alias.symlink_to(real)
                 self.parse_error(*(base + ["--socket", str(alias)] + origin))
 
+    def test_production_gate_requires_real_socket_and_activated_https_proxy(self):
+        base = ["--systemd-socket", "--nginx-uid", "33", "--enable-mute",
+                "--https-origin", "https://woodland-pi.local"]
+        args = xs8_gateway.parse_args(base)
+        self.assertTrue(args.enable_mute)
+        self.assertEqual(args.socket, xs8_gateway.DEFAULT_SOCKET)
+        for options in (base + ["--socket", "/tmp/fake-xs8.sock"],
+                        base + ["--bind", "127.0.0.1"],
+                        base + ["--allow-insecure-readonly-lan"],
+                        base + ["--enable-offline-mute"],
+                        ["--enable-mute", "--https-origin", "https://woodland-pi.local"],
+                        ["--systemd-socket", "--nginx-uid", "33", "--enable-mute"]):
+            with self.subTest(options=options):
+                self.parse_error(*options)
+
     def test_deployment_templates_keep_auth_and_control_gate_off(self):
         root = Path(xs8_gateway.__file__).resolve().parent
         nginx = (root / "deploy/nginx/kenwood-xs-remote.conf.example").read_text()
@@ -520,9 +576,10 @@ class ActivatedGatewayTest(unittest.TestCase):
         self.listener.listen(5)
         self.start_gateway()
 
-    def start_gateway(self, dev_mute=False):
+    def start_gateway(self, dev_mute=False, production_mute=False):
         handler = type("UnixTestHandler", (xs8_gateway.GatewayHandler,),
                        {"socket_path": self.service_path, "dev_mute_enabled": dev_mute,
+                        "production_mute_enabled": production_mute,
                         "https_origin": "https://woodland-pi.local", "sessions": {},
                         "log_message": lambda *args: None})
         self.server = xs8_gateway.ActivatedUnixServer(
@@ -665,6 +722,127 @@ class ActivatedGatewayTest(unittest.TestCase):
                 self.assertEqual(code, expected_code)
                 self.assertEqual(json.loads(body)["result"], expected_result)
                 self.assertEqual(len([line for line in fake.commands if line == b"MUTE\n"]), 1)
+
+    def test_production_gate_dispatches_one_mute_after_fresh_eligible_status(self):
+        self.stop_gateway()
+        self.start_gateway(production_mute=True)
+        fake = RecordingService(self.service_path)
+        try:
+            code, body, response_headers = self.nginx_like_request(
+                "GET", "/api/v1/session", "correct-test-password")
+            self.assertEqual(code, 200)
+            self.assertTrue(json.loads(body)["mute_available"])
+            headers = {"Origin": "https://woodland-pi.local",
+                       "Cookie": response_headers["Set-Cookie"].split(";", 1)[0],
+                       "X-CSRF-Token": json.loads(body)["csrf_token"],
+                       "Content-Type": "application/json"}
+            self.assertEqual(fake.commands, [b"STATUS\n"])
+            for credentials, changes, payload, expected in (
+                    (None, {}, "{}", 401),
+                    ("wrong", {}, "{}", 401),
+                    ("correct-test-password", {"Origin": "https://wrong.example"}, "{}", 403),
+                    ("correct-test-password", {"X-CSRF-Token": "wrong"}, "{}", 403),
+                    ("correct-test-password", {}, '{"x":1}', 400)):
+                self.assertEqual(self.nginx_like_request(
+                    "POST", "/api/v1/mute", credentials,
+                    {**headers, **changes}, payload)[0], expected)
+            self.assertEqual(fake.commands, [b"STATUS\n"])
+            code, body, _ = self.nginx_like_request(
+                "POST", "/api/v1/mute", "correct-test-password", headers, "{}")
+            self.assertEqual(code, 200)
+            self.assertEqual(json.loads(body)["result"], "SERVICE_TX_OK")
+            self.assertEqual(json.loads(body)["receiver_execution"], "UNVERIFIED")
+            self.assertEqual(fake.commands, [b"STATUS\n", b"STATUS\n", b"MUTE\n"])
+            self.assertEqual(self.nginx_like_request(
+                "POST", "/api/v1/mute", "correct-test-password", headers, "{}")[0], 403)
+            for path in ("/api/v1/source", "/api/v1/volume/step", "/api/v1/cd/transport"):
+                self.assertEqual(self.nginx_like_request(
+                    "POST", path, "correct-test-password", headers, "{}")[0], 501)
+            self.assertEqual(fake.commands.count(b"MUTE\n"), 1)
+        finally:
+            fake.close()
+
+    def test_production_gate_rejects_inhibited_faulted_and_unavailable_service(self):
+        self.stop_gateway()
+        self.start_gateway(production_mute=True)
+        for status in (STATUS.replace(b"state=IDLE", b"state=BOOT_INHIBIT"),
+                       STATUS.replace(b"state=IDLE", b"state=FAULT_LATCHED"),
+                       STATUS.replace(b"monitor=HEALTHY", b"monitor=FAILED"),
+                       STATUS.replace(b"stop_owed=0", b"stop_owed=1"),
+                       STATUS.replace(b"context_may_be_open=0", b"context_may_be_open=1")):
+            with self.subTest(status=status):
+                fake = RecordingService(self.service_path, status=status)
+                try:
+                    code, body, response_headers = self.nginx_like_request(
+                        "GET", "/api/v1/session", "correct-test-password")
+                    self.assertEqual(code, 200)
+                    self.assertFalse(json.loads(body)["mute_available"])
+                    headers = {"Origin": "https://woodland-pi.local",
+                               "Cookie": response_headers["Set-Cookie"].split(";", 1)[0],
+                               "X-CSRF-Token": json.loads(body)["csrf_token"],
+                               "Content-Type": "application/json"}
+                    code, body, _ = self.nginx_like_request(
+                        "POST", "/api/v1/mute", "correct-test-password", headers, "{}")
+                    self.assertEqual(code, 409)
+                    self.assertEqual(json.loads(body)["result"], "NOT_ELIGIBLE")
+                    self.assertEqual(fake.commands, [b"STATUS\n", b"STATUS\n"])
+                finally:
+                    fake.close()
+        code, body, response_headers = self.nginx_like_request(
+            "GET", "/api/v1/session", "correct-test-password")
+        self.assertEqual(code, 200)
+        self.assertFalse(json.loads(body)["mute_available"])
+        headers["Cookie"] = response_headers["Set-Cookie"].split(";", 1)[0]
+        headers["X-CSRF-Token"] = json.loads(body)["csrf_token"]
+        code, body, _ = self.nginx_like_request(
+            "POST", "/api/v1/mute", "correct-test-password", headers, "{}")
+        self.assertEqual(code, 503)
+        self.assertEqual(json.loads(body)["result"], "UNAVAILABLE")
+
+    def test_production_uncertain_reply_has_no_retry(self):
+        self.stop_gateway()
+        self.start_gateway(production_mute=True)
+        fake = RecordingService(self.service_path, mute_reply=b"ERR MUTE_UNCERTAIN\n")
+        try:
+            code, body, response_headers = self.nginx_like_request(
+                "GET", "/api/v1/session", "correct-test-password")
+            headers = {"Origin": "https://woodland-pi.local",
+                       "Cookie": response_headers["Set-Cookie"].split(";", 1)[0],
+                       "X-CSRF-Token": json.loads(body)["csrf_token"],
+                       "Content-Type": "application/json"}
+            code, body, _ = self.nginx_like_request(
+                "POST", "/api/v1/mute", "correct-test-password", headers, "{}")
+            self.assertEqual(code, 502)
+            self.assertEqual(json.loads(body)["result"], "SERVICE_UNCERTAIN")
+            self.assertEqual(self.nginx_like_request(
+                "POST", "/api/v1/mute", "correct-test-password", headers, "{}")[0], 403)
+            self.assertEqual(fake.commands.count(b"MUTE\n"), 1)
+        finally:
+            fake.close()
+
+    def test_production_incomplete_post_body_cannot_dispatch(self):
+        self.stop_gateway()
+        self.start_gateway(production_mute=True)
+        fake = RecordingService(self.service_path)
+        try:
+            code, body, response_headers = self.nginx_like_request(
+                "GET", "/api/v1/session", "correct-test-password")
+            self.assertEqual(code, 200)
+            request = (
+                "POST /api/v1/mute HTTP/1.1\r\nHost: woodland-pi.local\r\n"
+                "Origin: https://woodland-pi.local\r\nX-Forwarded-Proto: https\r\n"
+                "X-Kenwood-Authenticated-User: remote\r\n"
+                f"Cookie: {response_headers['Set-Cookie'].split(';', 1)[0]}\r\n"
+                f"X-CSRF-Token: {json.loads(body)['csrf_token']}\r\n"
+                "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n"
+            ).encode()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(self.path)
+                client.sendall(request)
+                time.sleep(2.3)
+            self.assertEqual(fake.commands, [b"STATUS\n"])
+        finally:
+            fake.close()
 
     def test_fake_nginx_request_and_unavailable_service(self):
         fake = FakeService(self.service_path, STATUS)
