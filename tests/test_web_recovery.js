@@ -24,6 +24,7 @@ const buttons = ['CD', 'TUNER', 'PHONO', 'TV1', 'TV2', 'TAPE1', 'TAPE2'].map(
   (source) => ({ dataset: { source }, disabled: true,
     addEventListener(_event, handler) { this.click = handler; } }));
 const mute = { disabled: true, addEventListener(_event, handler) { this.click = handler; } };
+const sync = { disabled: true, addEventListener(_event, handler) { this.click = handler; } };
 const calls = [];
 const queued = new Map();
 let poll;
@@ -52,6 +53,7 @@ const context = {
   document: {
     getElementById(id) {
       if (id === 'mute-button') return mute;
+      if (id === 'sync-button') return sync;
       if (!elements.has(id)) elements.set(id, { textContent: '' });
       return elements.get(id);
     },

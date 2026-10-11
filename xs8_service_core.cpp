@@ -69,7 +69,8 @@ std::string Xs8ServiceCore::status() const
             ? evidence.gpio_completed ? "TX_OK" : "TX_FAIL" : "NONE") +
         " last_waveform=" + waveform_name(evidence.waveform) +
         " last_stop_waveform=" + waveform_name(stop.waveform) +
-        " receiver_execution=" + receiver_name(evidence.receiver) + "\n";
+        " receiver_execution=" + receiver_name(evidence.receiver) +
+        receiver_status_ + "\n";
 }
 
 std::string Xs8ServiceCore::command(const std::string& line, Time received,

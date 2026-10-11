@@ -26,6 +26,10 @@
         <div class="left-controls">
           <section class="control-group" aria-labelledby="source-title">
             <div class="section-heading"><h2 id="source-title">Input</h2><span>SELECT SOURCE</span></div>
+            <div class="receiver-readback" aria-live="polite">
+              <div><span id="source-status">SOURCE UNKNOWN</span><small id="monitor-status">TAPE2 MONITOR UNKNOWN</small></div>
+              <button id="sync-button" disabled type="button">SYNC</button>
+            </div>
             <div class="source-grid">
               <button disabled type="button" data-source="CD">CD</button>
               <button disabled type="button" data-source="TV1">TV1</button>

@@ -20,6 +20,18 @@ STATUS = (b"OK state=IDLE stop_owed=0 context_may_be_open=0 "
           b"monitor=HEALTHY last_byte=0x09 last_gpio_tx=TX_OK "
           b"last_waveform=MATCH last_stop_waveform=MATCH "
           b"receiver_execution=UNVERIFIED\n")
+RECEIVER_STATUS = STATUS.replace(b"\n", (
+    b" receiver_source=CD receiver_source_ns=1000000000"
+    b" receiver_source_evidence=PASSIVE receiver_monitor=ON"
+    b" receiver_monitor_ns=1000000100 receiver_monitor_evidence=QUERY"
+    b" receiver_integrity=HEALTHY\n"))
+QUERY_REPLY = (b"OK QUERY_STATUS reason=NONE gpio_tx=TX_OK waveform=MATCH "
+               b"bytes=lsb/legacy@start_ns-end_ns:validity "
+               b"tx=0x13/0x37@1-2:VALID rx1=0x47/0x1D@3-4:VALID "
+               b"rx2=0xD7/0x14@5-6:VALID gap_events=0 "
+               b"source_inferred=CD monitor_inferred=ON "
+               b"attribution=TEMPORAL origin=UNATTRIBUTED "
+               b"receiver_execution=UNVERIFIED\n")
 
 
 class FakeService:
@@ -90,10 +102,12 @@ class OfflineFakeService(FakeService):
 class RecordingService:
     """Multi-connection fake for production-mode STATUS and MUTE requests."""
 
-    def __init__(self, path, status=STATUS, mute_reply=b"OK MUTE_TX\n"):
+    def __init__(self, path, status=STATUS, mute_reply=b"OK MUTE_TX\n",
+                 query_reply=QUERY_REPLY):
         self.path = path
         self.status = status
         self.mute_reply = mute_reply
+        self.query_reply = query_reply
         self.commands = []
         self.stop = threading.Event()
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -112,7 +126,9 @@ class RecordingService:
             with client:
                 command = client.recv(128)
                 self.commands.append(command)
-                reply = self.status if command == b"STATUS\n" else self.mute_reply
+                reply = (self.status if command == b"STATUS\n" else
+                         self.query_reply if command == b"QUERY_STATUS\n" else
+                         self.mute_reply)
                 if reply is not None:
                     try:
                         client.sendall(reply)
@@ -242,9 +258,10 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(code, 200)
         parser = DisabledControls()
         parser.feed(body.decode())
-        self.assertEqual(len(parser.buttons), 14)
+        self.assertEqual(len(parser.buttons), 15)
         self.assertTrue(all("disabled" in button for button in parser.buttons))
         for path in ("/api/v1/source", "/api/v1/mute",
+                     "/api/v1/receiver/query",
                      "/api/v1/volume/step", "/api/v1/cd/transport",
                      "/api/v1/status", "/anything"):
             code, _ = self.request("POST", path)
@@ -529,6 +546,132 @@ class SourceGatewayTest(GatewayTest):
             self.assertEqual(code, 429)
             self.assertEqual(json.loads(body)["result"], "TOO_FAST")
             dispatch.assert_called_once()
+
+
+class ReceiverQueryGatewayTest(GatewayTest):
+    def enable_query(self):
+        handler = self.server.RequestHandlerClass
+        handler.receiver_query_enabled = True
+        handler.https_origin = "https://woodland-pi.local"
+        self.server.proxy_peer_verified = True
+
+    def query(self, token, cookie, **overrides):
+        headers = {"Origin": "https://woodland-pi.local",
+                   "X-Forwarded-Proto": "https",
+                   "X-Kenwood-Authenticated-User": "remote",
+                   "X-CSRF-Token": token, "Cookie": cookie,
+                   "Content-Type": "application/json"}
+        headers.update(overrides.pop("headers", {}))
+        return self.request_full("POST", "/api/v1/receiver/query",
+                                 body=overrides.pop("body", "{}"), headers=headers)
+
+    def test_get_only_reads_status_and_exposes_cache(self):
+        fake = RecordingService(self.socket_path, status=RECEIVER_STATUS)
+        code, body, _ = self.request_full("GET", "/api/v1/status")
+        fake.close()
+        self.assertEqual(code, 200)
+        state = json.loads(body)["receiver"]
+        self.assertEqual(state["source"]["value"], "CD")
+        self.assertEqual(state["monitor"]["value"], "ON")
+        self.assertEqual(state["source"]["evidence"], "PASSIVE")
+        self.assertEqual(fake.commands, [b"STATUS\n"])
+
+    def test_malformed_receiver_fields_are_not_displayed(self):
+        bad = RECEIVER_STATUS.replace(b"receiver_source_ns=1000000000",
+                                      b"receiver_source_ns=0")
+        fake = FakeService(self.socket_path, bad)
+        code, _, _ = self.request_full("GET", "/api/v1/status")
+        fake.close()
+        self.assertEqual(code, 503)
+
+    def test_get_polling_and_capabilities_never_query(self):
+        self.enable_query()
+        token, cookie = self.session()
+        fake = RecordingService(self.socket_path, status=RECEIVER_STATUS)
+        headers = {"X-Kenwood-Authenticated-User": "remote", "Cookie": cookie}
+        for _ in range(3):
+            self.assertEqual(self.request_full("GET", "/api/v1/status")[0], 200)
+            code, body, _ = self.request_full("GET", "/api/v1/capabilities",
+                                              headers=headers)
+            self.assertEqual(code, 200)
+            self.assertTrue(json.loads(body)["operations"]["receiver_query"]["enabled"])
+        fake.close()
+        self.assertTrue(token)
+        self.assertNotIn(b"QUERY_STATUS\n", fake.commands)
+
+    def test_sync_one_dispatch_and_replay(self):
+        self.enable_query()
+        token, cookie = self.session()
+        fake = RecordingService(self.socket_path, status=RECEIVER_STATUS)
+        code, body, _ = self.query(token, cookie)
+        fake.close()
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["result"], "OBSERVATION_RECORDED")
+        self.assertEqual(fake.commands.count(b"QUERY_STATUS\n"), 1)
+        self.assertEqual(self.query(token, cookie)[0], 403)
+
+    def test_rejected_requests_never_dispatch(self):
+        self.enable_query()
+        token, cookie = self.session()
+        with mock.patch.object(xs8_gateway, "send_receiver_query") as dispatch:
+            self.assertEqual(self.query(token, cookie, headers={"Origin": "https://evil"})[0], 403)
+            self.assertEqual(self.query(token, cookie, headers={"X-CSRF-Token": "bad"})[0], 403)
+            self.assertEqual(self.query(token, cookie, headers={"Cookie": "bad=1"})[0], 401)
+            self.assertEqual(self.query(token, cookie, headers={"Content-Type": "text/plain"})[0], 400)
+            self.assertEqual(self.query(token, cookie, body='{"extra":1}')[0], 400)
+            dispatch.assert_not_called()
+
+    def test_one_use_token_shared_with_mute_and_source(self):
+        self.enable_query()
+        handler = self.server.RequestHandlerClass
+        handler.production_source_enabled = True
+        handler.production_mute_enabled = True
+        token, cookie = self.session()
+        fake = RecordingService(self.socket_path)
+        self.assertEqual(self.query(token, cookie)[0], 200)
+        fake.close()
+        headers = {"Origin": "https://woodland-pi.local",
+                   "X-Forwarded-Proto": "https",
+                   "X-Kenwood-Authenticated-User": "remote",
+                   "X-CSRF-Token": token, "Cookie": cookie,
+                   "Content-Type": "application/json"}
+        self.assertEqual(self.request_full("POST", "/api/v1/mute", "{}", headers)[0], 403)
+        self.assertEqual(self.request_full("POST", "/api/v1/source",
+                                           '{"source":"CD"}', headers)[0], 403)
+        self.assertEqual(fake.commands.count(b"QUERY_STATUS\n"), 1)
+
+    def test_inhibited_and_failed_query(self):
+        self.enable_query()
+        for state in ("BOOT_INHIBIT", "FAULT_LATCHED", "HOLDING_DOWN"):
+            token, cookie = self.session()
+            fake = RecordingService(self.socket_path,
+                status=STATUS.replace(b"state=IDLE", f"state={state}".encode()))
+            code, _, _ = self.query(token, cookie)
+            fake.close()
+            self.assertEqual(code, 409)
+            self.assertNotIn(b"QUERY_STATUS\n", fake.commands)
+        token, cookie = self.session()
+        fake = RecordingService(self.socket_path,
+            query_reply=b"ERR QUERY_STATUS reason=TX_UNCERTAIN gpio_tx=TX_OK waveform=MISSING receiver_execution=UNVERIFIED\n")
+        code, body, _ = self.query(token, cookie)
+        fake.close()
+        self.assertEqual(code, 502)
+        self.assertEqual(json.loads(body)["result"], "SERVICE_UNCERTAIN")
+        self.assertEqual(fake.commands.count(b"QUERY_STATUS\n"), 1)
+
+    def test_gate_off_and_secure_cli(self):
+        self.assertEqual(self.query("bad", "bad")[0], 501)
+        args = xs8_gateway.parse_args([
+            "--enable-receiver-query", "--systemd-socket", "--nginx-uid", "33",
+            "--https-origin", "https://woodland-pi.local"])
+        self.assertTrue(args.enable_receiver_query)
+        for args in (("--enable-receiver-query",),
+                     ("--enable-receiver-query", "--systemd-socket", "--nginx-uid", "33"),
+                     ("--enable-receiver-query", "--systemd-socket", "--nginx-uid", "33",
+                      "--https-origin", "https://woodland-pi.local", "--socket", self.socket_path)):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    xs8_gateway.parse_args(list(args))
 
 
 class BindingTest(unittest.TestCase):

@@ -39,6 +39,7 @@ public:
     bool shutdown(Time now);
     VolumeControl::State state() const { return volume_.state(); }
     bool stop_owed() const { return volume_.stop_owed(); }
+    void set_receiver_status(const std::string& fields) { receiver_status_ = fields; }
 private:
     std::string status() const;
     ServiceTransmitter& tx_;
@@ -46,6 +47,10 @@ private:
     bool client_connected_ = false;
     bool monitor_fault_handled_ = false;
     VolumeControl::Direction owner_direction_ = VolumeControl::Direction::DOWN;
+    std::string receiver_status_ =
+        " receiver_source=UNKNOWN receiver_source_ns=0 receiver_source_evidence=NONE"
+        " receiver_monitor=UNKNOWN receiver_monitor_ns=0 receiver_monitor_evidence=NONE"
+        " receiver_integrity=HEALTHY";
 };
 
 #endif

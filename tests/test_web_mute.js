@@ -9,10 +9,12 @@ let sessionAvailable = true;
 const posts = [];
 const elements = new Map();
 const muteButton = { disabled: true, addEventListener: (_, handler) => { click = handler; } };
+const syncButton = { disabled: true, addEventListener() {} };
 const sourceButtons = [];
 
 function element(id) {
   if (id === 'mute-button') return muteButton;
+  if (id === 'sync-button') return syncButton;
   if (!elements.has(id)) elements.set(id, { textContent: '' });
   return elements.get(id);
 }

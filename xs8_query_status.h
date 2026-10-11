@@ -18,6 +18,9 @@ public:
     void monitor_failed();
     void cancel();
     bool done(uint64_t now_ns) const;
+    bool successful(uint64_t now_ns) const;
+    const xs8_monitor_record& source_record() const { return observed_[1]; }
+    const xs8_monitor_record& monitor_record() const { return observed_[2]; }
     uint64_t deadline_ns() const { return deadline_ns_; }
     std::string response(uint64_t now_ns) const;
 private:

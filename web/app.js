@@ -1,39 +1,66 @@
 const text = (id, value) => { document.getElementById(id).textContent = value; };
 const muteButton = document.getElementById('mute-button');
+const syncButton = document.getElementById('sync-button');
 const sourceButtons = [...document.querySelectorAll('.source-grid button[data-source]')];
 let csrfToken = null;
 let serviceReady = false;
 let muteReady = false;
 let sourceReady = false;
+let queryReady = false;
 let enabledSources = [];
 let controlBusy = false;
 let lastSourceAttempt = 0;
 let controlResult = null;
 let refreshController = null;
 let refreshVersion = 0;
+let lastReceiver = null;
 
 function updateControls() {
   muteButton.disabled = controlBusy || !csrfToken || !serviceReady || !muteReady;
+  syncButton.disabled = controlBusy || !csrfToken || !serviceReady || !queryReady;
   for (const button of sourceButtons) {
     button.disabled = controlBusy || !csrfToken || !serviceReady || !sourceReady ||
       !enabledSources.includes(button.dataset.source);
   }
-  const available = !controlBusy && serviceReady && csrfToken && (muteReady || sourceReady);
+  const available = !controlBusy && serviceReady && csrfToken &&
+    (muteReady || sourceReady || queryReady);
   text('availability-text', controlResult
     ? `${controlResult}${available ? '' : ' · CONTROLS UNAVAILABLE'}`
     : (available ? 'CONTROLS READY · RECEIVER ACTION UNVERIFIED'
       : 'CONTROLS UNAVAILABLE · SERVICE OR AUTHORIZATION NOT READY'));
 }
 
+function renderReceiver(receiver, connected) {
+  if (receiver && receiver.source && receiver.monitor) lastReceiver = receiver;
+  const state = lastReceiver;
+  const source = state && state.source.value || 'UNKNOWN';
+  const monitor = state && state.monitor.value || 'UNKNOWN';
+  const quality = !connected ? 'CONNECTION LOST' :
+    state && state.integrity !== 'HEALTHY' ? 'OBSERVATION UNCERTAIN' :
+    state && state.source.freshness === 'LAST_KNOWN' ? 'LAST KNOWN' :
+    state && state.source.freshness || 'UNKNOWN';
+  text('source-status', `OBSERVED SOURCE ${source} · ${quality}`);
+  text('monitor-status', `OBSERVED TAPE2 MONITOR ${monitor}${!connected ? ' · CONNECTION LOST' :
+    state && state.monitor.freshness && state.monitor.freshness !== 'FRESH'
+      ? ` · ${state.monitor.freshness}` : ''}`);
+  for (const button of sourceButtons) {
+    if (connected && state && state.integrity === 'HEALTHY' &&
+        button.dataset.source === source) button.dataset.observed = 'true';
+    else delete button.dataset.observed;
+  }
+}
+
 function renderStatus(data) {
   text('gateway', data && data.gateway === 'online' ? 'Online' : 'Unavailable');
   if (!data || data.xs8_service !== 'connected' || !data.status) {
+    renderReceiver(null, false);
     text('service', data ? 'Unavailable' : 'Unknown');
     text('summary-state', data ? 'Service unavailable' : 'Connection lost');
     for (const id of ['state', 'monitor', 'tx', 'waveform']) text(id, '—');
     return;
   }
   const status = data.status;
+  renderReceiver(data.receiver, true);
   text('service', 'Connected');
   text('summary-state', status.state);
   text('state', status.state);
@@ -53,6 +80,10 @@ function applyRefresh(statusData, sessionData, capabilitiesData) {
   sourceReady = !!csrfToken && sessionData.source_available === true &&
     !!source && source.enabled === true && Array.isArray(source.available_sources);
   enabledSources = sourceReady ? source.available_sources : [];
+  const query = capabilitiesData && capabilitiesData.operations &&
+    capabilitiesData.operations.receiver_query;
+  queryReady = !!csrfToken && sessionData.receiver_query_available === true &&
+    !!query && query.enabled === true;
   renderStatus(statusData);
   updateControls();
 }
@@ -87,14 +118,15 @@ async function refresh() {
         });
         if (session.ok && typeof session.data.csrf_token === 'string') {
           sessionData = session.data;
-          if (session.data.source_available === true) {
+          if (session.data.source_available === true ||
+              session.data.receiver_query_available === true) {
             try {
               const capabilities = await fetchJson('/api/v1/capabilities', {
                 cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
               });
               if (capabilities.ok) capabilitiesData = capabilities.data;
             } catch (_) {
-              // MUTE eligibility remains independent of source capabilities.
+              // MUTE eligibility remains independent of capabilities.
             }
           }
         }
@@ -120,7 +152,7 @@ async function sendControl(url, body, success, failure) {
     refreshController = null;
   }
   const token = csrfToken;
-  csrfToken = null; muteReady = false; sourceReady = false;
+  csrfToken = null; muteReady = false; sourceReady = false; queryReady = false;
   updateControls();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 6000);
@@ -132,8 +164,8 @@ async function sendControl(url, body, success, failure) {
     });
     controlResult = response.ok ? success : failure(response.data);
   } catch (_) {
-    controlResult = url.endsWith('/mute')
-      ? 'MUTE RESULT UNKNOWN · CHECK RECEIVER'
+    controlResult = url.endsWith('/mute') ? 'MUTE RESULT UNKNOWN · CHECK RECEIVER'
+      : url.endsWith('/query') ? 'SYNC RESULT UNKNOWN · CHECK RECEIVER'
       : 'SOURCE RESULT UNKNOWN · CHECK RECEIVER';
   } finally {
     clearTimeout(timeout);
@@ -148,6 +180,13 @@ muteButton.addEventListener('click', async () => {
   await sendControl('/api/v1/mute', '{}',
     'MUTE TX REPORTED · RECEIVER ACTION UNVERIFIED',
     (data) => `MUTE ${data.result || 'FAILED'} · RECEIVER ACTION UNVERIFIED`);
+});
+
+syncButton.addEventListener('click', async () => {
+  if (syncButton.disabled || controlBusy) return;
+  await sendControl('/api/v1/receiver/query', '{}',
+    'SYNC OBSERVATIONS RECORDED · CHECK DISPLAYED STATE',
+    (data) => `SYNC ${data.result || 'FAILED'} · LAST OBSERVATION PRESERVED`);
 });
 
 for (const button of sourceButtons) {

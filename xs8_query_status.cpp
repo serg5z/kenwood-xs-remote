@@ -118,6 +118,11 @@ bool Xs8QueryStatus::done(uint64_t now_ns) const
     return fault_ != Fault::NONE || now_ns >= deadline_ns_;
 }
 
+bool Xs8QueryStatus::successful(uint64_t now_ns) const
+{
+    return now_ns >= deadline_ns_ && fault_ == Fault::NONE && count_ == 3;
+}
+
 std::string Xs8QueryStatus::response(uint64_t now_ns) const
 {
     Fault fault = fault_;

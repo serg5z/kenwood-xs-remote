@@ -19,6 +19,7 @@ const buttons = names.map((source) => ({
 }));
 const elements = new Map();
 const mute = { disabled: true, addEventListener() {} };
+const sync = { disabled: true, addEventListener() {} };
 let state = 'IDLE';
 let sourceEnabled = true;
 let now = 10000;
@@ -28,6 +29,7 @@ const context = {
   document: {
     getElementById(id) {
       if (id === 'mute-button') return mute;
+      if (id === 'sync-button') return sync;
       if (!elements.has(id)) elements.set(id, { textContent: '' });
       return elements.get(id);
     },

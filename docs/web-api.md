@@ -2,6 +2,8 @@
 
 The Gateway remains **read-only by default**. Explicit production `--enable-mute` and `--enable-source` options independently gate MUTE and the four evidenced source commands through authenticated HTTPS and the systemd Unix socket. TV1, TV2 and TAPE2 remain blocked pending controlled TX validation; volume and CD transport remain disabled. The checked-in systemd unit enables neither control. See [MUTE deployment](mute-control.md) and [source selection evidence and rollout](source-selection.md) before opting in.
 
+An independent default-off `--enable-receiver-query` gate permits one explicit authenticated `POST /api/v1/receiver/query` for live source/MONITOR synchronization. GET status and background polling remain passive. See [live receiver status](receiver-status.md) for the cache fields, uncertainty model, and manual rollout.
+
 ## Run locally
 
 Prerequisite: Python 3 with the standard library. From the repository root:

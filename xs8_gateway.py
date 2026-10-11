@@ -24,6 +24,11 @@ STATUS_FIELDS = {
     "last_gpio_tx", "last_waveform", "last_stop_waveform",
     "receiver_execution",
 }
+RECEIVER_FIELDS = {
+    "receiver_source", "receiver_source_ns", "receiver_source_evidence",
+    "receiver_monitor", "receiver_monitor_ns", "receiver_monitor_evidence",
+    "receiver_integrity",
+}
 SOURCES = ("CD", "TUNER", "PHONO", "TV1", "TV2", "TAPE1", "TAPE2")
 EVIDENCED_SOURCES = ("CD", "TUNER", "PHONO", "TAPE1")
 
@@ -39,7 +44,8 @@ class MuteServiceError(Exception):
         self.evidence = evidence
 
 
-def _send_control(socket_path, command, timeout=1.0, fake_only=True):
+def _send_control(socket_path, command, timeout=1.0, fake_only=True,
+                  max_reply=256):
     """One socket request, one command, no retry after an uncertain outcome."""
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
@@ -74,7 +80,7 @@ def _send_control(socket_path, command, timeout=1.0, fake_only=True):
                     if not chunk:
                         raise MuteServiceError("DISCONNECTED", "XS8 service disconnected before reply")
                     response.extend(chunk)
-                    if len(response) > 256:
+                    if len(response) > max_reply:
                         raise MuteServiceError("INVALID_REPLY", "XS8 service reply too long")
             except socket.timeout as exc:
                 if not challenge_complete:
@@ -128,6 +134,23 @@ def send_source(socket_path, source, timeout=1.0):
     raise MuteServiceError("INVALID_REPLY", "Invalid XS8 source reply")
 
 
+def send_receiver_query(socket_path):
+    line = _send_control(socket_path, b"QUERY_STATUS\n", timeout=3.0,
+                         fake_only=False, max_reply=2048)
+    if (line.startswith("OK QUERY_STATUS reason=NONE ") and
+            " gpio_tx=TX_OK waveform=MATCH " in line and
+            " tx=" in line and " rx1=" in line and " rx2=" in line and
+            " receiver_execution=UNVERIFIED" in line):
+        return "OBSERVATION_RECORDED"
+    if line.startswith("ERR QUERY_STATUS "):
+        result = ("SERVICE_UNCERTAIN" if "reason=TX_UNCERTAIN" in line else
+                  "OBSERVATION_FAILED")
+        raise MuteServiceError(result, line)
+    if line.startswith("ERR "):
+        raise MuteServiceError("REJECTED", line)
+    raise MuteServiceError("INVALID_REPLY", "Invalid XS8 query reply")
+
+
 def read_status(socket_path, timeout=1.0):
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
@@ -153,21 +176,62 @@ def read_status(socket_path, timeout=1.0):
         fields = {}
         for part in parts[1:]:
             key, value = part.split("=", 1)
-            if key not in STATUS_FIELDS or not value or key in fields:
+            if key not in STATUS_FIELDS | RECEIVER_FIELDS or not value or key in fields:
                 raise ValueError("invalid STATUS field")
             fields[key] = value
-        if set(fields) != STATUS_FIELDS:
+        if not STATUS_FIELDS <= set(fields) or set(fields) - STATUS_FIELDS not in (
+                set(), RECEIVER_FIELDS):
             raise ValueError("incomplete STATUS reply")
+        if RECEIVER_FIELDS <= set(fields):
+            if (fields["receiver_source"] not in SOURCES + ("UNKNOWN",) or
+                    fields["receiver_monitor"] not in ("ON", "OFF", "UNKNOWN") or
+                    fields["receiver_integrity"] not in ("HEALTHY", "UNCERTAIN") or
+                    fields["receiver_source_evidence"] not in
+                    ("NONE", "PASSIVE", "AFTER_LOCAL_TX", "QUERY") or
+                    fields["receiver_monitor_evidence"] not in
+                    ("NONE", "PASSIVE", "AFTER_LOCAL_TX", "QUERY") or
+                    not fields["receiver_source_ns"].isdecimal() or
+                    not fields["receiver_monitor_ns"].isdecimal()):
+                raise ValueError("invalid receiver state")
+            for name in ("source", "monitor"):
+                unknown = fields[f"receiver_{name}"] == "UNKNOWN"
+                empty = (fields[f"receiver_{name}_ns"] == "0" and
+                         fields[f"receiver_{name}_evidence"] == "NONE")
+                if unknown != empty or (not unknown and
+                        (fields[f"receiver_{name}_ns"] == "0" or
+                         fields[f"receiver_{name}_evidence"] == "NONE")):
+                    raise ValueError("inconsistent receiver observation")
+        else:
+            fields.update({"receiver_source": "UNKNOWN", "receiver_source_ns": "0",
+                           "receiver_source_evidence": "NONE",
+                           "receiver_monitor": "UNKNOWN", "receiver_monitor_ns": "0",
+                           "receiver_monitor_evidence": "NONE",
+                           "receiver_integrity": "UNCERTAIN"})
     except (UnicodeError, ValueError) as exc:
         raise ServiceError("Invalid XS8 service STATUS reply") from exc
     return fields
 
 
-def capabilities(mute_available=False, source_available=False):
+def receiver_state(status):
+    def field(name):
+        observed_ns = int(status[f"receiver_{name}_ns"])
+        age_ms = max(0, (time.monotonic_ns() - observed_ns) // 1_000_000) if observed_ns else None
+        return {"value": status[f"receiver_{name}"], "observed_mono_ns": observed_ns,
+                "evidence": status[f"receiver_{name}_evidence"], "age_ms": age_ms,
+                "freshness": ("UNKNOWN" if not observed_ns else
+                              "UNCERTAIN" if status["receiver_integrity"] != "HEALTHY" else
+                              "FRESH" if age_ms <= 30000 else "LAST_KNOWN")}
+    return {"source": field("source"), "monitor": field("monitor"),
+            "integrity": status["receiver_integrity"],
+            "receiver_execution": "UNVERIFIED"}
+
+
+def capabilities(mute_available=False, source_available=False, query_available=False):
     return {
         "api_version": "v0.1",
         "operations": {
             "status": {"classification": "supported", "enabled": True},
+            "receiver_query": {"classification": "supported", "enabled": query_available},
             "mute": {
                 "classification": "unverified", "enabled": mute_available,
                 "reason": "Receiver execution is unverified",
@@ -195,6 +259,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
     dev_mute_enabled = False
     production_mute_enabled = False
     production_source_enabled = False
+    receiver_query_enabled = False
     https_origin = None
     sessions = None
 
@@ -202,7 +267,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return self.dev_mute_enabled or self.production_mute_enabled
 
     def control_enabled(self):
-        return self.mute_enabled() or self.production_source_enabled
+        return self.mute_enabled() or self.production_source_enabled or self.receiver_query_enabled
 
     def authenticated_user(self):
         # nginx overwrites this header with $remote_user after Basic Auth.
@@ -266,12 +331,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                      "error": str(exc)})
                 return
             self.send_json(200, {"gateway": "online", "xs8_service": "connected",
-                                 "status": status})
+                                 "status": status, "receiver": receiver_state(status)})
             return
         if path == "/api/v1/capabilities":
             ready = self.current_session() is not None and self.service_ready()
             self.send_json(200, capabilities(self.mute_enabled() and ready,
-                                              self.production_source_enabled and ready))
+                                              self.production_source_enabled and ready,
+                                              self.receiver_query_enabled and ready))
             return
         if path == "/api/v1/session" and self.control_enabled():
             user = self.authenticated_user()
@@ -290,7 +356,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             ready = self.service_ready()
             self.send_json(200, {"csrf_token": session["csrf"],
                                  "mute_available": self.mute_enabled() and ready,
-                                 "source_available": self.production_source_enabled and ready}, headers)
+                                 "source_available": self.production_source_enabled and ready,
+                                 "receiver_query_available": self.receiver_query_enabled and ready}, headers)
             return
         assets = {
             "/": ("index.html", "text/html; charset=utf-8"),
@@ -307,7 +374,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         is_mute = path == "/api/v1/mute" and self.mute_enabled()
         is_source = path == "/api/v1/source" and self.production_source_enabled
-        if (not (is_mute or is_source) or
+        is_query = path == "/api/v1/receiver/query" and self.receiver_query_enabled
+        if (not (is_mute or is_source or is_query) or
                 not getattr(self.server, "proxy_peer_verified", False)):
             length = self.headers.get("Content-Length", "")
             if len(length) <= 4 and length.isdecimal() and 0 < int(length) <= 4096:
@@ -334,7 +402,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         types = self.headers.get_all("Content-Type", [])
         if (len(lengths) != 1 or not lengths[0].isdecimal() or
                 int(lengths[0]) > 64 or
-                (is_mute and lengths[0] != "2") or
+                ((is_mute or is_query) and lengths[0] != "2") or
                 types != ["application/json"] or self.headers.get("Transfer-Encoding")):
             self.send_json(400, {"error": "Invalid JSON request headers"})
             return
@@ -343,7 +411,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(int(lengths[0]))
         except (OSError, TimeoutError):
             return
-        if is_mute:
+        if is_mute or is_query:
             if body != b"{}":
                 self.send_json(400, {"error": "Expected JSON body {}"})
                 return
@@ -369,9 +437,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                      "receiver_execution": "UNVERIFIED"})
                 return
             session["last_source_request"] = now
+        if is_query:
+            now = time.monotonic()
+            if now - session.get("last_query_request", float("-inf")) < 2.0:
+                session["csrf"] = secrets.token_urlsafe(32)
+                self.send_json(429, {"result": "TOO_FAST",
+                                     "receiver_execution": "UNVERIFIED"})
+                return
+            session["last_query_request"] = now
         # Single use: a repeated request with the same token cannot dispatch again.
         session["csrf"] = secrets.token_urlsafe(32)
-        if (is_source or self.production_mute_enabled):
+        if (is_source or is_query or self.production_mute_enabled):
             try:
                 status = read_status(self.socket_path)
             except ServiceError:
@@ -382,7 +458,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
         try:
             reply = (send_mute(self.socket_path, fake_only=not self.production_mute_enabled)
-                     if is_mute else send_source(self.socket_path, source))
+                     if is_mute else send_receiver_query(self.socket_path) if is_query
+                     else send_source(self.socket_path, source))
         except MuteServiceError as exc:
             code = {"UNAVAILABLE": 503, "REJECTED": 409, "TIMEOUT": 504}.get(exc.result, 502)
             payload = {"result": exc.result, "error": str(exc),
@@ -392,7 +469,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.send_json(code, payload)
             return
         payload = {"result": "SERVICE_TX_OK", "receiver_execution": "UNVERIFIED"}
-        if is_mute:
+        if is_query:
+            payload["result"] = reply
+        elif is_mute:
             payload["service_reply"] = reply
         else:
             payload.update(reply)
@@ -448,6 +527,8 @@ def parse_args(argv=None):
                         help="enable production MUTE through the real local XS8 Service")
     parser.add_argument("--enable-source", action="store_true",
                         help="enable evidenced source selection through the real local XS8 Service")
+    parser.add_argument("--enable-receiver-query", action="store_true",
+                        help="enable one explicit authenticated receiver status query")
     parser.add_argument("--https-origin", help="required exact HTTPS Origin for active controls")
     parser.add_argument("--systemd-socket", action="store_true",
                         help="serve read-only HTTP using the systemd Unix listener")
@@ -456,9 +537,11 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.enable_dev_mute:
         parser.error("MUTE development gate is disabled in phase 2A")
-    if args.enable_offline_mute and (args.enable_mute or args.enable_source):
+    if args.enable_offline_mute and (args.enable_mute or args.enable_source or
+                                    args.enable_receiver_query):
         parser.error("offline and production MUTE modes are mutually exclusive")
-    if args.enable_offline_mute or args.enable_mute or args.enable_source:
+    if (args.enable_offline_mute or args.enable_mute or args.enable_source or
+            args.enable_receiver_query):
         if not args.systemd_socket or not args.https_origin:
             parser.error("active controls require --systemd-socket and --https-origin")
         try:
@@ -515,6 +598,7 @@ def main(argv=None):
                    {"socket_path": args.socket, "dev_mute_enabled": args.enable_offline_mute,
                     "production_mute_enabled": args.enable_mute,
                     "production_source_enabled": args.enable_source,
+                    "receiver_query_enabled": args.enable_receiver_query,
                     "https_origin": args.https_origin, "sessions": {}})
     if args.systemd_socket:
         try:
@@ -525,6 +609,7 @@ def main(argv=None):
         mode = ("PRODUCTION CONTROLS" if args.enable_mute and args.enable_source else
                 "PRODUCTION SOURCE" if args.enable_source else
                 "PRODUCTION MUTE" if args.enable_mute else
+                "RECEIVER QUERY" if args.enable_receiver_query else
                 "OFFLINE FAKE MUTE TEST" if args.enable_offline_mute else "read-only")
         print(f"XS8 gateway listening on {GATEWAY_SOCKET} ({mode})")
     else:

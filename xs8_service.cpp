@@ -2,6 +2,7 @@
 #include "xs8_gpio.h"
 #include "xs8_monitor.h"
 #include "xs8_query_status.h"
+#include "xs8_receiver_state.h"
 
 #include <atomic>
 #include <cerrno>
@@ -30,8 +31,9 @@ void on_signal(int) { stopping = 1; }
 
 class GpioServiceTransmitter final : public ServiceTransmitter {
 public:
-    GpioServiceTransmitter(xs8_gpio& bus, xs8_monitor& monitor)
-        : bus_(bus), monitor_(monitor) {}
+    GpioServiceTransmitter(xs8_gpio& bus, xs8_monitor& monitor,
+                           Xs8ReceiverState& receiver)
+        : bus_(bus), monitor_(monitor), receiver_(receiver) {}
     bool monitor_healthy() const override {
         return xs8_monitor_healthy(const_cast<xs8_monitor*>(&monitor_));
     }
@@ -49,6 +51,7 @@ public:
         int64_t end = xs8_gpio_now_ns();
         last_start_ns_ = start > 0 ? (uint64_t)start : 0;
         last_end_ns_ = end > 0 ? (uint64_t)end : 0;
+        receiver_.note_tx(last_start_ns_, last_end_ns_);
         if (last_.gpio_completed && start > 0 && end >= start) {
             enum xs8_observation observed = xs8_monitor_verify_tx(
                 &monitor_, checkpoint, byte, (uint64_t)start,
@@ -80,6 +83,7 @@ public:
 private:
     xs8_gpio& bus_;
     xs8_monitor& monitor_;
+    Xs8ReceiverState& receiver_;
     ServiceTxEvidence last_{};
     ServiceTxEvidence last_stop_{};
     uint64_t last_start_ns_ = 0;
@@ -177,7 +181,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    GpioServiceTransmitter transmitter(bus, *monitor);
+    Xs8ReceiverState receiver;
+    GpioServiceTransmitter transmitter(bus, *monitor, receiver);
     Xs8ServiceCore core(transmitter, VolumeControl::Ms(hold_ms), authorized,
                         [] { return stopping != 0; });
     std::fprintf(stderr, "XS8 service listening on %s; state=%s\n",
@@ -186,9 +191,23 @@ int main(int argc, char **argv)
     std::string input;
     std::optional<Xs8QueryStatus> query;
     uint64_t query_cursor = 0;
+    uint64_t state_cursor = xs8_monitor_checkpoint(monitor);
     while (!stopping) {
         xs8_monitor_poll(monitor, 0);
         core.tick(VolumeControl::Clock::now());
+        xs8_monitor_record state_records[16];
+        size_t state_count = 0;
+        do {
+            if (xs8_monitor_snapshot(monitor, &state_cursor, state_records, 16,
+                                     &state_count) < 0) {
+                receiver.history_overflow();
+                state_cursor = xs8_monitor_checkpoint(monitor);
+                break;
+            }
+            for (size_t i = 0; i < state_count; ++i)
+                receiver.observe(state_records[i], query.has_value());
+        } while (state_count == 16);
+        if (!xs8_monitor_healthy(monitor)) receiver.monitor_failed();
         if (query) {
             pollfd pending_client = {client, POLLIN, 0};
             if (poll(&pending_client, 1, 0) > 0 &&
@@ -221,6 +240,8 @@ int main(int argc, char **argv)
                     query->observe(&partial, 1);
             }
             if (query->done(now_ns > 0 ? (uint64_t)now_ns : 0)) {
+                if (now_ns > 0)
+                    receiver.apply_query(*query, (uint64_t)now_ns);
                 bool sent = reply(client, query->response(
                     now_ns > 0 ? (uint64_t)now_ns : 0));
                 query.reset();
@@ -298,6 +319,10 @@ int main(int argc, char **argv)
                     }
                     query_cursor = xs8_monitor_checkpoint(monitor);
                     std::string result = core.begin_query_status(received);
+                    if ((result.empty() || result.find("reason=TX_UNCERTAIN") !=
+                           std::string::npos) && transmitter.last_end_ns())
+                        receiver.suppress_until(transmitter.last_end_ns() +
+                                                Xs8QueryStatus::kWindowNs);
                     if (result.empty()) {
                         if (!transmitter.last_start_ns() ||
                             transmitter.last_end_ns() <
@@ -314,6 +339,8 @@ int main(int argc, char **argv)
                     if (!reply(client, result)) failed = true;
                     continue;
                 }
+                if (line == "STATUS")
+                    core.set_receiver_status(receiver.status_fields());
                 if (!reply(client, core.command(line, received, received))) {
                     failed = true;
                     break;
