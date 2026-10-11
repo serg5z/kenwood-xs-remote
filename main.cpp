@@ -1,25 +1,24 @@
-#include <iostream>
 #include <libcec/cec.h>
 #include <libcec/cecloader.h>
 
-#include <atomic>
+#include "volume_control.h"
+#include "xs8_gpio.h"
+
 #include <chrono>
+#include <cerrno>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <thread>
 
-#include <cerrno>
-#include <fcntl.h>
-#include <termios.h>
-#include <unistd.h>
-
 using namespace CEC;
-using Clock = std::chrono::steady_clock;
+using Clock = VolumeControl::Clock;
 
 static constexpr auto WATCHDOG = std::chrono::milliseconds(1200);
-static constexpr auto HEARTBEAT = std::chrono::milliseconds(300);
+static constexpr auto DEFAULT_MAX_HOLD = std::chrono::milliseconds(2000);
 
 struct KeyEvent {
     cec_user_control_code code;
@@ -27,95 +26,84 @@ struct KeyEvent {
     Clock::time_point received;
 };
 
-static std::atomic<bool> running{true};
+static volatile std::sig_atomic_t stopping = 0;
 static std::mutex queueMutex;
 static std::deque<KeyEvent> queue;
-static int serialFd = -1;
 
-static void onSignal(int) {
-    running = false;
-}
+static void onSignal(int) { stopping = 1; }
 
 static void onKey(void*, const cec_keypress* key) {
     if (!key) return;
-
     std::lock_guard<std::mutex> lock(queueMutex);
     queue.push_back({key->keycode, key->duration, Clock::now()});
 }
 
-static bool sendArduino(char command, const char* description) {
-    if (serialFd < 0) {
-        std::fprintf(stderr, "Arduino serial not connected\n");
+class GpioTransmitter final : public VolumeTransmitter {
+public:
+    explicit GpioTransmitter(xs8_gpio& bus) : bus_(bus) {}
+    bool send(uint8_t byte) override {
+        int64_t start = 0;
+        if (xs8_gpio_send(&bus_, byte, &start) == 0) return true;
+        std::fprintf(stderr, "XS8 TX 0x%02X failed; delivery uncertain\n", byte);
         return false;
     }
+private:
+    xs8_gpio& bus_;
+};
 
-    const ssize_t written = write(serialFd, &command, 1);
-    if (written != 1) {
-        if (written < 0) perror("Arduino serial write");
-        else std::fprintf(stderr, "Arduino serial: short write\n");
-        return false;
+static bool parse_options(int argc, char** argv, bool& recovery,
+                          bool& authorized, VolumeControl::Ms& max_hold) {
+    recovery = false;
+    authorized = false;
+    max_hold = DEFAULT_MAX_HOLD;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--startup-recovery") == 0) recovery = true;
+        else if (std::strcmp(argv[i], "--allow-unrecovered-start") == 0)
+            authorized = true;
+        else if (std::strcmp(argv[i], "--max-hold-ms") == 0 && i + 1 < argc) {
+            char* end = nullptr;
+            const char* argument = argv[++i];
+            errno = 0;
+            const long value = std::strtol(argument, &end, 10);
+            if (end == argument || *end || errno == ERANGE ||
+                value < 100 || value > 3000) return false;
+            max_hold = VolumeControl::Ms(value);
+        } else return false;
     }
-
-    if (description)
-        std::printf("Arduino '%c' %s\n", command, description);
-    return true;
+    return !(recovery && authorized);
 }
 
-static bool sendXS8(unsigned int code, const char* description) {
-    char command = 0;
-    switch (code) {
-        case 0xF9: command = 'U'; break;
-        case 0xE9: command = 'D'; break;
-        case 0x09: command = 'S'; break;
-        case 0xD8: command = 'M'; break;
-        default: return false;
+int main(int argc, char** argv) {
+    bool recovery = false, authorized = false;
+    VolumeControl::Ms max_hold{};
+    if (!parse_options(argc, argv, recovery, authorized, max_hold)) {
+        std::fprintf(stderr, "Usage: %s [--startup-recovery | "
+                             "--allow-unrecovered-start] "
+                             "[--max-hold-ms 100..3000]\n", argv[0]);
+        return 2;
     }
-    return sendArduino(command, description);
-}
-
-static bool openArduino() {
-    serialFd = open("/dev/ttyACM0", O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (serialFd < 0) {
-        perror("Cannot open Arduino");
-        return false;
-    }
-
-    termios tty{};
-    if (tcgetattr(serialFd, &tty) != 0) {
-        perror("tcgetattr");
-        close(serialFd);
-        serialFd = -1;
-        return false;
-    }
-
-    cfmakeraw(&tty);
-    cfsetispeed(&tty, B115200);
-    cfsetospeed(&tty, B115200);
-    tty.c_cflag |= CLOCAL | CREAD;
-    tty.c_cflag &= ~CRTSCTS;
-
-    if (tcsetattr(serialFd, TCSANOW, &tty) != 0) {
-        perror("tcsetattr");
-        close(serialFd);
-        serialFd = -1;
-        return false;
-    }
-
-    std::puts("Arduino Serial ready");
-    return true;
-}
-
-int main() {
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
-    if (!openArduino()) return 1;
-
-    // Synchronize the Arduino's state before accepting CEC input.
-    if (!sendXS8(0x09, "STOP (startup)")) {
-        close(serialFd);
+    xs8_gpio bus{};
+    if (xs8_gpio_open(&bus, false) < 0) {
+        std::perror("Cannot open XS8 GPIO");
+        std::fprintf(stderr, "WARNING: receiver volume state is unknown; "
+                             "check it at the receiver\n");
         return 1;
     }
+    GpioTransmitter tx(bus);
+    VolumeControl volume(tx, WATCHDOG, max_hold, [] { return stopping != 0; });
+    if (!volume.startup(recovery, authorized) && recovery) {
+        std::fprintf(stderr, "FAULT: startup recovery failed; "
+                             "receiver volume may remain active\n");
+        volume.shutdown(Clock::now());
+        xs8_gpio_close(&bus);
+        return 1;
+    }
+    if (volume.state() == VolumeControl::State::BOOT_INHIBIT)
+        std::fprintf(stderr, "BOOT_INHIBIT: GPIO ready, CEC controls disabled; "
+                             "startup recovery is unvalidated\n");
 
     libcec_configuration config;
     config.Clear();
@@ -123,10 +111,8 @@ int main() {
     config.wakeDevices.Clear();
     config.clientVersion = LIBCEC_VERSION_CURRENT;
     config.deviceTypes.Add(CEC_DEVICE_TYPE_AUDIO_SYSTEM);
-
-    std::snprintf(config.strDeviceName,
-                  sizeof(config.strDeviceName), "Kenwood Bridge");
-
+    std::snprintf(config.strDeviceName, sizeof(config.strDeviceName),
+                  "Kenwood Bridge");
     ICECCallbacks callbacks{};
     callbacks.keyPress = onKey;
     config.callbacks = &callbacks;
@@ -134,89 +120,67 @@ int main() {
     ICECAdapter* cec = LibCecInitialise(&config);
     if (!cec) {
         std::fprintf(stderr, "Cannot initialize libCEC\n");
-        close(serialFd);
+        volume.shutdown(Clock::now());
+        xs8_gpio_close(&bus);
         return 1;
     }
-
     cec_adapter_descriptor adapters[10]{};
     const int count = cec->DetectAdapters(adapters, 10, nullptr, true);
-
     if (count <= 0 || !cec->Open(adapters[0].strComName)) {
         std::fprintf(stderr, "Cannot open CEC adapter\n");
+        volume.shutdown(Clock::now());
         UnloadLibCec(cec);
-        close(serialFd);
+        xs8_gpio_close(&bus);
         return 1;
     }
-
     cec->SetInactiveView();
     std::puts("CEC Audio System ready");
 
-    int activeVolume = 0;
-    Clock::time_point lastVolumeEvent{};
-    Clock::time_point lastHeartbeat{};
-
-    while (running) {
+    bool fault_reported = false;
+    auto report_fault = [&] {
+        if (volume.state() == VolumeControl::State::FAULT_LATCHED &&
+            !fault_reported) {
+            std::fprintf(stderr, "FAULT_LATCHED: XS8 state uncertain; "
+                                 "CEC commands disabled. Check receiver.\n");
+            fault_reported = true;
+        }
+    };
+    while (!stopping) {
+        volume.tick(Clock::now());
+        report_fault();
         std::deque<KeyEvent> pending;
         {
             std::lock_guard<std::mutex> lock(queueMutex);
             pending.swap(queue);
         }
-
         for (const auto& event : pending) {
-            const int code = event.code;
+            if (stopping) break;
+            const auto now = Clock::now();
+            volume.tick(now); // A busy event queue must not postpone STOP.
             const bool released = event.duration > 0;
-
-            if (code == CEC_USER_CONTROL_CODE_VOLUME_UP ||
-                code == CEC_USER_CONTROL_CODE_VOLUME_DOWN) {
-                if (released) {
-                    if (activeVolume == code) {
-                        sendXS8(0x09, "STOP (release)");
-                        activeVolume = 0;
-                    }
-                } else {
-                    if (activeVolume != code) {
-                        if (activeVolume != 0)
-                            sendXS8(0x09, "STOP (direction change)");
-
-                        if (sendXS8(code == CEC_USER_CONTROL_CODE_VOLUME_UP
-                                        ? 0xF9 : 0xE9,
-                                    code == CEC_USER_CONTROL_CODE_VOLUME_UP
-                                        ? "VOL+" : "VOL-")) {
-                            activeVolume = code;
-                            lastHeartbeat = Clock::now();
-                        } else {
-                            activeVolume = 0;
-                        }
-                    }
-                    lastVolumeEvent = event.received;
-                }
-            } else if (code == CEC_USER_CONTROL_CODE_MUTE) {
-                if (!released)
-                    sendXS8(0xD8, "MUTE");
+            if (event.code == CEC_USER_CONTROL_CODE_VOLUME_UP ||
+                event.code == CEC_USER_CONTROL_CODE_VOLUME_DOWN) {
+                auto direction = event.code == CEC_USER_CONTROL_CODE_VOLUME_UP
+                    ? VolumeControl::Direction::UP : VolumeControl::Direction::DOWN;
+                if (released) volume.release(direction, now);
+                else volume.press(direction, event.received, now);
+            } else if (event.code == CEC_USER_CONTROL_CODE_MUTE && !released &&
+                       event.received <= now && now - event.received < WATCHDOG) {
+                volume.mute(now);
             }
+            report_fault();
         }
-
-        const auto now = Clock::now();
-        if (activeVolume != 0 && now - lastVolumeEvent > WATCHDOG) {
-            sendXS8(0x09, "STOP (watchdog)");
-            activeVolume = 0;
-        }
-
-        if (activeVolume != 0 && now - lastHeartbeat >= HEARTBEAT) {
-            if (!sendArduino('H', nullptr)) {
-                sendXS8(0x09, "STOP (heartbeat failure)");
-                activeVolume = 0;
-            }
-            lastHeartbeat = now;
-        }
-
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
-    sendXS8(0x09, "STOP (shutdown)");
+    bool stopped = volume.shutdown(Clock::now());
+    if (!stopped || volume.stop_owed() || volume.context_may_be_open())
+        std::fprintf(stderr, "WARNING: XS8 cleanup incomplete; "
+                             "receiver volume may remain active\n");
     cec->Close();
     UnloadLibCec(cec);
-    close(serialFd);
-    return 0;
+    const bool released = xs8_gpio_release(&bus) == 0;
+    if (!released) std::fprintf(stderr, "WARNING: GPIO TX release failed\n");
+    xs8_gpio_close(&bus);
+    return stopped && released ? 0 : 1;
 }
-
