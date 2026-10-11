@@ -24,6 +24,7 @@ let sourceEnabled = true;
 let now = 10000;
 let refresh;
 const context = {
+  AbortController, setTimeout, clearTimeout,
   document: {
     getElementById(id) {
       if (id === 'mute-button') return mute;

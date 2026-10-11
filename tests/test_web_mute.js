@@ -18,6 +18,7 @@ function element(id) {
 }
 
 const context = {
+  AbortController, setTimeout, clearTimeout,
   document: { getElementById: element, querySelectorAll: () => sourceButtons },
   setInterval: (handler) => { refresh = handler; },
   fetch: async (url, options) => {

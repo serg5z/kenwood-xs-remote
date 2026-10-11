@@ -3,143 +3,162 @@ const muteButton = document.getElementById('mute-button');
 const sourceButtons = [...document.querySelectorAll('.source-grid button[data-source]')];
 let csrfToken = null;
 let serviceReady = false;
-let sessionReady = false;
+let muteReady = false;
 let sourceReady = false;
 let enabledSources = [];
-let sourceBusy = false;
+let controlBusy = false;
 let lastSourceAttempt = 0;
-let sourceResult = null;
-let muteBusy = false;
-let muteResult = null;
+let controlResult = null;
+let refreshController = null;
+let refreshVersion = 0;
 
 function updateControls() {
-  muteButton.disabled = !csrfToken || !sessionReady || !serviceReady || muteBusy;
+  muteButton.disabled = controlBusy || !csrfToken || !serviceReady || !muteReady;
   for (const button of sourceButtons) {
-    button.disabled = !csrfToken || !sourceReady || !serviceReady || sourceBusy ||
+    button.disabled = controlBusy || !csrfToken || !serviceReady || !sourceReady ||
       !enabledSources.includes(button.dataset.source);
   }
-  text('availability-text', csrfToken
-    ? (serviceReady ? (sourceResult || muteResult || 'CONTROLS READY · RECEIVER ACTION UNVERIFIED')
-      : 'CONTROLS UNAVAILABLE · SERVICE NOT READY')
-    : 'CONTROL DISABLED · READ-ONLY PREVIEW');
+  const available = !controlBusy && serviceReady && csrfToken && (muteReady || sourceReady);
+  text('availability-text', controlResult
+    ? `${controlResult}${available ? '' : ' · CONTROLS UNAVAILABLE'}`
+    : (available ? 'CONTROLS READY · RECEIVER ACTION UNVERIFIED'
+      : 'CONTROLS UNAVAILABLE · SERVICE OR AUTHORIZATION NOT READY'));
 }
 
-async function refreshCapabilities() {
-  try {
-    const response = await fetch('/api/v1/capabilities', { cache: 'no-store' });
-    const data = await response.json();
-    const source = data.operations && data.operations.source;
-    enabledSources = response.ok && source && source.enabled === true &&
-      Array.isArray(source.available_sources) ? source.available_sources : [];
-  } catch (_) {
-    enabledSources = [];
-  }
-  updateControls();
-}
-
-async function refreshSession() {
-  try {
-    const response = await fetch('/api/v1/session', { cache: 'no-store', credentials: 'same-origin' });
-    const data = await response.json();
-    csrfToken = response.ok && typeof data.csrf_token === 'string' ? data.csrf_token : null;
-    sessionReady = response.ok && data.mute_available === true;
-    sourceReady = response.ok && data.source_available === true;
-  } catch (_) {
-    csrfToken = null;
-    sessionReady = false;
-    sourceReady = false;
-  }
-  updateControls();
-}
-
-async function refreshStatus() {
-  try {
-    const response = await fetch('/api/v1/status', { cache: 'no-store' });
-    const data = await response.json();
-    text('gateway', data.gateway === 'online' ? 'Online' : 'Unavailable');
-    if (!response.ok || data.xs8_service !== 'connected') {
-      serviceReady = false;
-      updateControls();
-      text('service', 'Unavailable');
-      text('summary-state', 'Service unavailable');
-      for (const id of ['state', 'monitor', 'tx', 'waveform']) text(id, '—');
-      return;
-    }
-    const status = data.status;
-    serviceReady = status.state === 'IDLE' && status.monitor === 'HEALTHY' &&
-      status.stop_owed === '0' && status.context_may_be_open === '0';
-    updateControls();
-    text('service', 'Connected');
-    text('summary-state', status.state);
-    text('state', status.state);
-    text('monitor', status.monitor);
-    text('tx', `${status.last_byte} · ${status.last_gpio_tx}`);
-    text('waveform', status.last_waveform);
-  } catch (_) {
-    serviceReady = false;
-    updateControls();
-    text('gateway', 'Unavailable');
-    text('service', 'Unknown');
-    text('summary-state', 'Connection lost');
+function renderStatus(data) {
+  text('gateway', data && data.gateway === 'online' ? 'Online' : 'Unavailable');
+  if (!data || data.xs8_service !== 'connected' || !data.status) {
+    text('service', data ? 'Unavailable' : 'Unknown');
+    text('summary-state', data ? 'Service unavailable' : 'Connection lost');
     for (const id of ['state', 'monitor', 'tx', 'waveform']) text(id, '—');
+    return;
+  }
+  const status = data.status;
+  text('service', 'Connected');
+  text('summary-state', status.state);
+  text('state', status.state);
+  text('monitor', status.monitor);
+  text('tx', `${status.last_byte} · ${status.last_gpio_tx}`);
+  text('waveform', status.last_waveform);
+}
+
+function applyRefresh(statusData, sessionData, capabilitiesData) {
+  const status = statusData && statusData.xs8_service === 'connected' && statusData.status;
+  serviceReady = !!status && status.state === 'IDLE' && status.monitor === 'HEALTHY' &&
+    status.stop_owed === '0' && status.context_may_be_open === '0';
+  csrfToken = serviceReady && sessionData && typeof sessionData.csrf_token === 'string'
+    ? sessionData.csrf_token : null;
+  muteReady = !!csrfToken && sessionData.mute_available === true;
+  const source = capabilitiesData && capabilitiesData.operations && capabilitiesData.operations.source;
+  sourceReady = !!csrfToken && sessionData.source_available === true &&
+    !!source && source.enabled === true && Array.isArray(source.available_sources);
+  enabledSources = sourceReady ? source.available_sources : [];
+  renderStatus(statusData);
+  updateControls();
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  return { ok: response.ok, data: await response.json() };
+}
+
+// One bounded refresh at a time. Apply its results together, so a delayed GET
+// cannot restore an old one-use token or overwrite newer availability.
+async function refresh() {
+  if (controlBusy || refreshController) return;
+  const controller = new AbortController();
+  const version = ++refreshVersion;
+  refreshController = controller;
+  const timeout = setTimeout(() => controller.abort(), 4500);
+  let statusData = null;
+  let sessionData = null;
+  let capabilitiesData = null;
+  try {
+    const status = await fetchJson('/api/v1/status', {
+      cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
+    });
+    statusData = status.data;
+    if (status.ok && statusData.xs8_service === 'connected') {
+      const s = statusData.status;
+      if (s && s.state === 'IDLE' && s.monitor === 'HEALTHY' &&
+          s.stop_owed === '0' && s.context_may_be_open === '0') {
+        const session = await fetchJson('/api/v1/session', {
+          cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
+        });
+        if (session.ok && typeof session.data.csrf_token === 'string') {
+          sessionData = session.data;
+          if (session.data.source_available === true) {
+            try {
+              const capabilities = await fetchJson('/api/v1/capabilities', {
+                cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
+              });
+              if (capabilities.ok) capabilitiesData = capabilities.data;
+            } catch (_) {
+              // MUTE eligibility remains independent of source capabilities.
+            }
+          }
+        }
+      }
+    }
+  } catch (_) {
+    // A timeout or transient failure disables controls until the next poll.
+  } finally {
+    clearTimeout(timeout);
+    if (refreshController === controller) refreshController = null;
+  }
+  if (version === refreshVersion && !controlBusy) {
+    applyRefresh(controller.signal.aborted ? null : statusData,
+      controller.signal.aborted ? null : sessionData, capabilitiesData);
+  }
+}
+
+async function sendControl(url, body, success, failure) {
+  controlBusy = true;
+  ++refreshVersion;
+  if (refreshController) {
+    refreshController.abort();
+    refreshController = null;
+  }
+  const token = csrfToken;
+  csrfToken = null; muteReady = false; sourceReady = false;
+  updateControls();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6000);
+  try {
+    const response = await fetchJson(url, {
+      method: 'POST', credentials: 'same-origin', signal: controller.signal,
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token },
+      body,
+    });
+    controlResult = response.ok ? success : failure(response.data);
+  } catch (_) {
+    controlResult = url.endsWith('/mute')
+      ? 'MUTE RESULT UNKNOWN · CHECK RECEIVER'
+      : 'SOURCE RESULT UNKNOWN · CHECK RECEIVER';
+  } finally {
+    clearTimeout(timeout);
+    controlBusy = false;
+    updateControls();
+    await refresh();
   }
 }
 
 muteButton.addEventListener('click', async () => {
-  if (muteButton.disabled) return;
-  muteBusy = true;
-  updateControls();
-  try {
-    const response = await fetch('/api/v1/mute', {
-      method: 'POST', credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
-      body: '{}',
-    });
-    const data = await response.json();
-    muteResult = response.ok
-      ? 'MUTE TX REPORTED · RECEIVER ACTION UNVERIFIED'
-      : `MUTE ${data.result || 'FAILED'} · RECEIVER ACTION UNVERIFIED`;
-  } catch (_) {
-    muteResult = 'MUTE RESULT UNKNOWN · CHECK RECEIVER';
-  } finally {
-    csrfToken = null;
-    sessionReady = false;
-    muteBusy = false;
-    await refreshSession();
-    await refreshStatus();
-  }
+  if (muteButton.disabled || controlBusy) return;
+  await sendControl('/api/v1/mute', '{}',
+    'MUTE TX REPORTED · RECEIVER ACTION UNVERIFIED',
+    (data) => `MUTE ${data.result || 'FAILED'} · RECEIVER ACTION UNVERIFIED`);
 });
 
 for (const button of sourceButtons) {
   button.addEventListener('click', async () => {
-    if (button.disabled || sourceBusy || Date.now() - lastSourceAttempt < 1000) return;
+    if (button.disabled || controlBusy || Date.now() - lastSourceAttempt < 1000) return;
     lastSourceAttempt = Date.now();
-    sourceBusy = true;
-    updateControls();
-    try {
-      const response = await fetch('/api/v1/source', {
-        method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
-        body: JSON.stringify({ source: button.dataset.source }),
-      });
-      const data = await response.json();
-      sourceResult = response.ok
-        ? `${button.dataset.source} TX REPORTED · SELECTION UNVERIFIED`
-        : `SOURCE ${data.result || 'FAILED'} · SELECTION UNVERIFIED`;
-    } catch (_) {
-      sourceResult = 'SOURCE RESULT UNKNOWN · CHECK RECEIVER';
-    } finally {
-      csrfToken = null;
-      sourceReady = false;
-      sourceBusy = false;
-      await refreshSession();
-      await refreshCapabilities();
-      await refreshStatus();
-    }
+    await sendControl('/api/v1/source', JSON.stringify({ source: button.dataset.source }),
+      `${button.dataset.source} TX REPORTED · SELECTION UNVERIFIED`,
+      (data) => `SOURCE ${data.result || 'FAILED'} · SELECTION UNVERIFIED`);
   });
 }
 
-refreshStatus();
-refreshSession();
-refreshCapabilities();
-setInterval(() => { refreshStatus(); refreshSession(); refreshCapabilities(); }, 5000);
+refresh();
+setInterval(() => refresh(), 5000);

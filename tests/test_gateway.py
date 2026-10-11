@@ -393,6 +393,19 @@ class MuteGatewayTest(GatewayTest):
             self.assertEqual(self.mute(token, cookie)[0], 403)
             dispatch.assert_not_called()
 
+    def test_session_get_reuses_token_and_control_post_rotates_it(self):
+        self.enable_dev_mute()
+        token, cookie = self.session()
+        headers = {"X-Kenwood-Authenticated-User": "remote", "Cookie": cookie}
+        code, body, _ = self.request_full("GET", "/api/v1/session", headers=headers)
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["csrf_token"], token)
+        # The service is unavailable, but a validated POST still consumes its token.
+        self.assertEqual(self.mute(token, cookie)[0], 503)
+        code, body, _ = self.request_full("GET", "/api/v1/session", headers=headers)
+        self.assertEqual(code, 200)
+        self.assertNotEqual(json.loads(body)["csrf_token"], token)
+
     def test_fault_status_disables_capability_and_service_refusal_is_preserved(self):
         self.enable_dev_mute()
         token, cookie = self.session()
