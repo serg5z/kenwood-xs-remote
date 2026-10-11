@@ -1,6 +1,7 @@
 #include "xs8_service_core.h"
 #include "xs8_gpio.h"
 #include "xs8_monitor.h"
+#include "xs8_query_status.h"
 
 #include <atomic>
 #include <cerrno>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <fcntl.h>
 #include <poll.h>
@@ -35,6 +37,8 @@ public:
     }
     ServiceTxEvidence last_evidence() const override { return last_; }
     ServiceTxEvidence last_stop_evidence() const override { return last_stop_; }
+    uint64_t last_start_ns() const { return last_start_ns_; }
+    uint64_t last_end_ns() const { return last_end_ns_; }
     bool send(uint8_t byte) override {
         last_ = {};
         last_.attempted = true;
@@ -43,6 +47,8 @@ public:
         int64_t start = 0;
         last_.gpio_completed = xs8_gpio_send(&bus_, byte, &start) == 0;
         int64_t end = xs8_gpio_now_ns();
+        last_start_ns_ = start > 0 ? (uint64_t)start : 0;
+        last_end_ns_ = end > 0 ? (uint64_t)end : 0;
         if (last_.gpio_completed && start > 0 && end >= start) {
             enum xs8_observation observed = xs8_monitor_verify_tx(
                 &monitor_, checkpoint, byte, (uint64_t)start,
@@ -76,6 +82,8 @@ private:
     xs8_monitor& monitor_;
     ServiceTxEvidence last_{};
     ServiceTxEvidence last_stop_{};
+    uint64_t last_start_ns_ = 0;
+    uint64_t last_end_ns_ = 0;
 };
 
 bool set_nonblocking(int fd)
@@ -176,9 +184,54 @@ int main(int argc, char **argv)
         socket_path, authorized ? "IDLE (operator authorized)" : "BOOT_INHIBIT");
     int client = -1;
     std::string input;
+    std::optional<Xs8QueryStatus> query;
+    uint64_t query_cursor = 0;
     while (!stopping) {
         xs8_monitor_poll(monitor, 0);
         core.tick(VolumeControl::Clock::now());
+        if (query) {
+            pollfd pending_client = {client, POLLIN, 0};
+            if (poll(&pending_client, 1, 0) > 0 &&
+                (pending_client.revents &
+                 (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+                query->cancel();
+                query.reset();
+                core.disconnected(VolumeControl::Clock::now());
+                close(client);
+                client = -1;
+                input.clear();
+                continue;
+            }
+            xs8_monitor_record records[8];
+            size_t copied = 0;
+            do {
+                if (xs8_monitor_snapshot(monitor, &query_cursor, records, 8,
+                                         &copied) < 0) {
+                    query->overflow();
+                    break;
+                }
+                query->observe(records, copied);
+            } while (copied == 8 && !query->done(0));
+            if (!xs8_monitor_healthy(monitor)) query->monitor_failed();
+            int64_t now_ns = xs8_gpio_now_ns();
+            if (now_ns < 0) query->monitor_failed();
+            if (now_ns > 0 && (uint64_t)now_ns >= query->deadline_ns()) {
+                xs8_monitor_record partial{};
+                if (xs8_monitor_partial(monitor, (uint64_t)now_ns, &partial))
+                    query->observe(&partial, 1);
+            }
+            if (query->done(now_ns > 0 ? (uint64_t)now_ns : 0)) {
+                bool sent = reply(client, query->response(
+                    now_ns > 0 ? (uint64_t)now_ns : 0));
+                query.reset();
+                if (!sent) {
+                    core.disconnected(VolumeControl::Clock::now());
+                    close(client);
+                    client = -1;
+                    input.clear();
+                }
+            }
+        }
         pollfd fds[2] = {{server, POLLIN, 0}, {client, POLLIN, 0}};
         int count = poll(fds, client >= 0 ? 2 : 1, 20);
         if (count < 0) {
@@ -208,6 +261,7 @@ int main(int argc, char **argv)
         if (!(fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)))
             continue;
         if (fds[1].revents & POLLNVAL) {
+            if (query) query->cancel();
             core.disconnected(VolumeControl::Clock::now());
             close(client);
             client = -1;
@@ -216,6 +270,16 @@ int main(int argc, char **argv)
         }
         char buffer[256];
         ssize_t size = read(client, buffer, sizeof(buffer));
+        if (query) {
+            if (size < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+            query->cancel();
+            query.reset();
+            core.disconnected(VolumeControl::Clock::now());
+            close(client);
+            client = -1;
+            input.clear();
+            continue;
+        }
         if (size > 0) {
             input.append(buffer, static_cast<size_t>(size));
             size_t newline;
@@ -226,6 +290,30 @@ int main(int argc, char **argv)
                 input.erase(0, newline + 1);
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 auto received = VolumeControl::Clock::now();
+                if (line == "QUERY_STATUS") {
+                    if (!input.empty()) {
+                        if (!reply(client, "ERR QUERY_STATUS reason=PIPELINED\n"))
+                            failed = true;
+                        continue;
+                    }
+                    query_cursor = xs8_monitor_checkpoint(monitor);
+                    std::string result = core.begin_query_status(received);
+                    if (result.empty()) {
+                        if (!transmitter.last_start_ns() ||
+                            transmitter.last_end_ns() <
+                                transmitter.last_start_ns()) {
+                            if (!reply(client,
+                                "ERR QUERY_STATUS reason=TX_TIME_UNAVAILABLE\n"))
+                                failed = true;
+                            continue;
+                        }
+                        query.emplace(transmitter.last_start_ns(),
+                                      transmitter.last_end_ns());
+                        break;
+                    }
+                    if (!reply(client, result)) failed = true;
+                    continue;
+                }
                 if (!reply(client, core.command(line, received, received))) {
                     failed = true;
                     break;
@@ -241,6 +329,7 @@ int main(int argc, char **argv)
         input.clear();
     }
     if (client >= 0) {
+        if (query) query->cancel();
         core.disconnected(VolumeControl::Clock::now());
         close(client);
     }

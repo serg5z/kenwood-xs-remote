@@ -32,6 +32,8 @@ public:
                    std::function<Time()> now = Clock::now);
     void connected();
     std::string command(const std::string& line, Time received, Time now);
+    // Empty result means one query frame was verified and RX collection may begin.
+    std::string begin_query_status(Time now);
     void disconnected(Time now);
     void tick(Time now);
     bool shutdown(Time now);

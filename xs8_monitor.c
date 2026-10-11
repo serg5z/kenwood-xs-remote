@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "xs8_monitor.h"
+#include "xs8_gpio.h"
 #include "xs8_decode.h"
 
 #include <errno.h>
@@ -16,11 +17,6 @@
 #define OBS_HISTORY 64
 #define OBS_TAIL_NS 2000000ULL
 
-struct observation_record {
-    uint64_t serial, end_ns;
-    struct xs8_decoded decoded;
-};
-
 struct xs8_monitor {
     struct xs8_gpio *bus;
     struct gpiod_edge_event_buffer *buffer;
@@ -35,7 +31,7 @@ struct xs8_monitor {
     bool timestamp_seen;
     pthread_mutex_t observation_lock;
     pthread_cond_t observation_changed;
-    struct observation_record observations[OBS_HISTORY];
+    struct xs8_monitor_record observations[OBS_HISTORY];
     uint64_t observation_serial;
     atomic_bool healthy;
     bool threaded;
@@ -68,7 +64,7 @@ static void record_observation(struct xs8_monitor *monitor,
     pthread_mutex_lock(&monitor->observation_lock);
     uint64_t serial = ++monitor->observation_serial;
     monitor->observations[serial % OBS_HISTORY] =
-        (struct observation_record){serial, end_ns, *result};
+        (struct xs8_monitor_record){serial, end_ns, *result};
     pthread_cond_broadcast(&monitor->observation_changed);
     pthread_mutex_unlock(&monitor->observation_lock);
 }
@@ -362,6 +358,58 @@ uint64_t xs8_monitor_checkpoint(struct xs8_monitor *monitor)
     return serial;
 }
 
+int xs8_monitor_snapshot(struct xs8_monitor *monitor, uint64_t *cursor,
+    struct xs8_monitor_record *records, size_t capacity, size_t *count)
+{
+    if (!monitor || !cursor || !records || !capacity || !count) {
+        errno = EINVAL;
+        return -1;
+    }
+    *count = 0;
+    pthread_mutex_lock(&monitor->observation_lock);
+    uint64_t newest = monitor->observation_serial;
+    if (*cursor > newest || newest - *cursor >= OBS_HISTORY) {
+        pthread_mutex_unlock(&monitor->observation_lock);
+        errno = EOVERFLOW;
+        return -1;
+    }
+    while (*cursor < newest && *count < capacity) {
+        uint64_t serial = *cursor + 1;
+        struct xs8_monitor_record record =
+            monitor->observations[serial % OBS_HISTORY];
+        if (record.serial != serial) {
+            pthread_mutex_unlock(&monitor->observation_lock);
+            errno = EOVERFLOW;
+            return -1;
+        }
+        records[(*count)++] = record;
+        *cursor = serial;
+    }
+    pthread_mutex_unlock(&monitor->observation_lock);
+    return 0;
+}
+
+bool xs8_monitor_partial(struct xs8_monitor *monitor, uint64_t now_ns,
+    struct xs8_monitor_record *record)
+{
+    if (!monitor || monitor->threaded || !record || !monitor->decoder.active)
+        return false;
+    *record = (struct xs8_monitor_record){
+        .end_ns = now_ns,
+        .decoded = {
+            .kind = XS8_FRAME,
+            .time_ns = monitor->decoder.frame_start_ns,
+            .valid = false,
+            .waveform_lsb = monitor->decoder.waveform_lsb,
+            .legacy_msb_short1 = monitor->decoder.legacy_msb_short1,
+            .bits = monitor->decoder.bits,
+            .reason = monitor->decoder.error
+                ? monitor->decoder.error : "CAPTURE_WINDOW_ENDED"
+        }
+    };
+    return true;
+}
+
 enum xs8_observation xs8_monitor_verify_tx(struct xs8_monitor *monitor,
     uint64_t checkpoint, uint8_t byte, uint64_t start_ns, uint64_t end_ns,
     unsigned int timeout_ms)
@@ -390,7 +438,7 @@ enum xs8_observation xs8_monitor_verify_tx(struct xs8_monitor *monitor,
             return XS8_OBS_UNHEALTHY;
         }
         while (next <= monitor->observation_serial) {
-            struct observation_record record =
+            struct xs8_monitor_record record =
                 monitor->observations[next % OBS_HISTORY];
             ++next;
             if (record.serial != next - 1 ||

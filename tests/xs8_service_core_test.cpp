@@ -18,6 +18,8 @@ struct FakeTx final : ServiceTransmitter {
     std::deque<bool> stop_matches;
     bool healthy = true;
     bool fail_next = false;
+    bool fail_root = false;
+    WaveformEvidence fail_waveform = WaveformEvidence::MISSING;
     ServiceTxEvidence last{}, last_stop{};
     bool monitor_healthy() const override { return healthy; }
     ServiceTxEvidence last_evidence() const override { return last; }
@@ -36,10 +38,10 @@ struct FakeTx final : ServiceTransmitter {
             last_stop = last;
             return match;
         }
-        const bool match = healthy && !fail_next;
+        const bool match = healthy && !fail_next && !(fail_root && byte == 0x07);
         fail_next = false;
         last.waveform = match ? WaveformEvidence::MATCH
-                                : WaveformEvidence::MISSING;
+                                : fail_waveform;
         return match;
     }
 };
@@ -227,6 +229,74 @@ static void test_failed_stop_verification_and_monitor()
     assert(tx3.sent.size() == attempts);
 }
 
+static void test_query_status_gates_and_single_tx()
+{
+    FakeTx inhibited_tx;
+    Xs8ServiceCore inhibited(inhibited_tx, Ms(2000), false);
+    inhibited.connected();
+    assert(inhibited.begin_query_status(at(1)) == "ERR BOOT_INHIBIT\n");
+    assert(inhibited_tx.sent.empty());
+
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true);
+    assert(core.begin_query_status(at(1)) == "ERR NO_CLIENT\n");
+    core.connected();
+    assert(core.begin_query_status(at(2)).empty());
+    assert(tx.sent == (std::vector<uint8_t>{0x13}));
+    tx.healthy = false;
+    assert(core.begin_query_status(at(3)) == "ERR MONITOR_FAILED\n");
+    assert(tx.sent.size() == 1);
+
+    FakeTx mismatch_tx;
+    mismatch_tx.fail_next = true;
+    mismatch_tx.fail_waveform = WaveformEvidence::MISMATCH;
+    Xs8ServiceCore mismatch(mismatch_tx, Ms(2000), true);
+    mismatch.connected();
+    assert(mismatch.begin_query_status(at(1)) ==
+        "ERR QUERY_STATUS reason=TX_UNCERTAIN gpio_tx=TX_OK "
+        "waveform=MISMATCH receiver_execution=UNVERIFIED\n");
+    assert(mismatch_tx.sent == (std::vector<uint8_t>{0x13}));
+
+    FakeTx holding_tx;
+    Xs8ServiceCore holding(holding_tx, Ms(2000), true,
+                           {}, [] { return at(1); });
+    holding.connected();
+    assert(holding.command("VOLUME_PRESS DOWN", at(1), at(1)) ==
+           "OK VOLUME_PRESS_TX\n");
+    const size_t before = holding_tx.sent.size();
+    assert(holding.begin_query_status(at(2)) == "ERR HOLDING_DOWN\n");
+    assert(holding_tx.sent.size() == before);
+    assert(holding.begin_query_status(at(2002)) == "ERR HOLDING_DOWN\n");
+    assert(holding_tx.sent == (std::vector<uint8_t>{
+        0x17, 0xE9, 0x09, 0x07}));
+    assert(holding.begin_query_status(at(2003)).empty());
+    assert(holding_tx.sent.back() == 0x13);
+    assert(holding_tx.sent.size() == 5);
+
+    FakeTx unresolved_tx;
+    Xs8ServiceCore unresolved(unresolved_tx, Ms(2000), true,
+                              {}, [] { return at(1); });
+    unresolved.connected();
+    unresolved.command("VOLUME_PRESS DOWN", at(1), at(1));
+    unresolved_tx.stop_matches = {false, false, false};
+    unresolved.command("VOLUME_RELEASE DOWN", at(3), at(3));
+    assert(unresolved.stop_owed());
+    const size_t unresolved_count = unresolved_tx.sent.size();
+    assert(unresolved.begin_query_status(at(4)) == "ERR FAULT_LATCHED\n");
+    assert(unresolved_tx.sent.size() == unresolved_count);
+
+    FakeTx root_tx;
+    Xs8ServiceCore root_fault(root_tx, Ms(2000), true,
+                              {}, [] { return at(1); });
+    root_fault.connected();
+    root_fault.command("VOLUME_PRESS DOWN", at(1), at(1));
+    root_tx.fail_root = true;
+    root_fault.command("VOLUME_RELEASE DOWN", at(2), at(2));
+    assert(root_fault.state() == VolumeControl::State::FAULT_LATCHED);
+    assert(root_fault.begin_query_status(at(3)) == "ERR FAULT_LATCHED\n");
+    assert(root_tx.sent.back() == 0x07);
+}
+
 int main()
 {
     test_startup_and_parsing();
@@ -236,5 +306,6 @@ int main()
     test_release_and_mute_order();
     test_release_and_watchdog();
     test_failed_stop_verification_and_monitor();
+    test_query_status_gates_and_single_tx();
     std::cout << "XS8 service core tests passed\n";
 }

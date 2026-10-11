@@ -119,6 +119,31 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
                                            : "ERR VOLUME_STOP_UNCERTAIN\n";
 }
 
+std::string Xs8ServiceCore::begin_query_status(Time now)
+{
+    const VolumeControl::State received_state = volume_.state();
+    const bool received_unresolved =
+        volume_.stop_owed() || volume_.context_may_be_open();
+    tick(now);
+    if (!client_connected_) return "ERR NO_CLIENT\n";
+    if (!tx_.monitor_healthy()) return "ERR MONITOR_FAILED\n";
+    if (received_state != VolumeControl::State::IDLE)
+        return std::string("ERR ") + state_name(received_state) + "\n";
+    if (received_unresolved)
+        return "ERR QUERY_STATUS reason=UNRESOLVED_STATE\n";
+    if (volume_.state() != VolumeControl::State::IDLE ||
+        volume_.stop_owed() || volume_.context_may_be_open())
+        return "ERR QUERY_STATUS reason=UNRESOLVED_STATE\n";
+    const bool verified = tx_.send(0x13);
+    const ServiceTxEvidence evidence = tx_.last_evidence();
+    if (!verified)
+        return std::string("ERR QUERY_STATUS reason=TX_UNCERTAIN gpio_tx=") +
+            (evidence.gpio_completed ? "TX_OK" : "TX_FAIL") +
+            " waveform=" + waveform_name(evidence.waveform) +
+            " receiver_execution=UNVERIFIED\n";
+    return {};
+}
+
 void Xs8ServiceCore::disconnected(Time now)
 {
     if (!client_connected_) return;

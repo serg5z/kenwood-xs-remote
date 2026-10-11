@@ -30,17 +30,18 @@ all: .build/cec-xs-bridge .build/cec-xs-client .build/xs8_send .build/xs8-servic
 .build/xs8_send: xs8_send.c xs8_gpio.h .build/xs8_gpio.o .build/xs8_rt.o
 	$(CC) $(CFLAGS) -std=c11 xs8_send.c .build/xs8_gpio.o .build/xs8_rt.o -o $@ -pthread -lgpiod
 
-.build/xs8-service: xs8_service.cpp xs8_service_core.cpp xs8_service_core.h volume_control.cpp volume_control.h xs8_gpio.h xs8_monitor.h .build/xs8_gpio.o .build/xs8_rt.o .build/xs8_decode.o .build/xs8_monitor.o
-	$(CXX) $(CXXFLAGS) xs8_service.cpp xs8_service_core.cpp volume_control.cpp .build/xs8_gpio.o .build/xs8_rt.o .build/xs8_decode.o .build/xs8_monitor.o -o $@ -pthread -lgpiod
+.build/xs8-service: xs8_service.cpp xs8_service_core.cpp xs8_service_core.h xs8_query_status.cpp xs8_query_status.h volume_control.cpp volume_control.h xs8_gpio.h xs8_monitor.h .build/xs8_gpio.o .build/xs8_rt.o .build/xs8_decode.o .build/xs8_monitor.o
+	$(CXX) $(CXXFLAGS) xs8_service.cpp xs8_service_core.cpp xs8_query_status.cpp volume_control.cpp .build/xs8_gpio.o .build/xs8_rt.o .build/xs8_decode.o .build/xs8_monitor.o -o $@ -pthread -lgpiod
 
 .build/volume_control_test: volume_control.cpp volume_control.h tests/volume_control_test.cpp | .build
 	$(CXX) $(CXXFLAGS) -Werror -I. volume_control.cpp tests/volume_control_test.cpp -o $@
 
-test: .build/volume_control_test .build/xs8_decode_test .build/xs8_rt_test .build/xs8_service_core_test .build/cec_client_core_test .build/cec_service_socket_test
+test: .build/volume_control_test .build/xs8_decode_test .build/xs8_rt_test .build/xs8_service_core_test .build/xs8_query_status_test .build/cec_client_core_test .build/cec_service_socket_test
 	./.build/volume_control_test
 	./.build/xs8_decode_test
 	./.build/xs8_rt_test
 	./.build/xs8_service_core_test
+	./.build/xs8_query_status_test
 	./.build/cec_client_core_test
 	./.build/cec_service_socket_test
 
@@ -52,6 +53,9 @@ test: .build/volume_control_test .build/xs8_decode_test .build/xs8_rt_test .buil
 
 .build/xs8_service_core_test: xs8_service_core.cpp xs8_service_core.h volume_control.cpp volume_control.h tests/xs8_service_core_test.cpp | .build
 	$(CXX) $(CXXFLAGS) -Werror -I. xs8_service_core.cpp volume_control.cpp tests/xs8_service_core_test.cpp -o $@
+
+.build/xs8_query_status_test: xs8_query_status.cpp xs8_query_status.h xs8_monitor.h xs8_decode.h tests/xs8_query_status_test.cpp | .build
+	$(CXX) $(CXXFLAGS) -Werror -I. xs8_query_status.cpp tests/xs8_query_status_test.cpp -o $@
 
 .build/cec_client_core_test: cec_client_core.cpp cec_client_core.h tests/cec_client_core_test.cpp | .build
 	$(CXX) $(CXXFLAGS) -Werror -I. cec_client_core.cpp tests/cec_client_core_test.cpp -o $@ -pthread
