@@ -1,10 +1,13 @@
 #define _POSIX_C_SOURCE 200809L
 #include "xs8_gpio.h"
+#include "xs8_rt.h"
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define CHIP "/dev/gpiochip0"
 #define DATA_TX 4
@@ -21,6 +24,8 @@
 #define BUS_FREE_TIMEOUT_US 100000
 #define BUS_FREE_GUARD_US 500
 #define END_GUARD_US 750
+/* Normal frame duration is below 130 ms; abandon a badly delayed RT frame. */
+#define RT_FRAME_LIMIT_NS 250000000LL
 
 int64_t xs8_gpio_now_ns(void)
 {
@@ -115,6 +120,12 @@ int xs8_gpio_open(struct xs8_gpio *bus, bool capture)
     gpiod_line_config_free(tx_cfg);
     gpiod_line_settings_free(in);
     gpiod_line_settings_free(out);
+    bus->rt_priority = xs8_rt_parse_priority(getenv("XS8_RT_PRIORITY"));
+    if (bus->rt_priority < 0) {
+        fprintf(stderr, "XS8 RT disabled: invalid XS8_RT_PRIORITY "
+                        "(expected 1..10)\n");
+        bus->rt_priority = 0;
+    }
     return 0;
 
 fail:
@@ -151,6 +162,29 @@ static int wait_bus_free(struct xs8_gpio *bus)
     return -1;
 }
 
+static int restore_scheduling(struct xs8_gpio *bus, struct xs8_rt_guard *guard)
+{
+    int result = xs8_rt_end(guard, NULL);
+    if (result == 0) return 0;
+    if (result == 1) {
+        fprintf(stderr, "XS8 RT restore needed a retry; original "
+                        "scheduling restored\n");
+        return 0;
+    }
+    if (result == 2) {
+        fprintf(stderr, "WARNING: XS8 RT original scheduling restore "
+                        "failed; demoted to SCHED_OTHER; TX marked failed\n");
+        errno = EIO;
+        return -1;
+    }
+    /* Continuing CEC or logging on a stuck FIFO owner thread is unsafe. */
+    xs8_gpio_release(bus);
+    static const char warning[] = "FATAL: XS8 RT demotion failed; exiting. "
+        "Receiver volume state is unknown; check receiver.\n";
+    (void)write(STDERR_FILENO, warning, sizeof(warning) - 1);
+    _Exit(1);
+}
+
 int xs8_gpio_send(struct xs8_gpio *bus, uint8_t value, int64_t *tx_start_ns)
 {
     int64_t max_late_ns = 0;
@@ -158,9 +192,16 @@ int xs8_gpio_send(struct xs8_gpio *bus, uint8_t value, int64_t *tx_start_ns)
     unsigned int over_500us = 0, over_1000us = 0;
     unsigned int samples = 0, clock_errors = 0;
     bool frame_started = false;
+    bool rt_enabled = false;
+    struct xs8_rt_guard rt = {0};
     if (!bus || !bus->tx_req || !bus->rx_req) { errno = EINVAL; return -1; }
     if (tx_start_ns) *tx_start_ns = 0;
     if (xs8_gpio_release(bus) < 0 || wait_bus_free(bus) < 0) goto fail;
+    int rt_result = xs8_rt_begin(&rt, bus->rt_priority, NULL);
+    if (rt_result < 0)
+        fprintf(stderr, "XS8 RT enable failed: %s; using normal "
+                        "scheduling\n", strerror(errno));
+    rt_enabled = rt_result == 1;
     int64_t deadline = xs8_gpio_now_ns();
     if (deadline < 0) goto fail;
     frame_start_ns = deadline;
@@ -180,6 +221,9 @@ int xs8_gpio_send(struct xs8_gpio *bus, uint8_t value, int64_t *tx_start_ns)
         if (late_ns > max_late_ns) max_late_ns = late_ns;          \
         if (late_ns > 500000) ++over_500us;                       \
         if (late_ns > 1000000) ++over_1000us;                     \
+        if (rt.active && woke_ns - frame_start_ns > RT_FRAME_LIMIT_NS) { \
+            errno = ETIMEDOUT; goto fail;                          \
+        }                                                         \
     }                                                            \
 } while (0)
 
@@ -192,26 +236,32 @@ int xs8_gpio_send(struct xs8_gpio *bus, uint8_t value, int64_t *tx_start_ns)
     STEP(DATA_TX, 0, END_GUARD_US);
     if (tx(bus, BUSY_TX, 0) < 0) goto fail;
 #undef STEP
+    if (restore_scheduling(bus, &rt) < 0) goto fail;
     fprintf(stderr, "mono_us=%lld XS8 TX 0x%02X timing result=TX_OK "
                     "max_late_ns=%lld "
-                    "over_500us=%u over_1000us=%u samples=%u clock_errors=%u\n",
+                    "over_500us=%u over_1000us=%u samples=%u clock_errors=%u "
+                    "rt=%s\n",
             (long long)(frame_start_ns / 1000), value,
             (long long)max_late_ns, over_500us, over_1000us,
-            samples, clock_errors);
+            samples, clock_errors,
+            rt_enabled ? "FIFO" : bus->rt_priority ? "UNAVAILABLE" : "OFF");
     return 0;
 
 fail:
     {
         int saved_error = errno ? errno : EIO;
         xs8_gpio_release(bus);
+        if (restore_scheduling(bus, &rt) < 0) saved_error = errno;
         if (frame_started)
             fprintf(stderr, "mono_us=%lld XS8 TX 0x%02X timing "
                             "result=TX_FAIL "
                             "max_late_ns=%lld over_500us=%u over_1000us=%u "
-                            "samples=%u clock_errors=%u\n",
+                            "samples=%u clock_errors=%u rt=%s\n",
                     (long long)(frame_start_ns / 1000), value,
                     (long long)max_late_ns, over_500us, over_1000us,
-                    samples, clock_errors);
+                    samples, clock_errors,
+                    rt_enabled ? "FIFO" :
+                    bus->rt_priority ? "UNAVAILABLE" : "OFF");
         errno = saved_error;
     }
     return -1;

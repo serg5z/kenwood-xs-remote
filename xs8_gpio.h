@@ -16,6 +16,7 @@ struct xs8_gpio {
     struct gpiod_line_request *rx_req;
     pthread_mutex_t rx_lock;
     bool lock_ready;
+    int rt_priority;
 };
 
 /* One owner sends frames. The RX lock also protects a concurrent capture reader. */
