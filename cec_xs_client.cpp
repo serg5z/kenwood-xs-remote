@@ -1,3 +1,4 @@
+#include <iostream>
 #include "cec_client_core.h"
 #include "cec_service_socket.h"
 
@@ -65,7 +66,7 @@ int main(int argc, char** argv)
     config.wakeDevices.Clear();
     config.clientVersion = LIBCEC_VERSION_CURRENT;
     config.deviceTypes.Add(CEC_DEVICE_TYPE_AUDIO_SYSTEM);
-    std::snprintf(config.strDeviceName, sizeof(config.strDeviceName), "Kenwood CEC Client");
+    std::snprintf(config.strDeviceName, sizeof(config.strDeviceName), "Kenwood XS");
     ICECCallbacks callbacks{};
     callbacks.keyPress = on_key;
     config.callbacks = &callbacks;
