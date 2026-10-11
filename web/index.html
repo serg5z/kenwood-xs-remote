@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ebe8e1">
+  <title>Kenwood XS Remote</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span>KENWOOD <small>XS REMOTE</small></span></div>
+      <span class="edition">KR-V6070 · EXPERIMENTAL</span>
+    </header>
+
+    <section class="remote" aria-label="Receiver remote">
+      <div class="remote-heading">
+        <p class="eyebrow">SYSTEM CONTROL / XS8</p>
+        <h1>Receiver control</h1>
+        <p class="intro">A quiet place for your hi-fi controls. Control actions are unavailable in this read-only preview.</p>
+      </div>
+
+      <div class="control-layout">
+        <div class="left-controls">
+          <section class="control-group" aria-labelledby="source-title">
+            <div class="section-heading"><h2 id="source-title">Input</h2><span>SELECT SOURCE</span></div>
+            <div class="source-grid">
+              <button disabled type="button">CD</button>
+              <button disabled type="button">TV1</button>
+              <button disabled type="button">TV2</button>
+              <button disabled type="button">TUNER</button>
+              <button disabled type="button">PHONO</button>
+              <button disabled type="button">TAPE1</button>
+              <button disabled type="button">TAPE2</button>
+            </div>
+          </section>
+
+          <section class="control-group transport" aria-labelledby="transport-title">
+            <div class="section-heading"><h2 id="transport-title">CD transport</h2><span>PLAYBACK</span></div>
+            <div class="transport-grid">
+              <button disabled type="button" aria-label="Previous track">◀◀<small>PREV</small></button>
+              <button disabled type="button" aria-label="Play or pause">▶Ⅱ<small>PLAY / PAUSE</small></button>
+              <button disabled type="button" aria-label="Stop">■<small>STOP</small></button>
+              <button disabled type="button" aria-label="Next track">▶▶<small>NEXT</small></button>
+            </div>
+          </section>
+        </div>
+
+        <section class="volume" aria-labelledby="volume-title">
+          <div class="section-heading"><h2 id="volume-title">Volume</h2></div>
+          <div class="rocker" role="group" aria-label="Volume rocker">
+            <button disabled type="button" aria-label="Volume up">+</button>
+            <span class="rocker-seam" aria-hidden="true"></span>
+            <button disabled type="button" aria-label="Volume down">−</button>
+          </div>
+          <button class="mute" disabled type="button">MUTE</button>
+        </section>
+      </div>
+
+      <p class="availability"><span class="availability-dot" aria-hidden="true"></span>CONTROL DISABLED · READ-ONLY PREVIEW</p>
+    </section>
+
+    <details class="diagnostics">
+      <summary>Connection details <span id="summary-state">Checking…</span></summary>
+      <dl>
+        <div><dt>Gateway</dt><dd id="gateway">Checking…</dd></div>
+        <div><dt>XS8 service</dt><dd id="service">Checking…</dd></div>
+        <div><dt>Service state</dt><dd id="state">—</dd></div>
+        <div><dt>Monitor health</dt><dd id="monitor">—</dd></div>
+        <div><dt>Last TX</dt><dd id="tx">—</dd></div>
+        <div><dt>Last waveform</dt><dd id="waveform">—</dd></div>
+      </dl>
+      <p>TX_OK and waveform MATCH do not confirm receiver execution.</p>
+    </details>
+    <footer>LOCAL PREVIEW <span>·</span> ABSOLUTE VOLUME UNKNOWN</footer>
+  </main>
+</body>
+</html>
