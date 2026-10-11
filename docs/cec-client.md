@@ -1,6 +1,6 @@
 # Standalone CEC client for XS8 Service
 
-`cec-xs-client` is an optional, manually started CEC frontend for the existing single-owner `xs8-service`:
+`cec-xs-client` is a CEC frontend for the existing single-owner `xs8-service`. It can be run manually or through the [systemd service template](cec-client-systemd.md):
 
 ```text
 Apple TV / onn remote → HDMI-CEC → libCEC → cec-xs-client
@@ -36,7 +36,7 @@ The new `cec_client_core_test` exercises press/release, repeated and out-of-orde
 
    Match the maximum hold to the reviewed service configuration; the service's own limit remains authoritative. No socket or XS8 command is opened at startup. Test one short volume-down press/release first, then up and MUTE separately while watching the receiver. Inspect the client and service logs for `VOLUME_RELEASE`, STOP waveform evidence, and faults. A successful socket reply or TX waveform does not prove receiver execution. Stop validation immediately if the motor continues unexpectedly.
 
-There is no new systemd unit or autostart in this phase. The executable does not restart `xs8-service` or configure CEC adapters. If the service is unavailable, a press fails closed until its release; recovery requires a new physical press after the service is healthy. If the service process crashes while the motor is active, software cannot guarantee STOP delivery. Physical receiver observation and a manual stop path remain necessary.
+The executable does not restart `xs8-service` or configure CEC adapters. If the service is unavailable, a press fails closed until its release; recovery requires a new physical press after the service is healthy. If the service process crashes while the motor is active, software cannot guarantee STOP delivery. Physical receiver observation and a manual stop path remain necessary. The systemd template starts only the CEC client; it does not enable `xs8-service` or the original bridge.
 
 ## Rollback
 

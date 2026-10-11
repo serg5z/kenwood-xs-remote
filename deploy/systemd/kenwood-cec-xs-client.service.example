@@ -1,0 +1,19 @@
+[Unit]
+Description=Kenwood XS Remote CEC client
+After=local-fs.target systemd-udevd.service
+StartLimitIntervalSec=60s
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=serg
+WorkingDirectory=__REPO_DIR__
+ExecStart=__REPO_DIR__/.build/cec-xs-client --socket /tmp/kenwood-xs8.sock --max-hold-ms 2000
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
