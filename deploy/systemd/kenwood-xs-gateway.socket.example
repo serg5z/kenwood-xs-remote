@@ -1,0 +1,14 @@
+[Unit]
+Description=Kenwood XS Remote read-only Gateway socket
+
+[Socket]
+ListenStream=/run/kenwood-gateway.sock
+Accept=no
+SocketUser=root
+# Set this to the verified nginx worker group; do not use the XS8 Service group.
+SocketGroup=__NGINX_WORKER_GROUP__
+SocketMode=0660
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

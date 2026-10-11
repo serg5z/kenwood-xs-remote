@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""Local, read-only HTTP gateway for the XS8 control service."""
+"""Local HTTP gateway; MUTE requires an explicit offline development gate."""
 
 import argparse
 import ipaddress
 import json
+import os
+import secrets
 import socket
+import socketserver
+import struct
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
 
 DEFAULT_SOCKET = "/tmp/kenwood-xs8.sock"
+GATEWAY_SOCKET = "/run/kenwood-gateway.sock"
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 STATUS_FIELDS = {
     "state", "stop_owed", "context_may_be_open", "monitor", "last_byte",
@@ -22,6 +28,50 @@ STATUS_FIELDS = {
 
 class ServiceError(Exception):
     pass
+
+
+class MuteServiceError(Exception):
+    def __init__(self, result, message):
+        super().__init__(message)
+        self.result = result
+
+
+def send_mute(socket_path, timeout=1.0):
+    """One socket request, one command, no retry after an uncertain outcome."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout)
+            try:
+                client.connect(socket_path)
+            except socket.timeout as exc:
+                raise MuteServiceError("TIMEOUT", "XS8 service connection timed out") from exc
+            except OSError as exc:
+                raise MuteServiceError("UNAVAILABLE", "XS8 service unavailable") from exc
+            try:
+                client.sendall(b"MUTE\n")
+                response = bytearray()
+                while b"\n" not in response:
+                    chunk = client.recv(128)
+                    if not chunk:
+                        raise MuteServiceError("DISCONNECTED", "XS8 service disconnected before reply")
+                    response.extend(chunk)
+                    if len(response) > 256:
+                        raise MuteServiceError("INVALID_REPLY", "XS8 service reply too long")
+            except socket.timeout as exc:
+                raise MuteServiceError("TIMEOUT", "XS8 service reply timed out; delivery is uncertain") from exc
+            except OSError as exc:
+                raise MuteServiceError("DISCONNECTED", "XS8 service disconnected; delivery is uncertain") from exc
+    except socket.timeout as exc:
+        raise MuteServiceError("TIMEOUT", "XS8 service connection timed out") from exc
+    try:
+        line = bytes(response).split(b"\n", 1)[0].decode("ascii")
+    except UnicodeError as exc:
+        raise MuteServiceError("INVALID_REPLY", "Invalid XS8 service reply") from exc
+    if line == "OK MUTE_TX":
+        return line
+    if line.startswith("ERR ") and len(line) > 4:
+        raise MuteServiceError("REJECTED", line)
+    raise MuteServiceError("INVALID_REPLY", "Invalid XS8 service reply")
 
 
 def read_status(socket_path, timeout=1.0):
@@ -59,14 +109,14 @@ def read_status(socket_path, timeout=1.0):
     return fields
 
 
-def capabilities():
+def capabilities(mute_available=False):
     return {
         "api_version": "v0.1",
         "operations": {
             "status": {"classification": "supported", "enabled": True},
             "mute": {
-                "classification": "unverified", "enabled": False,
-                "reason": "XS8 service has MUTE, but HTTP control is not enabled; receiver execution is unverified",
+                "classification": "unverified", "enabled": mute_available,
+                "reason": "Development gate only; receiver execution is unverified",
             },
             "volume_step": {
                 "classification": "unsupported", "enabled": False,
@@ -86,20 +136,57 @@ def capabilities():
 
 class GatewayHandler(BaseHTTPRequestHandler):
     socket_path = DEFAULT_SOCKET
+    dev_mute_enabled = False
+    https_origin = None
+    sessions = None
 
-    def send_body(self, code, body, content_type):
+    def authenticated_user(self):
+        # nginx overwrites this header with $remote_user after Basic Auth.
+        if not getattr(self.server, "proxy_peer_verified", False):
+            return None
+        users = self.headers.get_all("X-Kenwood-Authenticated-User", [])
+        return users[0] if len(users) == 1 and users[0].strip() else None
+
+    def address_string(self):
+        return "local" if isinstance(self.client_address, str) else super().address_string()
+
+    def current_session(self):
+        user = self.authenticated_user()
+        cookies = self.headers.get_all("Cookie", [])
+        if not user or len(cookies) != 1:
+            return None
+        values = [part.strip().split("=", 1)[1] for part in cookies[0].split(";")
+                  if part.strip().startswith("xs8_session=")]
+        if len(values) != 1:
+            return None
+        session = self.sessions.get(values[0]) if self.sessions is not None else None
+        if not session or session["user"] != user or session["expires"] < time.monotonic():
+            return None
+        return session
+
+    def service_ready(self):
+        try:
+            status = read_status(self.socket_path)
+        except ServiceError:
+            return False
+        return (status["state"] == "IDLE" and status["monitor"] == "HEALTHY"
+                and status["stop_owed"] == "0" and status["context_may_be_open"] == "0")
+
+    def send_body(self, code, body, content_type, headers=None):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def send_json(self, code, payload):
+    def send_json(self, code, payload, headers=None):
         self.send_body(code, json.dumps(payload, separators=(",", ":")).encode(),
-                       "application/json; charset=utf-8")
+                       "application/json; charset=utf-8", headers)
 
     def do_GET(self):
         path = urlsplit(self.path).path
@@ -114,7 +201,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                  "status": status})
             return
         if path == "/api/v1/capabilities":
-            self.send_json(200, capabilities())
+            enabled = (self.dev_mute_enabled and self.current_session() is not None
+                       and self.service_ready())
+            self.send_json(200, capabilities(enabled))
+            return
+        if path == "/api/v1/session" and self.dev_mute_enabled:
+            user = self.authenticated_user()
+            if not user:
+                self.send_json(401, {"error": "Authentication required"})
+                return
+            session = self.current_session()
+            if session is None:
+                session_id = secrets.token_urlsafe(32)
+                session = {"user": user, "csrf": secrets.token_urlsafe(32),
+                           "expires": time.monotonic() + 1800}
+                self.sessions[session_id] = session
+                headers = {"Set-Cookie": f"xs8_session={session_id}; Path=/; Secure; HttpOnly; SameSite=Strict"}
+            else:
+                headers = None
+            self.send_json(200, {"csrf_token": session["csrf"], "mute_available": self.service_ready()}, headers)
             return
         assets = {
             "/": ("index.html", "text/html; charset=utf-8"),
@@ -128,19 +233,115 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "Not found"})
 
     def do_POST(self):
-        self.send_json(501, {"error": "Control endpoints are not implemented"})
+        if (urlsplit(self.path).path != "/api/v1/mute" or
+                not self.dev_mute_enabled or
+                not getattr(self.server, "proxy_peer_verified", False)):
+            length = self.headers.get("Content-Length", "")
+            if len(length) <= 4 and length.isdecimal() and 0 < int(length) <= 4096:
+                self.connection.settimeout(2)
+                try:
+                    self.rfile.read(int(length))
+                except (OSError, TimeoutError):
+                    return
+            self.send_json(501, {"error": "Control endpoint disabled"})
+            return
+        if self.headers.get_all("Origin", []) != [self.https_origin] or \
+                self.headers.get_all("X-Forwarded-Proto", []) != ["https"]:
+            self.send_json(403, {"error": "HTTPS Origin required"})
+            return
+        session = self.current_session()
+        if session is None:
+            self.send_json(401, {"error": "Authentication and session required"})
+            return
+        tokens = self.headers.get_all("X-CSRF-Token", [])
+        if len(tokens) != 1 or not secrets.compare_digest(tokens[0], session["csrf"]):
+            self.send_json(403, {"error": "Invalid CSRF token"})
+            return
+        lengths = self.headers.get_all("Content-Length", [])
+        types = self.headers.get_all("Content-Type", [])
+        if (len(lengths) != 1 or lengths[0] != "2" or
+                types != ["application/json"] or self.headers.get("Transfer-Encoding")):
+            self.send_json(400, {"error": "Expected Content-Type application/json and body {}"})
+            return
+        if self.rfile.read(2) != b"{}":
+            self.send_json(400, {"error": "Expected JSON body {}"})
+            return
+        # Single use: a repeated request with the same token cannot dispatch again.
+        session["csrf"] = secrets.token_urlsafe(32)
+        try:
+            reply = send_mute(self.socket_path)
+        except MuteServiceError as exc:
+            code = {"UNAVAILABLE": 503, "REJECTED": 409, "TIMEOUT": 504}.get(exc.result, 502)
+            self.send_json(code, {"result": exc.result, "error": str(exc),
+                                  "receiver_execution": "UNVERIFIED"})
+            return
+        self.send_json(200, {"result": "SERVICE_TX_OK", "service_reply": reply,
+                             "receiver_execution": "UNVERIFIED"})
+
+
+class ActivatedUnixServer(socketserver.TCPServer):
+    """Serve HTTP on a pre-existing AF_UNIX listener; never bind TCP."""
+    address_family = socket.AF_UNIX
+
+    def __init__(self, listener, handler, allowed_uid):
+        socketserver.BaseServer.__init__(self, listener.getsockname(), handler)
+        self.socket = listener
+        self.allowed_uid = allowed_uid
+        self.proxy_peer_verified = True
+
+    def verify_request(self, request, client_address):
+        try:
+            credentials = request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                             struct.calcsize("3i"))
+            _, uid, _ = struct.unpack("3i", credentials)
+        except (AttributeError, OSError, struct.error):
+            return False
+        return uid == self.allowed_uid
+
+
+def systemd_listener(expected_path=GATEWAY_SOCKET):
+    if os.environ.get("LISTEN_PID") != str(os.getpid()) or os.environ.get("LISTEN_FDS") != "1":
+        raise ValueError("expected exactly one systemd socket for this process")
+    listener = socket.socket(fileno=3)
+    if (listener.family != socket.AF_UNIX or listener.type != socket.SOCK_STREAM or
+            listener.getsockname() != expected_path or
+            not listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)):
+        listener.close()
+        raise ValueError("systemd passed an unexpected listening socket")
+    return listener
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int)
     parser.add_argument("--socket", default=DEFAULT_SOCKET,
                         help="local XS8 service Unix socket")
-    parser.add_argument("--bind", default="127.0.0.1",
+    parser.add_argument("--bind",
                         help="literal IPv4 address (default: 127.0.0.1)")
     parser.add_argument("--allow-insecure-readonly-lan", action="store_true",
                         help="explicitly allow unauthenticated read-only LAN HTTP")
+    parser.add_argument("--enable-dev-mute", action="store_true",
+                        help="reserved: MUTE is disabled in phase 2A")
+    parser.add_argument("--https-origin", help="reserved HTTPS Origin for future MUTE requests")
+    parser.add_argument("--systemd-socket", action="store_true",
+                        help="serve read-only HTTP using the systemd Unix listener")
+    parser.add_argument("--nginx-uid", type=int,
+                        help="expected nginx worker UID for --systemd-socket")
     args = parser.parse_args(argv)
+    if args.enable_dev_mute:
+        parser.error("MUTE development gate is disabled in phase 2A")
+    if args.https_origin:
+        parser.error("--https-origin requires an enabled MUTE gate")
+    if args.systemd_socket:
+        if (args.nginx_uid is None or args.nginx_uid <= 0 or
+                args.allow_insecure_readonly_lan or args.bind is not None or
+                args.port is not None):
+            parser.error("--systemd-socket requires --nginx-uid and no TCP or LAN options")
+        return args
+    if args.nginx_uid is not None:
+        parser.error("--nginx-uid requires --systemd-socket")
+    args.bind = args.bind or "127.0.0.1"
+    args.port = 8080 if args.port is None else args.port
     if args.bind in ("0.0.0.0", "::"):
         parser.error("wildcard binding is not allowed; use the Pi's specific LAN IPv4 address")
     try:
@@ -160,9 +361,18 @@ def main(argv=None):
         print("WARNING: unauthenticated, unencrypted read-only LAN preview; "
               "do not forward this port to the internet", file=sys.stderr)
     handler = type("ConfiguredGatewayHandler", (GatewayHandler,),
-                   {"socket_path": args.socket})
-    server = HTTPServer((args.bind, args.port), handler)
-    print(f"XS8 gateway listening on http://{args.bind}:{server.server_port}")
+                   {"socket_path": args.socket, "dev_mute_enabled": args.enable_dev_mute,
+                    "https_origin": args.https_origin, "sessions": {}})
+    if args.systemd_socket:
+        try:
+            server = ActivatedUnixServer(systemd_listener(), handler, args.nginx_uid)
+        except (OSError, ValueError) as exc:
+            print(f"XS8 gateway socket activation failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"XS8 gateway listening on {GATEWAY_SOCKET} (read-only)")
+    else:
+        server = HTTPServer((args.bind, args.port), handler)
+        print(f"XS8 gateway listening on http://{args.bind}:{server.server_port} (read-only)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

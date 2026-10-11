@@ -1,6 +1,6 @@
 # LAN-only HTTPS and authentication setup
 
-This is a **configuration template**, not an installed service. The intended route is iPhone Safari → nginx HTTPS and Basic Auth → `xs8_gateway.py` on `127.0.0.1:8080` → local XS8 Unix socket. The gateway remains read-only; every POST still returns HTTP 501. Do not expose this site to the public internet or configure router port forwarding.
+This is a **configuration template**, not an installed service. The intended route is iPhone Safari → nginx HTTPS and Basic Auth → `/run/kenwood-gateway.sock` → Python Gateway → local XS8 Service socket. The socket-activated Gateway remains read-only; every POST returns HTTP 501. Do not expose this site to the public internet or configure router port forwarding.
 
 ## 1. Choose the LAN name and address
 
@@ -16,7 +16,7 @@ The nginx template is [deploy/nginx/kenwood-xs-remote.conf.example](../deploy/ng
 | `__SERVER_KEY_PATH__` | `/etc/nginx/kenwood-xs-remote/server.key` | Server private key on the Pi. |
 | `__PASSWORD_FILE_PATH__` | `/etc/nginx/kenwood-xs-remote/users.htpasswd` | Basic Auth password hashes on the Pi. |
 
-The template has **no port 80 listener**. Check all other enabled nginx sites as well; remove any default or duplicate listener that would expose this application through unencrypted HTTP or bypass authentication. Its `auth_basic` directives cover the whole UI and API, including future paths. The template strips the browser's `Authorization` header before proxying to the gateway. nginx's TLS, authentication, and proxy directives are documented by [nginx](https://nginx.org/en/docs/http/ngx_http_ssl_module.html), [nginx Basic Auth](https://nginx.org/en/docs/http/ngx_http_auth_basic_module.html), and [nginx proxy](https://nginx.org/en/docs/http/ngx_http_proxy_module.html).
+The template has **no port 80 listener**. Check all other enabled nginx sites as well; remove any default or duplicate listener that would expose this application through unencrypted HTTP or bypass authentication. Its `auth_basic` directives cover the whole UI and API, including future paths. The template strips the browser's `Authorization` header and overwrites `X-Kenwood-Authenticated-User` with nginx's authenticated `$remote_user` before proxying to the gateway. The default gateway remains read-only; the MUTE development gate is documented in [Web API](web-api.md). nginx's TLS, authentication, and proxy directives are documented by [nginx](https://nginx.org/en/docs/http/ngx_http_ssl_module.html), [nginx Basic Auth](https://nginx.org/en/docs/http/ngx_http_auth_basic_module.html), and [nginx proxy](https://nginx.org/en/docs/http/ngx_http_proxy_module.html).
 
 ## 2. Make a private CA and server certificate on an administrator computer
 
@@ -79,12 +79,13 @@ Trusting this CA allows it to sign certificates for other names too. Protect its
 
 ## 5. Validate before enabling LAN access
 
-Install the filled nginx template as a site only after checking the certificate and password-file paths. Keep the gateway on loopback using `python3 xs8_gateway.py` with **no** `--bind` or `--allow-insecure-readonly-lan`. The gateway user must still have permission to open the local XS8 socket. On the Pi, after nginx is installed and configured, check its configuration and listeners:
+Install the filled nginx template as a site only after checking the certificate and password-file paths and preparing the [Gateway socket and service units](gateway-systemd.md). The authenticated nginx upstream uses a Unix socket, not TCP port 8080. The Gateway user must still have permission to open the separate local XS8 Service socket. On the Pi, after nginx is installed and configured, check its configuration and listeners:
 
 ```sh
 sudo nginx -t
 sudo nginx -T
 ss -ltnp
+ss -lxnp
 ```
 
 On the administrator computer holding the public `ca.crt`, test the complete LAN route (replace the example name if needed):
@@ -95,13 +96,13 @@ curl --cacert ca.crt -u remote -i https://woodland-pi.local/api/v1/capabilities
 curl --cacert ca.crt -u remote -X POST -i https://woodland-pi.local/api/v1/mute
 ```
 
-Review `nginx -T` for a single intended HTTPS site on the specific LAN IPv4 address, no HTTP route to the gateway, and no unauthenticated alternate site. `ss` should show the gateway only on `127.0.0.1:8080` and nginx on the selected LAN IPv4 address port 443. The first `curl` should get HTTP 401, the authenticated GET should succeed, and the authenticated POST should remain HTTP 501. `curl -u remote` prompts for the password; do not place it in shell history. Test the same outcomes in iPhone Safari. The gateway's status endpoint can still return 503 if the XS8 service is down; that is not an authentication failure. Keep the router free of port forwarding and check that no IPv6 or other interface exposes the site unexpectedly.
+Review `nginx -T` for a single intended HTTPS site on the specific LAN IPv4 address, no HTTP route to the gateway, and no unauthenticated alternate site. `ss` should show the Gateway Unix socket and **no Gateway TCP listener**; nginx should listen on the selected LAN IPv4 address port 443. The first `curl` should get HTTP 401, the authenticated GET should succeed, and the authenticated POST should remain HTTP 501. `curl -u remote` prompts for the password; do not place it in shell history. Test the same outcomes in iPhone Safari. The gateway's status endpoint can still return 503 if the XS8 service is down; that is not an authentication failure. Keep the router free of port forwarding and check that no IPv6 or other interface exposes the site unexpectedly.
 
 ## Disable the temporary HTTP preview and rollback
 
-Before enabling nginx, stop the temporary gateway process started with `--bind LAN_IP --allow-insecure-readonly-lan`. Start it again with defaults so it binds to `127.0.0.1:8080`; confirm with `ss -ltnp` that no LAN port 8080 remains. The nginx template intentionally does not redirect port 80, because there is no authenticated HTTP listener to redirect from.
+Before enabling nginx, stop any temporary Gateway process started with `--bind LAN_IP --allow-insecure-readonly-lan` or loopback TCP. Enable the socket-activated Gateway as described in the [unit guide](gateway-systemd.md); confirm with `ss -ltnp` that no Gateway TCP listener remains. The nginx template intentionally does not redirect port 80, because there is no authenticated HTTP listener to redirect from.
 
-To roll back, disable only the nginx site and keep (or restart) the gateway on loopback. The established Mac workflow remains available through an SSH tunnel:
+For rollback, restore the saved read-only TCP Gateway and matching nginx configuration together as described in the [unit guide](gateway-systemd.md). The established Mac workflow then remains available through an SSH tunnel:
 
 ```sh
 ssh -N -L 8080:127.0.0.1:8080 pi@woodland-pi.local
@@ -109,4 +110,4 @@ ssh -N -L 8080:127.0.0.1:8080 pi@woodland-pi.local
 
 Then open `http://127.0.0.1:8080/` on the Mac. Adjust the SSH account or hostname to match the Pi. Do not roll back to the unauthenticated LAN HTTP preview for routine use. This procedure does not change `xs8-service`, its Unix socket, CEC, GPIO, or motor-control behavior.
 
-**Future controls:** Basic Auth restricts access but does not prevent cross-site request forgery. Before enabling any state-changing endpoint, add origin checks and CSRF protection in the gateway, validate requests, and keep motor steps bounded inside the single-owner XS8 service. [OWASP CSRF guidance](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html).
+**Future controls:** Basic Auth restricts access but does not prevent cross-site request forgery. The Gateway retains Origin and session-bound CSRF validation code, while Phase 2A rejects the MUTE development gate and leaves every POST disabled. Review nginx worker identity, socket permissions and XS8 Service access before physical Web control. Keep future motor steps bounded inside the single-owner XS8 service. [OWASP CSRF guidance](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html).
