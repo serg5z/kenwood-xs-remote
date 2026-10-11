@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -28,11 +29,20 @@
 #define CAPTURE_NS 1000000000LL
 #define EVENT_BATCH 256
 #define INITIAL_EDGES 4096
+#define VOLUME_HOLD_NS 150000000LL
+#define STOP_ATTEMPTS 3
 
 static struct gpiod_line_request *tx_req;
 static struct gpiod_line_request *rx_req;
 /* The TX BUSY check and capture reader share one RX request. */
 static pthread_mutex_t rx_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile sig_atomic_t probe_interrupted;
+
+static void on_probe_signal(int signal_number)
+{
+    (void)signal_number;
+    probe_interrupted = 1;
+}
 
 struct captured_edge {
     uint64_t timestamp_ns;
@@ -148,6 +158,21 @@ static int wait_until(int64_t deadline)
     return rc;
 }
 
+static int wait_probe_until(int64_t deadline)
+{
+    struct timespec t = {
+        .tv_sec = deadline / 1000000000LL,
+        .tv_nsec = deadline % 1000000000LL
+    };
+    while (!probe_interrupted) {
+        int rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME,
+                                 &t, NULL);
+        if (rc == 0) return 0;
+        if (rc != EINTR) return -1;
+    }
+    return -1;
+}
+
 static int tx(unsigned int pin, int high)
 {
     return gpiod_line_request_set_value(
@@ -182,7 +207,9 @@ static int send_xs(uint8_t value, int64_t *tx_start_ns)
 {
     int64_t deadline;
 
-    if (tx(DATA_TX, 0) < 0 || tx(BUSY_TX, 0) < 0)
+    int data_release = tx(DATA_TX, 0);
+    int busy_release = tx(BUSY_TX, 0);
+    if (data_release < 0 || busy_release < 0)
         return -1;
 
     if (wait_bus_free() < 0) {
@@ -217,21 +244,91 @@ static int send_xs(uint8_t value, int64_t *tx_start_ns)
     return 0;
 }
 
+static int run_volume_probe(int64_t *tx_start_ns)
+{
+    int64_t ignored_start = 0;
+    bool context_may_be_open = false;
+    bool volume_may_be_active = false;
+    bool volume_started = false;
+    bool stop_completed = false;
+    int64_t stop_complete_ns = 0;
+    int result = -1;
+
+    if (probe_interrupted) goto finish;
+    if (send_xs(0x17, tx_start_ns) < 0) {
+        context_may_be_open = *tx_start_ns != 0;
+        goto finish;
+    }
+    context_may_be_open = true;
+    if (probe_interrupted) goto finish;
+
+    /* Set the guard before TX: a partly transmitted VOL- is uncertain. */
+    volume_may_be_active = true;
+    if (send_xs(0xE9, &ignored_start) < 0) goto finish;
+    volume_started = true;
+    if (wait_probe_until(now_ns() + VOLUME_HOLD_NS) < 0) goto finish;
+    result = 0;
+
+finish:
+    if (volume_may_be_active) {
+        for (int attempt = 0; attempt < STOP_ATTEMPTS; ++attempt) {
+            if (send_xs(0x09, &ignored_start) == 0) {
+                stop_completed = true;
+                stop_complete_ns = now_ns();
+                fprintf(stderr, "VOL STOP transmission completed\n");
+                break;
+            }
+            fprintf(stderr, "VOL STOP attempt %d/%d failed\n",
+                    attempt + 1, STOP_ATTEMPTS);
+        }
+        if (!stop_completed) {
+            fprintf(stderr, "WARNING: VOL STOP FAILED; VOLUME CONTROL "
+                    "MAY REMAIN ACTIVE. Stop it at the receiver.\n");
+            result = -1;
+        }
+    }
+
+    if (volume_started && stop_completed && result == 0 &&
+        wait_probe_until(stop_complete_ns + CAPTURE_NS) < 0)
+        result = -1;
+
+    /* Never exit the context ahead of a possibly outstanding VOL STOP. */
+    if (context_may_be_open && (!volume_may_be_active || stop_completed)) {
+        if (send_xs(0x07, &ignored_start) < 0) {
+            fprintf(stderr, "WARNING: ROOT exit transmission failed; "
+                    "receiver context may remain open\n");
+            result = -1;
+        }
+    }
+    if (probe_interrupted) {
+        fprintf(stderr, "Volume probe interrupted\n");
+        result = -1;
+    }
+    return result;
+}
+
 int main(int argc, char **argv)
 {
-    bool capturing = argc == 3 && strcmp(argv[1], "--capture") == 0;
-    if ((argc != 2 && !capturing) ||
-        (argc == 2 && argv[1][0] == '-')) {
-        fprintf(stderr, "Usage: %s [--capture] 0xNN\n", argv[0]);
+    bool volume_probe = argc == 2 &&
+                        strcmp(argv[1], "--volume-probe") == 0;
+    bool capturing = volume_probe ||
+                     (argc == 3 && strcmp(argv[1], "--capture") == 0);
+    if (!volume_probe && ((argc != 2 && !capturing) ||
+        (argc == 2 && argv[1][0] == '-'))) {
+        fprintf(stderr, "Usage: %s [--capture 0xNN | --volume-probe | 0xNN]\n",
+                argv[0]);
         return 2;
     }
 
-    char *end;
-    const char *byte_arg = argv[capturing ? 2 : 1];
-    unsigned long parsed = strtoul(byte_arg, &end, 0);
-    if (end == byte_arg || *end || parsed > 255) {
-        fprintf(stderr, "Invalid byte\n");
-        return 2;
+    unsigned long parsed = 0;
+    if (!volume_probe) {
+        char *end;
+        const char *byte_arg = argv[capturing ? 2 : 1];
+        parsed = strtoul(byte_arg, &end, 0);
+        if (end == byte_arg || *end || parsed > 255) {
+            fprintf(stderr, "Invalid byte\n");
+            return 2;
+        }
     }
 
     struct gpiod_chip *chip = gpiod_chip_open(CHIP);
@@ -245,7 +342,18 @@ int main(int argc, char **argv)
     pthread_t capture_thread;
     bool thread_started = false;
     int64_t tx_start_ns = 0;
+    int64_t capture_start_ns = 0;
     int result = -1;
+
+    if (volume_probe) {
+        struct sigaction action = {.sa_handler = on_probe_signal};
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGINT, &action, NULL) < 0 ||
+            sigaction(SIGTERM, &action, NULL) < 0) {
+            perror("Probe signal setup");
+            goto cleanup;
+        }
+    }
 
     if (!chip || !out || !in || !tx_cfg || !rx_cfg ||
         (capturing && !rx_req_cfg)) {
@@ -313,12 +421,14 @@ int main(int argc, char **argv)
             goto cleanup;
         }
         thread_started = true;
+        capture_start_ns = now_ns();
     } else {
         printf("XS8 TX: 0x%02lX\n", parsed);
         fflush(stdout);
     }
 
-    result = send_xs((uint8_t)parsed, &tx_start_ns);
+    result = volume_probe ? run_volume_probe(&tx_start_ns) :
+             send_xs((uint8_t)parsed, &tx_start_ns);
     int64_t tx_complete_ns = now_ns();
 
     /* Always release both transistor outputs. */
@@ -328,7 +438,7 @@ int main(int argc, char **argv)
         result = -1;
 
     if (capturing) {
-        if (result == 0) {
+        if (!volume_probe && result == 0) {
             cap.end_ns = tx_complete_ns + CAPTURE_NS;
             if (wait_until(cap.end_ns) != 0)
                 result = -1;
@@ -344,7 +454,8 @@ int main(int argc, char **argv)
                     cap.error, cap.out_of_memory, cap.lost);
             result = -1;
         }
-        if (tx_start_ns) {
+        if (tx_start_ns || volume_probe) {
+            int64_t origin_ns = tx_start_ns ? tx_start_ns : capture_start_ns;
             puts("time_us,gpio,edge");
             for (size_t i = 0; i < cap.count; ++i) {
                 const struct captured_edge *edge = &cap.edges[i];
@@ -352,7 +463,7 @@ int main(int argc, char **argv)
                     continue;
                 printf("%lld,%u,%s\n",
                        (long long)((int64_t)edge->timestamp_ns -
-                                   tx_start_ns) / 1000,
+                                   origin_ns) / 1000,
                        edge->gpio,
                        edge->type == GPIOD_EDGE_EVENT_RISING_EDGE
                            ? "rising" : "falling");
