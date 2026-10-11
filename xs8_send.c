@@ -1,5 +1,10 @@
 #define _POSIX_C_SOURCE 200809L
+#include "xs8_decode.h"
+#ifndef XS8_SEND_VERIFY_TEST
 #include "xs8_gpio.h"
+/* The standalone Makefile target compiles this utility as one C unit. */
+#include "xs8_decode.c"
+#endif
 #include <errno.h>
 #include <pthread.h>
 #include <poll.h>
@@ -18,6 +23,7 @@
 #define VOLUME_HOLD_NS 150000000LL
 #define STOP_ATTEMPTS 3
 
+#ifndef XS8_SEND_VERIFY_TEST
 static struct xs8_gpio bus;
 static volatile sig_atomic_t probe_interrupted;
 
@@ -31,11 +37,15 @@ static void on_probe_signal(int signal_number)
     (void)signal_number;
     probe_interrupted = 1;
 }
+#endif
+
+struct gpiod_edge_event_buffer;
 
 struct captured_edge {
     uint64_t timestamp_ns;
+    uint64_t sequence;
     unsigned int gpio;
-    enum gpiod_edge_event_type type;
+    enum xs8_edge_kind type;
 };
 
 struct capture {
@@ -43,13 +53,17 @@ struct capture {
     struct gpiod_edge_event_buffer *buffer;
     struct captured_edge *edges;
     size_t count, capacity;
-    unsigned long last_seqno, lost;
+    unsigned long last_seqno, lost, regressions, timestamp_regressions;
+    uint64_t last_timestamp_ns;
     int error;
     bool out_of_memory;
+    bool started, window_error;
     int64_t end_ns;
+    bool initial_busy_low;
     atomic_bool stop;
 };
 
+#ifndef XS8_SEND_VERIFY_TEST
 static void *capture_events(void *arg)
 {
     struct capture *cap = arg;
@@ -96,7 +110,12 @@ static void *capture_events(void *arg)
             unsigned long seqno = gpiod_edge_event_get_global_seqno(event);
             if (seqno > cap->last_seqno + 1)
                 cap->lost += seqno - cap->last_seqno - 1;
+            else if (seqno <= cap->last_seqno)
+                ++cap->regressions;
             cap->last_seqno = seqno;
+            if (cap->last_timestamp_ns && timestamp < cap->last_timestamp_ns)
+                ++cap->timestamp_regressions;
+            cap->last_timestamp_ns = timestamp;
             if (cap->out_of_memory) continue;
             if (cap->count == cap->capacity) {
                 size_t next = cap->capacity ? cap->capacity * 2 : EVENT_BATCH;
@@ -116,13 +135,129 @@ static void *capture_events(void *arg)
             }
             cap->edges[cap->count++] = (struct captured_edge){
                 timestamp,
+                seqno,
                 gpiod_edge_event_get_line_offset(event),
-                gpiod_edge_event_get_event_type(event)
+                gpiod_edge_event_get_event_type(event) ==
+                    GPIOD_EDGE_EVENT_RISING_EDGE ? XS8_RISING : XS8_FALLING
             };
         }
         if (past_end) break;
     }
     return NULL;
+}
+#endif
+
+struct tx_verification {
+    uint64_t start_ns, end_ns;
+    unsigned int candidate_frames, valid_frames, other_frames;
+    uint8_t observed_lsb, observed_legacy;
+    bool log_frames;
+};
+
+enum capture_result { CAPTURE_COMPLETE, CAPTURE_INCOMPLETE, CAPTURE_INVALID };
+enum match_result { MATCH, MISMATCH, MATCH_UNKNOWN };
+
+struct self_capture_result {
+    enum capture_result capture;
+    enum match_result match;
+    unsigned int additional_frames;
+    uint8_t observed_lsb, observed_legacy;
+    bool observed_byte;
+};
+
+static void inspect_frame(void *user, const struct xs8_decoded *decoded)
+{
+    struct tx_verification *verification = user;
+    if (decoded->kind != XS8_FRAME) return;
+    if (verification->log_frames && decoded->valid)
+        fprintf(stderr, "mono_us=%llu OBSERVED_BUS source=UNATTRIBUTED "
+                        "status=VALID waveform_lsb=0x%02X "
+                        "legacy_msb_short1=0x%02X\n",
+                (unsigned long long)(decoded->time_ns / 1000),
+                decoded->waveform_lsb, decoded->legacy_msb_short1);
+    else if (verification->log_frames)
+        fprintf(stderr, "mono_us=%llu OBSERVED_BUS source=UNATTRIBUTED "
+                        "status=INCOMPLETE bits=%u reason=%s\n",
+                (unsigned long long)(decoded->time_ns / 1000),
+                decoded->bits, decoded->reason);
+    if (decoded->time_ns < verification->start_ns ||
+        decoded->time_ns > verification->end_ns) {
+        ++verification->other_frames;
+        return;
+    }
+    ++verification->candidate_frames;
+    if (!decoded->valid) return;
+    ++verification->valid_frames;
+    if (verification->valid_frames == 1) {
+        verification->observed_lsb = decoded->waveform_lsb;
+        verification->observed_legacy = decoded->legacy_msb_short1;
+    }
+}
+
+static struct self_capture_result verify_self_capture(
+    const struct capture *cap, uint8_t requested, bool tx_ok,
+    int64_t tx_start_ns, int64_t tx_complete_ns, bool log_frames)
+{
+    struct xs8_decoder decoder;
+    struct tx_verification verification = {
+        .start_ns = tx_start_ns > 0 ? (uint64_t)tx_start_ns : UINT64_MAX,
+        .end_ns = tx_complete_ns > 0 ? (uint64_t)tx_complete_ns : 0,
+        .log_frames = log_frames
+    };
+    xs8_decoder_init(&decoder, cap->initial_busy_low);
+    for (size_t i = 0; i < cap->count; ++i) {
+        const struct captured_edge *captured = &cap->edges[i];
+        if (captured->timestamp_ns > (uint64_t)cap->end_ns) continue;
+        struct xs8_edge edge = {
+            .time_ns = captured->timestamp_ns,
+            .sequence = captured->sequence,
+            .gpio = captured->gpio,
+            .kind = captured->type
+        };
+        xs8_decoder_edge(&decoder, &edge, inspect_frame, &verification);
+    }
+    xs8_decoder_flush(&decoder, inspect_frame, &verification);
+
+    bool invalid = !cap->started || cap->window_error || cap->error ||
+                   cap->out_of_memory || cap->lost || cap->regressions ||
+                   cap->timestamp_regressions || verification.candidate_frames > 1;
+    struct self_capture_result result = {
+        .capture = invalid ? CAPTURE_INVALID :
+            verification.valid_frames == 1 ? CAPTURE_COMPLETE : CAPTURE_INCOMPLETE,
+        .match = MATCH_UNKNOWN,
+        .additional_frames = verification.other_frames +
+            (verification.candidate_frames > 1 ?
+             verification.candidate_frames - 1 : 0),
+        .observed_lsb = verification.observed_lsb,
+        .observed_legacy = verification.observed_legacy,
+        .observed_byte = verification.valid_frames == 1
+    };
+    if (tx_ok && result.capture == CAPTURE_COMPLETE)
+        result.match = result.observed_lsb == requested ? MATCH : MISMATCH;
+    return result;
+}
+
+#ifndef XS8_SEND_VERIFY_TEST
+static bool report_self_capture(const struct capture *cap, uint8_t requested,
+                                bool tx_ok, int64_t tx_start_ns,
+                                int64_t tx_complete_ns)
+{
+    struct self_capture_result result = verify_self_capture(
+        cap, requested, tx_ok, tx_start_ns, tx_complete_ns, true);
+    const char *capture_result = result.capture == CAPTURE_COMPLETE ? "COMPLETE" :
+        result.capture == CAPTURE_INCOMPLETE ? "INCOMPLETE" : "INVALID";
+    const char *match_result = result.match == MATCH ? "MATCH" :
+        result.match == MISMATCH ? "MISMATCH" : "UNKNOWN";
+    fprintf(stderr, "TX_RESULT=%s\nCAPTURE_RESULT=%s\nMATCH_RESULT=%s\n",
+            tx_ok ? "TX_OK" : "TX_FAIL", capture_result, match_result);
+    fprintf(stderr, "ADDITIONAL_FRAMES=%u\n", result.additional_frames);
+    if (result.observed_byte)
+        fprintf(stderr, "requested_logical=0x%02X observed_waveform_lsb=0x%02X "
+                        "observed_legacy_msb_short1=0x%02X\n",
+                requested, result.observed_lsb, result.observed_legacy);
+    fprintf(stderr, "Capture comparison checks the bus waveform only; "
+                    "it is not receiver acknowledgment.\n");
+    return result.match == MATCH;
 }
 
 static int wait_probe_until(int64_t deadline)
@@ -231,8 +366,10 @@ int main(int argc, char **argv)
     pthread_t capture_thread;
     bool thread_started = false;
     int64_t tx_start_ns = 0;
+    int64_t tx_complete_ns = 0;
     int64_t capture_start_ns = 0;
     int result = -1;
+    bool tx_ok = false;
 
     if (volume_probe) {
         struct sigaction action = {.sa_handler = on_probe_signal};
@@ -258,6 +395,14 @@ int main(int argc, char **argv)
             goto cleanup;
         }
         cap.capacity = INITIAL_EDGES;
+        pthread_mutex_lock(&bus.rx_lock);
+        int initial_busy = gpiod_line_request_get_value(bus.rx_req, 23);
+        pthread_mutex_unlock(&bus.rx_lock);
+        if (initial_busy < 0) {
+            perror("Initial BUSY read");
+            goto cleanup;
+        }
+        cap.initial_busy_low = initial_busy == 0;
         atomic_init(&cap.stop, false);
         int thread_error = pthread_create(
             &capture_thread, NULL, capture_events, &cap);
@@ -267,6 +412,7 @@ int main(int argc, char **argv)
             goto cleanup;
         }
         thread_started = true;
+        cap.started = true;
         capture_start_ns = now_ns();
     } else {
         printf("XS8 TX: 0x%02lX\n", parsed);
@@ -275,27 +421,39 @@ int main(int argc, char **argv)
 
     result = volume_probe ? run_volume_probe(&tx_start_ns) :
              xs8_gpio_send(&bus, (uint8_t)parsed, &tx_start_ns);
-    int64_t tx_complete_ns = now_ns();
+    tx_ok = !volume_probe && result == 0;
+    tx_complete_ns = now_ns();
+    if (tx_complete_ns < 0) cap.window_error = true;
 
     /* Always release both transistor outputs. */
-    if (xs8_gpio_release(&bus) < 0)
+    if (xs8_gpio_release(&bus) < 0) {
+        tx_ok = false;
         result = -1;
+    }
 
     if (capturing) {
-        if (!volume_probe && result == 0) {
+        if (!volume_probe && result == 0 && tx_complete_ns >= 0 &&
+            tx_complete_ns <= INT64_MAX - CAPTURE_NS) {
             cap.end_ns = tx_complete_ns + CAPTURE_NS;
-            if (wait_until(cap.end_ns) != 0)
+            if (wait_until(cap.end_ns) != 0) {
+                cap.window_error = true;
                 result = -1;
+            }
         } else {
+            if (!volume_probe && result == 0) cap.window_error = true;
             cap.end_ns = now_ns();
+            if (cap.end_ns < 0) cap.window_error = true;
         }
         atomic_store(&cap.stop, true);
         pthread_join(capture_thread, NULL);
         thread_started = false;
-        if (cap.error || cap.out_of_memory || cap.lost) {
+        if (cap.error || cap.out_of_memory || cap.lost || cap.regressions ||
+            cap.timestamp_regressions) {
             fprintf(stderr, "Capture incomplete: read error=%d, "
-                    "allocation failure=%d, missing events=%lu\n",
-                    cap.error, cap.out_of_memory, cap.lost);
+                    "allocation failure=%d, missing events=%lu, "
+                    "sequence regressions=%lu, timestamp regressions=%lu\n",
+                    cap.error, cap.out_of_memory, cap.lost, cap.regressions,
+                    cap.timestamp_regressions);
             result = -1;
         }
         if (tx_start_ns || volume_probe) {
@@ -309,10 +467,13 @@ int main(int argc, char **argv)
                        (long long)((int64_t)edge->timestamp_ns -
                                    origin_ns) / 1000,
                        edge->gpio,
-                       edge->type == GPIOD_EDGE_EVENT_RISING_EDGE
+                       edge->type == XS8_RISING
                            ? "rising" : "falling");
             }
-            if (ferror(stdout)) result = -1;
+            if (ferror(stdout)) {
+                cap.window_error = true;
+                result = -1;
+            }
         }
     }
 
@@ -322,16 +483,25 @@ cleanup:
         atomic_store(&cap.stop, true);
         pthread_join(capture_thread, NULL);
     }
-    if (xs8_gpio_release(&bus) < 0) result = -1;
+    if (xs8_gpio_release(&bus) < 0) {
+        tx_ok = false;
+        result = -1;
+    }
+    if (capturing && !volume_probe)
+        if (!report_self_capture(&cap, (uint8_t)parsed, tx_ok,
+                                 tx_start_ns, tx_complete_ns)) result = -1;
     xs8_gpio_close(&bus);
     if (cap.buffer) gpiod_edge_event_buffer_free(cap.buffer);
     free(cap.edges);
 
     if (result < 0) {
-        fprintf(stderr, "XS8 transmission failed\n");
+        fprintf(stderr, "%s\n", capturing && !volume_probe
+                ? "XS8 self-capture diagnostic failed"
+                : "XS8 transmission failed");
         return 1;
     }
 
     if (!capturing) puts("XS8 transmission complete");
     return 0;
 }
+#endif
