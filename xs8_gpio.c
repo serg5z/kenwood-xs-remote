@@ -2,6 +2,7 @@
 #include "xs8_gpio.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -152,18 +153,34 @@ static int wait_bus_free(struct xs8_gpio *bus)
 
 int xs8_gpio_send(struct xs8_gpio *bus, uint8_t value, int64_t *tx_start_ns)
 {
+    int64_t max_late_ns = 0;
+    int64_t frame_start_ns = 0;
+    unsigned int over_500us = 0, over_1000us = 0;
+    unsigned int samples = 0, clock_errors = 0;
+    bool frame_started = false;
     if (!bus || !bus->tx_req || !bus->rx_req) { errno = EINVAL; return -1; }
     if (tx_start_ns) *tx_start_ns = 0;
     if (xs8_gpio_release(bus) < 0 || wait_bus_free(bus) < 0) goto fail;
     int64_t deadline = xs8_gpio_now_ns();
     if (deadline < 0) goto fail;
+    frame_start_ns = deadline;
     if (tx_start_ns) *tx_start_ns = deadline;
+    frame_started = true;
 
 #define STEP(pin, level, duration) do {                         \
     if (tx(bus, (pin), (level)) < 0) goto fail;                   \
     deadline += (int64_t)(duration) * 1000LL;                    \
     int wait_error = xs8_gpio_wait_until(deadline);              \
     if (wait_error) { errno = wait_error; goto fail; }            \
+    int64_t woke_ns = xs8_gpio_now_ns();                          \
+    if (woke_ns < 0) ++clock_errors;                              \
+    else {                                                       \
+        int64_t late_ns = woke_ns - deadline;                     \
+        ++samples;                                                \
+        if (late_ns > max_late_ns) max_late_ns = late_ns;          \
+        if (late_ns > 500000) ++over_500us;                       \
+        if (late_ns > 1000000) ++over_1000us;                     \
+    }                                                            \
 } while (0)
 
     STEP(BUSY_TX, 1, LEAD_US);
@@ -175,12 +192,26 @@ int xs8_gpio_send(struct xs8_gpio *bus, uint8_t value, int64_t *tx_start_ns)
     STEP(DATA_TX, 0, END_GUARD_US);
     if (tx(bus, BUSY_TX, 0) < 0) goto fail;
 #undef STEP
+    fprintf(stderr, "mono_us=%lld XS8 TX 0x%02X timing result=TX_OK "
+                    "max_late_ns=%lld "
+                    "over_500us=%u over_1000us=%u samples=%u clock_errors=%u\n",
+            (long long)(frame_start_ns / 1000), value,
+            (long long)max_late_ns, over_500us, over_1000us,
+            samples, clock_errors);
     return 0;
 
 fail:
     {
         int saved_error = errno ? errno : EIO;
         xs8_gpio_release(bus);
+        if (frame_started)
+            fprintf(stderr, "mono_us=%lld XS8 TX 0x%02X timing "
+                            "result=TX_FAIL "
+                            "max_late_ns=%lld over_500us=%u over_1000us=%u "
+                            "samples=%u clock_errors=%u\n",
+                    (long long)(frame_start_ns / 1000), value,
+                    (long long)max_late_ns, over_500us, over_1000us,
+                    samples, clock_errors);
         errno = saved_error;
     }
     return -1;
