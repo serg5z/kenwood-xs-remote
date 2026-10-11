@@ -4,6 +4,7 @@
 
 #include "volume_control.h"
 #include "xs8_gpio.h"
+#include "xs8_monitor.h"
 
 #include <chrono>
 #include <cerrno>
@@ -53,14 +54,18 @@ private:
 };
 
 static bool parse_options(int argc, char** argv, bool& recovery,
-                          bool& authorized, VolumeControl::Ms& max_hold) {
+                          bool& authorized, bool& monitor_xs8,
+                          VolumeControl::Ms& max_hold) {
     recovery = false;
     authorized = false;
+    monitor_xs8 = false;
     max_hold = DEFAULT_MAX_HOLD;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--startup-recovery") == 0) recovery = true;
         else if (std::strcmp(argv[i], "--allow-unrecovered-start") == 0)
             authorized = true;
+        else if (std::strcmp(argv[i], "--monitor-xs8") == 0)
+            monitor_xs8 = true;
         else if (std::strcmp(argv[i], "--max-hold-ms") == 0 && i + 1 < argc) {
             char* end = nullptr;
             const char* argument = argv[++i];
@@ -75,22 +80,30 @@ static bool parse_options(int argc, char** argv, bool& recovery,
 }
 
 int main(int argc, char** argv) {
-    bool recovery = false, authorized = false;
+    bool recovery = false, authorized = false, monitor_xs8 = false;
     VolumeControl::Ms max_hold{};
-    if (!parse_options(argc, argv, recovery, authorized, max_hold)) {
+    if (!parse_options(argc, argv, recovery, authorized, monitor_xs8,
+                       max_hold)) {
         std::fprintf(stderr, "Usage: %s [--startup-recovery | "
                              "--allow-unrecovered-start] "
-                             "[--max-hold-ms 100..3000]\n", argv[0]);
+                             "[--max-hold-ms 100..3000] [--monitor-xs8]\n",
+                     argv[0]);
         return 2;
     }
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
     xs8_gpio bus{};
-    if (xs8_gpio_open(&bus, false) < 0) {
+    if (xs8_gpio_open(&bus, monitor_xs8) < 0) {
         std::perror("Cannot open XS8 GPIO");
         std::fprintf(stderr, "WARNING: receiver volume state is unknown; "
                              "check it at the receiver\n");
+        return 1;
+    }
+    struct xs8_monitor *monitor = nullptr;
+    if (monitor_xs8 && xs8_monitor_start(&bus, &monitor) < 0) {
+        std::perror("Cannot start XS8 bus monitor");
+        xs8_gpio_close(&bus);
         return 1;
     }
     GpioTransmitter tx(bus);
@@ -99,6 +112,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "FAULT: startup recovery failed; "
                              "receiver volume may remain active\n");
         volume.shutdown(Clock::now());
+        xs8_monitor_stop(monitor);
         xs8_gpio_close(&bus);
         return 1;
     }
@@ -122,6 +136,7 @@ int main(int argc, char** argv) {
     if (!cec) {
         std::fprintf(stderr, "Cannot initialize libCEC\n");
         volume.shutdown(Clock::now());
+        xs8_monitor_stop(monitor);
         xs8_gpio_close(&bus);
         return 1;
     }
@@ -130,6 +145,7 @@ int main(int argc, char** argv) {
     if (count <= 0 || !cec->Open(adapters[0].strComName)) {
         std::fprintf(stderr, "Cannot open CEC adapter\n");
         volume.shutdown(Clock::now());
+        xs8_monitor_stop(monitor);
         UnloadLibCec(cec);
         xs8_gpio_close(&bus);
         return 1;
@@ -192,6 +208,7 @@ int main(int argc, char** argv) {
                              "receiver volume may remain active\n");
     cec->Close();
     UnloadLibCec(cec);
+    xs8_monitor_stop(monitor);
     const bool released = xs8_gpio_release(&bus) == 0;
     if (!released) std::fprintf(stderr, "WARNING: GPIO TX release failed\n");
     xs8_gpio_close(&bus);
