@@ -47,7 +47,22 @@ def send_mute(socket_path, timeout=1.0):
                 raise MuteServiceError("TIMEOUT", "XS8 service connection timed out") from exc
             except OSError as exc:
                 raise MuteServiceError("UNAVAILABLE", "XS8 service unavailable") from exc
+            challenge_complete = False
             try:
+                # Keep the fake-only challenge and MUTE on one connection.
+                challenge = secrets.token_hex(16).encode("ascii")
+                client.sendall(b"OFFLINE_TEST " + challenge + b"\n")
+                reply = bytearray()
+                while b"\n" not in reply:
+                    chunk = client.recv(128)
+                    if not chunk:
+                        raise MuteServiceError("UNSAFE_SERVICE", "Fake service challenge failed")
+                    reply.extend(chunk)
+                    if len(reply) > 256:
+                        raise MuteServiceError("UNSAFE_SERVICE", "Fake service challenge failed")
+                if bytes(reply) != b"OK OFFLINE_TEST " + challenge + b"\n":
+                    raise MuteServiceError("UNSAFE_SERVICE", "Fake service challenge failed")
+                challenge_complete = True
                 client.sendall(b"MUTE\n")
                 response = bytearray()
                 while b"\n" not in response:
@@ -58,8 +73,12 @@ def send_mute(socket_path, timeout=1.0):
                     if len(response) > 256:
                         raise MuteServiceError("INVALID_REPLY", "XS8 service reply too long")
             except socket.timeout as exc:
+                if not challenge_complete:
+                    raise MuteServiceError("UNSAFE_SERVICE", "Fake service challenge timed out") from exc
                 raise MuteServiceError("TIMEOUT", "XS8 service reply timed out; delivery is uncertain") from exc
             except OSError as exc:
+                if not challenge_complete:
+                    raise MuteServiceError("UNSAFE_SERVICE", "Fake service challenge failed") from exc
                 raise MuteServiceError("DISCONNECTED", "XS8 service disconnected; delivery is uncertain") from exc
     except socket.timeout as exc:
         raise MuteServiceError("TIMEOUT", "XS8 service connection timed out") from exc
@@ -69,6 +88,8 @@ def send_mute(socket_path, timeout=1.0):
         raise MuteServiceError("INVALID_REPLY", "Invalid XS8 service reply") from exc
     if line == "OK MUTE_TX":
         return line
+    if line == "ERR MUTE_UNCERTAIN":
+        raise MuteServiceError("SERVICE_UNCERTAIN", line)
     if line.startswith("ERR ") and len(line) > 4:
         raise MuteServiceError("REJECTED", line)
     raise MuteServiceError("INVALID_REPLY", "Invalid XS8 service reply")
@@ -321,8 +342,10 @@ def parse_args(argv=None):
     parser.add_argument("--allow-insecure-readonly-lan", action="store_true",
                         help="explicitly allow unauthenticated read-only LAN HTTP")
     parser.add_argument("--enable-dev-mute", action="store_true",
-                        help="reserved: MUTE is disabled in phase 2A")
-    parser.add_argument("--https-origin", help="reserved HTTPS Origin for future MUTE requests")
+                        help="reserved: legacy development gate remains disabled")
+    parser.add_argument("--enable-offline-mute", action="store_true",
+                        help="allow MUTE only after a fake service challenge")
+    parser.add_argument("--https-origin", help="required HTTPS Origin for offline MUTE tests")
     parser.add_argument("--systemd-socket", action="store_true",
                         help="serve read-only HTTP using the systemd Unix listener")
     parser.add_argument("--nginx-uid", type=int,
@@ -330,8 +353,27 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.enable_dev_mute:
         parser.error("MUTE development gate is disabled in phase 2A")
-    if args.https_origin:
-        parser.error("--https-origin requires an enabled MUTE gate")
+    if args.enable_offline_mute:
+        if not args.systemd_socket or args.socket == DEFAULT_SOCKET or not args.https_origin:
+            parser.error("offline MUTE requires --systemd-socket, --https-origin, and an explicit non-default --socket")
+        try:
+            origin = urlsplit(args.https_origin)
+            origin.port  # Reject malformed port syntax before accepting the origin.
+        except ValueError:
+            parser.error("--https-origin must be a valid HTTPS origin")
+        if (origin.scheme != "https" or not origin.hostname or origin.username or
+                origin.password or origin.netloc.endswith(":") or
+                args.https_origin != f"https://{origin.netloc}"):
+            parser.error("--https-origin must be an exact HTTPS origin without path or credentials")
+        if Path(args.socket).resolve() == Path(DEFAULT_SOCKET).resolve():
+            parser.error("offline MUTE socket must not resolve to the real XS8 Service socket")
+        try:
+            if os.path.samefile(args.socket, DEFAULT_SOCKET):
+                parser.error("offline MUTE socket must not be the real XS8 Service socket")
+        except FileNotFoundError:
+            pass
+    elif args.https_origin:
+        parser.error("--https-origin requires --enable-offline-mute")
     if args.systemd_socket:
         if (args.nginx_uid is None or args.nginx_uid <= 0 or
                 args.allow_insecure_readonly_lan or args.bind is not None or
@@ -361,7 +403,7 @@ def main(argv=None):
         print("WARNING: unauthenticated, unencrypted read-only LAN preview; "
               "do not forward this port to the internet", file=sys.stderr)
     handler = type("ConfiguredGatewayHandler", (GatewayHandler,),
-                   {"socket_path": args.socket, "dev_mute_enabled": args.enable_dev_mute,
+                   {"socket_path": args.socket, "dev_mute_enabled": args.enable_offline_mute,
                     "https_origin": args.https_origin, "sessions": {}})
     if args.systemd_socket:
         try:
@@ -369,7 +411,8 @@ def main(argv=None):
         except (OSError, ValueError) as exc:
             print(f"XS8 gateway socket activation failed: {exc}", file=sys.stderr)
             return 1
-        print(f"XS8 gateway listening on {GATEWAY_SOCKET} (read-only)")
+        mode = "OFFLINE FAKE MUTE TEST" if args.enable_offline_mute else "read-only"
+        print(f"XS8 gateway listening on {GATEWAY_SOCKET} ({mode})")
     else:
         server = HTTPServer((args.bind, args.port), handler)
         print(f"XS8 gateway listening on http://{args.bind}:{server.server_port} (read-only)")

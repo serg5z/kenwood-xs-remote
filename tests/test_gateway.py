@@ -54,6 +54,39 @@ class FakeService:
             raise AssertionError("fake service did not receive a connection")
 
 
+class OfflineFakeService(FakeService):
+    """Answer the fake-only challenge before accepting one MUTE."""
+
+    def run(self):
+        client, _ = self.listener.accept()
+        with client:
+            challenge = bytearray()
+            while b"\n" not in challenge:
+                chunk = client.recv(128)
+                if not chunk:
+                    return
+                challenge.extend(chunk)
+            challenge = bytes(challenge)
+            self.commands.append(challenge)
+            if not challenge.startswith(b"OFFLINE_TEST ") or not challenge.endswith(b"\n"):
+                return
+            client.sendall(b"OK " + challenge)
+            command = bytearray()
+            while b"\n" not in command:
+                chunk = client.recv(128)
+                if not chunk:
+                    return
+                command.extend(chunk)
+            self.commands.append(bytes(command))
+            if self.delay:
+                time.sleep(self.delay)
+            if self.response is not None:
+                try:
+                    client.sendall(self.response)
+                except BrokenPipeError:
+                    pass
+
+
 class DisabledControls(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -90,6 +123,19 @@ class GatewayTest(unittest.TestCase):
         client.request(method, path, body=body, headers=headers or {})
         response = client.getresponse()
         result = response.status, response.read(), dict(response.getheaders())
+        client.close()
+        return result
+
+    def request_with_headers(self, method, path, headers, body=None):
+        """Preserve duplicate headers for HTTP parser regression tests."""
+        client = http.client.HTTPConnection("127.0.0.1", self.server.server_port,
+                                            timeout=2)
+        client.putrequest(method, path)
+        for name, value in headers:
+            client.putheader(name, value)
+        client.endheaders(body.encode() if body is not None else None)
+        response = client.getresponse()
+        result = response.status, response.read()
         client.close()
         return result
 
@@ -165,24 +211,24 @@ class MuteGatewayTest(GatewayTest):
     def test_success_one_command_and_replay_rejected(self):
         self.enable_dev_mute()
         token, cookie = self.session()
-        fake = FakeService(self.socket_path, b"OK MUTE_TX\n")
+        fake = OfflineFakeService(self.socket_path, b"OK MUTE_TX\n")
         code, body, _ = self.mute(token, cookie)
         fake.close()
         self.assertEqual(code, 200)
-        self.assertEqual(fake.commands, [b"MUTE\n"])
+        self.assertEqual(fake.commands[-1], b"MUTE\n")
         self.assertEqual(json.loads(body)["receiver_execution"], "UNVERIFIED")
         self.assertEqual(json.loads(body)["result"], "SERVICE_TX_OK")
         self.assertEqual(self.mute(token, cookie)[0], 403)
 
-    def test_service_rejection_preserves_policy(self):
+    def test_service_uncertain_is_not_labeled_rejected(self):
         self.enable_dev_mute()
         token, cookie = self.session()
-        fake = FakeService(self.socket_path, b"ERR MUTE_UNCERTAIN\n")
+        fake = OfflineFakeService(self.socket_path, b"ERR MUTE_UNCERTAIN\n")
         code, body, _ = self.mute(token, cookie)
         fake.close()
-        self.assertEqual(code, 409)
-        self.assertEqual(fake.commands, [b"MUTE\n"])
-        self.assertEqual(json.loads(body)["result"], "REJECTED")
+        self.assertEqual(code, 502)
+        self.assertEqual(fake.commands[-1], b"MUTE\n")
+        self.assertEqual(json.loads(body)["result"], "SERVICE_UNCERTAIN")
 
     def test_boot_inhibit_not_shown_as_available(self):
         self.enable_dev_mute()
@@ -194,16 +240,17 @@ class MuteGatewayTest(GatewayTest):
         self.assertFalse(json.loads(body)["mute_available"])
         token = json.loads(body)["csrf_token"]
         cookie = headers["Set-Cookie"].split(";", 1)[0]
-        fake = FakeService(self.socket_path, b"ERR MUTE_UNCERTAIN\n")
+        fake = OfflineFakeService(self.socket_path, b"ERR MUTE_UNCERTAIN\n")
         code, body, _ = self.mute(token, cookie)
         fake.close()
-        self.assertEqual(code, 409)
-        self.assertEqual(fake.commands, [b"MUTE\n"])
+        self.assertEqual(code, 502)
+        self.assertEqual(fake.commands[-1], b"MUTE\n")
+        self.assertEqual(json.loads(body)["result"], "SERVICE_UNCERTAIN")
 
     def test_invalid_service_reply_is_not_success(self):
         self.enable_dev_mute()
         token, cookie = self.session()
-        fake = FakeService(self.socket_path, b"OK OTHER\n")
+        fake = OfflineFakeService(self.socket_path, b"OK OTHER\n")
         code, body, _ = self.mute(token, cookie)
         fake.close()
         self.assertEqual(code, 502)
@@ -216,13 +263,13 @@ class MuteGatewayTest(GatewayTest):
         self.assertEqual(code, 503)
         self.assertEqual(json.loads(body)["result"], "UNAVAILABLE")
         token, cookie = self.session()
-        fake = FakeService(self.socket_path, None, delay=1.2)
+        fake = OfflineFakeService(self.socket_path, None, delay=1.2)
         code, body, _ = self.mute(token, cookie)
         fake.close()
         self.assertEqual(code, 504)
         self.assertEqual(json.loads(body)["result"], "TIMEOUT")
         token, cookie = self.session()
-        fake = FakeService(self.socket_path, None)
+        fake = OfflineFakeService(self.socket_path, None)
         code, body, _ = self.mute(token, cookie)
         fake.close()
         self.assertEqual(code, 502)
@@ -241,10 +288,75 @@ class MuteGatewayTest(GatewayTest):
         for path in ("/api/v1/source", "/api/v1/volume/step", "/api/v1/cd/transport"):
             self.assertEqual(self.request("POST", path)[0], 501)
         # A valid request is still accepted: rejected requests did not use the token.
-        fake = FakeService(self.socket_path, b"OK MUTE_TX\n")
+        fake = OfflineFakeService(self.socket_path, b"OK MUTE_TX\n")
         self.assertEqual(self.mute(token, cookie)[0], 200)
         fake.close()
-        self.assertEqual(fake.commands, [b"MUTE\n"])
+        self.assertEqual(fake.commands[-1], b"MUTE\n")
+
+    def test_duplicate_and_missing_headers_never_dispatch(self):
+        self.enable_dev_mute()
+        token, cookie = self.session()
+        valid = [
+            ("Origin", "https://woodland-pi.local"),
+            ("X-Forwarded-Proto", "https"),
+            ("X-Kenwood-Authenticated-User", "remote"),
+            ("X-CSRF-Token", token),
+            ("Cookie", cookie),
+            ("Content-Type", "application/json"),
+            ("Content-Length", "2"),
+        ]
+        with mock.patch.object(xs8_gateway, "send_mute") as dispatch:
+            for name in ("Origin", "X-Forwarded-Proto", "X-CSRF-Token",
+                         "Cookie", "Content-Type", "Content-Length"):
+                with self.subTest(missing=name):
+                    headers = [(key, value) for key, value in valid if key != name]
+                    self.assertNotEqual(self.request_with_headers(
+                        "POST", "/api/v1/mute", headers, "{}")[0], 200)
+                with self.subTest(duplicate=name):
+                    self.assertNotEqual(self.request_with_headers(
+                        "POST", "/api/v1/mute", valid + [(name, dict(valid)[name])],
+                        "{}")[0], 200)
+            for name, value in (("Transfer-Encoding", "chunked"),
+                                ("X-Kenwood-Authenticated-User", "intruder")):
+                with self.subTest(extra=name):
+                    self.assertNotEqual(self.request_with_headers(
+                        "POST", "/api/v1/mute", valid + [(name, value)],
+                        "{}")[0], 200)
+            dispatch.assert_not_called()
+
+    def test_session_bound_to_identity_and_token_consumed_on_service_error(self):
+        self.enable_dev_mute()
+        token, cookie = self.session()
+        with mock.patch.object(xs8_gateway, "send_mute") as dispatch:
+            self.assertEqual(self.mute(token, cookie, headers={
+                "X-Kenwood-Authenticated-User": "other"})[0], 401)
+            self.assertEqual(self.mute(token, cookie, headers={
+                "Origin": "https://woodland-pi.local:443"})[0], 403)
+            dispatch.assert_not_called()
+        fake = OfflineFakeService(self.socket_path, b"ERR MONITOR_FAILED\n")
+        code, body, _ = self.mute(token, cookie)
+        fake.close()
+        self.assertEqual(code, 409)
+        self.assertEqual(json.loads(body)["result"], "REJECTED")
+        self.assertEqual(fake.commands[-1], b"MUTE\n")
+        with mock.patch.object(xs8_gateway, "send_mute") as dispatch:
+            self.assertEqual(self.mute(token, cookie)[0], 403)
+            dispatch.assert_not_called()
+
+    def test_fault_status_disables_capability_and_service_refusal_is_preserved(self):
+        self.enable_dev_mute()
+        token, cookie = self.session()
+        fake = FakeService(self.socket_path, STATUS.replace(b"state=IDLE", b"state=FAULT_LATCHED"))
+        code, body, _ = self.request_full("GET", "/api/v1/capabilities", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        fake.close()
+        self.assertEqual(code, 200)
+        self.assertFalse(json.loads(body)["operations"]["mute"]["enabled"])
+        fake = OfflineFakeService(self.socket_path, b"ERR MUTE_UNCERTAIN\n")
+        code, body, _ = self.mute(token, cookie)
+        fake.close()
+        self.assertEqual(code, 502)
+        self.assertEqual(json.loads(body)["result"], "SERVICE_UNCERTAIN")
 
     def test_session_requires_identity_and_service_availability_disables_mute(self):
         self.enable_dev_mute()
@@ -282,11 +394,49 @@ class BindingTest(unittest.TestCase):
         self.assertFalse(args.allow_insecure_readonly_lan)
         self.assertFalse(args.enable_dev_mute)
 
-    def test_dev_gate_requires_https_loopback_and_nondefault_socket(self):
+    def test_legacy_dev_gate_remains_disabled(self):
         for options in ([], ["--systemd-socket", "--nginx-uid", "1000"]):
             self.assertIn("disabled in phase 2A", self.parse_error(
                 *options, "--enable-dev-mute", "--https-origin",
                 "https://woodland-pi.local", "--socket", "/tmp/fake-xs8.sock"))
+
+    def test_offline_gate_requires_activated_socket_fake_path_and_https_origin(self):
+        base = ["--systemd-socket", "--nginx-uid", "33", "--enable-offline-mute"]
+        fake = ["--socket", "/tmp/offline-fake-xs8.sock"]
+        origin = ["--https-origin", "https://woodland-pi.local"]
+        args = xs8_gateway.parse_args(base + fake + origin)
+        self.assertTrue(args.enable_offline_mute)
+        for options in (base + origin, base + fake, fake + origin + ["--enable-offline-mute"],
+                        base + fake + origin + ["--bind", "127.0.0.1"],
+                        base + fake + origin + ["--allow-insecure-readonly-lan"],
+                        base + fake + ["--https-origin", "http://woodland-pi.local"],
+                        base + fake + ["--https-origin", "https://woodland-pi.local/path"],
+                        base + fake + ["--https-origin", "https://user@woodland-pi.local"]):
+            with self.subTest(options=options):
+                self.parse_error(*options)
+        with tempfile.TemporaryDirectory() as directory:
+            real = Path(directory) / "real.sock"
+            alias = Path(directory) / "alias.sock"
+            with mock.patch.object(xs8_gateway, "DEFAULT_SOCKET", str(real)):
+                alias.symlink_to(real)
+                self.parse_error(*(base + ["--socket", str(alias)] + origin))
+
+    def test_deployment_templates_keep_auth_and_control_gate_off(self):
+        root = Path(xs8_gateway.__file__).resolve().parent
+        nginx = (root / "deploy/nginx/kenwood-xs-remote.conf.example").read_text()
+        service = (root / "deploy/systemd/kenwood-xs-gateway.service.example").read_text()
+        listener = (root / "deploy/systemd/kenwood-xs-gateway.socket.example").read_text()
+        self.assertIn('listen __LAN_IPV4__:443 ssl;', nginx)
+        self.assertIn('auth_basic "Kenwood XS Remote";', nginx)
+        self.assertIn('auth_basic_user_file __PASSWORD_FILE_PATH__;', nginx)
+        self.assertIn('proxy_set_header X-Kenwood-Authenticated-User $remote_user;', nginx)
+        self.assertIn('proxy_set_header Authorization "";', nginx)
+        self.assertIn('proxy_pass http://unix:/run/kenwood-gateway.sock:;', nginx)
+        self.assertIn('--systemd-socket --nginx-uid __NGINX_WORKER_UID__', service)
+        self.assertNotIn('--enable-dev-mute', service)
+        self.assertNotIn('--enable-offline-mute', service)
+        self.assertIn('ListenStream=/run/kenwood-gateway.sock', listener)
+        self.assertIn('SocketMode=0660', listener)
 
     def test_systemd_socket_options(self):
         args = xs8_gateway.parse_args(["--systemd-socket", "--nginx-uid", "33"])
@@ -360,16 +510,6 @@ class BindingTest(unittest.TestCase):
                           self.parse_error("--bind", address))
 
 
-class UnixHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, path):
-        super().__init__("localhost", timeout=2)
-        self.path = path
-
-    def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.connect(self.path)
-
-
 class ActivatedGatewayTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -387,8 +527,9 @@ class ActivatedGatewayTest(unittest.TestCase):
                         "log_message": lambda *args: None})
         self.server = xs8_gateway.ActivatedUnixServer(
             self.listener.dup(), handler, os.getuid())
-        # macOS lacks Linux SO_PEERCRED; credential checks are tested separately.
-        self.server.verify_request = lambda request, address: True
+        # Exercise actual Linux SO_PEERCRED; macOS lacks it.
+        if not hasattr(socket, "SO_PEERCRED"):
+            self.server.verify_request = lambda request, address: True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -403,12 +544,127 @@ class ActivatedGatewayTest(unittest.TestCase):
         self.temp.cleanup()
 
     def request(self, method, path, headers=None, body=None):
-        client = UnixHTTPConnection(self.path)
-        client.request(method, path, body=body, headers=headers or {})
-        response = client.getresponse()
-        result = response.status, response.read(), dict(response.getheaders())
-        client.close()
-        return result
+        payload = body.encode() if isinstance(body, str) else (body or b"")
+        fields = {"Host": "localhost", **(headers or {})}
+        if body is not None and "Content-Length" not in fields:
+            fields["Content-Length"] = str(len(payload))
+        request = (f"{method} {path} HTTP/1.1\r\n" +
+                   "".join(f"{name}: {value}\r\n" for name, value in fields.items()) +
+                   "Connection: close\r\n\r\n").encode() + payload
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(2)
+            client.connect(self.path)
+            client.sendall(request)
+            response = http.client.HTTPResponse(client)
+            response.begin()
+            return response.status, response.read(), dict(response.getheaders())
+
+    def nginx_like_request(self, method, path, credentials, headers=None, body=None):
+        """Model Basic Auth and nginx's header replacement for offline tests."""
+        if credentials != "correct-test-password":
+            return 401, b"", {}
+        upstream = {key: value for key, value in (headers or {}).items()
+                    if key.lower() not in ("x-kenwood-authenticated-user", "authorization",
+                                           "x-forwarded-proto")}
+        upstream["X-Kenwood-Authenticated-User"] = "remote"
+        upstream["X-Forwarded-Proto"] = "https"
+        return self.request(method, path, upstream, body)
+
+    def test_offline_mute_uses_activated_socket_and_fake_challenge(self):
+        self.stop_gateway()
+        self.start_gateway(dev_mute=True)
+        forged = {"X-Kenwood-Authenticated-User": "attacker"}
+        self.assertEqual(self.nginx_like_request(
+            "GET", "/api/v1/session", None, forged)[0], 401)
+        code, body, response_headers = self.nginx_like_request(
+            "GET", "/api/v1/session", "correct-test-password", forged)
+        self.assertEqual(code, 200)
+        token = json.loads(body)["csrf_token"]
+        cookie = response_headers["Set-Cookie"].split(";", 1)[0]
+        self.assertEqual(self.server.RequestHandlerClass.sessions[cookie.split("=", 1)[1]]["user"],
+                         "remote")
+        headers = {**forged, "Origin": "https://woodland-pi.local",
+                   "Cookie": cookie, "X-CSRF-Token": token,
+                   "Content-Type": "application/json"}
+        for credentials, changes, expected in (
+                (None, {}, 401),
+                ("wrong", {}, 401),
+                ("correct-test-password", {"Origin": "https://wrong.example"}, 403),
+                ("correct-test-password", {"X-CSRF-Token": "wrong"}, 403),
+                ("correct-test-password", {"X-CSRF-Token": ""}, 403),
+                ("correct-test-password", {"Content-Type": "text/plain"}, 400)):
+            with self.subTest(credentials=credentials, changes=changes):
+                self.assertEqual(self.nginx_like_request(
+                    "POST", "/api/v1/mute", credentials,
+                    {**headers, **changes}, "{}")[0], expected)
+        missing_token = {key: value for key, value in headers.items() if key != "X-CSRF-Token"}
+        self.assertEqual(self.nginx_like_request(
+            "POST", "/api/v1/mute", "correct-test-password", missing_token, "{}")[0], 403)
+        self.assertEqual(self.nginx_like_request(
+            "POST", "/api/v1/mute", "correct-test-password", headers, '{"x":1}')[0], 400)
+        fake = OfflineFakeService(self.service_path, b"OK MUTE_TX\n")
+        code, body, _ = self.nginx_like_request(
+            "POST", "/api/v1/mute", "correct-test-password", headers, "{}")
+        fake.close()
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["receiver_execution"], "UNVERIFIED")
+        self.assertEqual(len([line for line in fake.commands if line == b"MUTE\n"]), 1)
+        self.assertEqual(len(fake.commands), 2)
+        self.assertTrue(fake.commands[0].startswith(b"OFFLINE_TEST "))
+        self.assertEqual(self.nginx_like_request(
+            "POST", "/api/v1/mute", "correct-test-password", headers, "{}")[0], 403)
+        for path in ("/api/v1/source", "/api/v1/volume/step", "/api/v1/cd/transport"):
+            self.assertEqual(self.nginx_like_request(
+                "POST", path, "correct-test-password", headers, "{}")[0], 501)
+
+    def test_offline_fake_gate_rejects_real_service_and_unavailable_socket(self):
+        self.stop_gateway()
+        self.start_gateway(dev_mute=True)
+        code, body, response_headers = self.nginx_like_request(
+            "GET", "/api/v1/session", "correct-test-password")
+        self.assertEqual(code, 200)
+        headers = {"Origin": "https://woodland-pi.local",
+                   "Cookie": response_headers["Set-Cookie"].split(";", 1)[0],
+                   "X-CSRF-Token": json.loads(body)["csrf_token"],
+                   "Content-Type": "application/json"}
+        code, body, _ = self.nginx_like_request(
+            "POST", "/api/v1/mute", "correct-test-password", headers, "{}")
+        self.assertEqual(code, 503)
+        self.assertEqual(json.loads(body)["result"], "UNAVAILABLE")
+        code, body, response_headers = self.nginx_like_request(
+            "GET", "/api/v1/session", "correct-test-password", {"Cookie": headers["Cookie"]})
+        headers["X-CSRF-Token"] = json.loads(body)["csrf_token"]
+        fake = FakeService(self.service_path, b"ERR UNKNOWN_COMMAND\n")
+        code, body, _ = self.nginx_like_request(
+            "POST", "/api/v1/mute", "correct-test-password", headers, "{}")
+        fake.close()
+        self.assertEqual(code, 502)
+        self.assertEqual(json.loads(body)["result"], "UNSAFE_SERVICE")
+        self.assertEqual(len([line for line in fake.commands if b"MUTE" in line]), 0)
+
+    def test_offline_mute_preserves_service_outcome_classes(self):
+        self.stop_gateway()
+        self.start_gateway(dev_mute=True)
+        for service_reply, delay, expected_code, expected_result in (
+                (b"ERR MONITOR_FAILED\n", 0, 409, "REJECTED"),
+                (b"ERR MUTE_UNCERTAIN\n", 0, 502, "SERVICE_UNCERTAIN"),
+                (None, 0, 502, "DISCONNECTED"),
+                (None, 1.2, 504, "TIMEOUT")):
+            with self.subTest(expected_result=expected_result):
+                code, body, response_headers = self.nginx_like_request(
+                    "GET", "/api/v1/session", "correct-test-password")
+                self.assertEqual(code, 200)
+                headers = {"Origin": "https://woodland-pi.local",
+                           "Cookie": response_headers["Set-Cookie"].split(";", 1)[0],
+                           "X-CSRF-Token": json.loads(body)["csrf_token"],
+                           "Content-Type": "application/json"}
+                fake = OfflineFakeService(self.service_path, service_reply, delay)
+                code, body, _ = self.nginx_like_request(
+                    "POST", "/api/v1/mute", "correct-test-password", headers, "{}")
+                fake.close()
+                self.assertEqual(code, expected_code)
+                self.assertEqual(json.loads(body)["result"], expected_result)
+                self.assertEqual(len([line for line in fake.commands if line == b"MUTE\n"]), 1)
 
     def test_fake_nginx_request_and_unavailable_service(self):
         fake = FakeService(self.service_path, STATUS)
@@ -469,6 +725,23 @@ class ActivatedGatewayTest(unittest.TestCase):
         tcp.assert_not_called()
         server.serve_forever.assert_called_once()
         server.server_close.assert_called_once()
+
+    def test_offline_systemd_mode_keeps_tcp_closed_and_requires_fake_challenge(self):
+        server = mock.Mock()
+        with mock.patch.object(xs8_gateway, "systemd_listener") as inherited, \
+             mock.patch.object(xs8_gateway, "ActivatedUnixServer", return_value=server) as unix, \
+             mock.patch.object(xs8_gateway, "HTTPServer") as tcp:
+            with contextlib.redirect_stdout(io.StringIO()):
+                xs8_gateway.main(["--systemd-socket", "--nginx-uid", "33",
+                                  "--enable-offline-mute", "--https-origin",
+                                  "https://woodland-pi.local", "--socket",
+                                  "/tmp/offline-fake-xs8.sock"])
+        inherited.assert_called_once()
+        tcp.assert_not_called()
+        handler = unix.call_args.args[1]
+        self.assertTrue(handler.dev_mute_enabled)
+        self.assertEqual(handler.socket_path, "/tmp/offline-fake-xs8.sock")
+        self.assertEqual(handler.https_origin, "https://woodland-pi.local")
 
 
 if __name__ == "__main__":

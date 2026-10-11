@@ -43,11 +43,19 @@ python3 -m unittest discover -s tests -p 'test_gateway.py'
 
 `status` preserves the service's `last_gpio_tx`, `last_waveform`, and `receiver_execution` fields. `TX_OK` and `MATCH` do not prove that the Kenwood executed a command. The gateway opens one short-lived Unix socket connection per status request. It does not modify XS8 state.
 
-## Dormant MUTE development path
+## Isolated offline MUTE test path
 
-Phase 2A rejects `--enable-dev-mute` in both TCP and systemd-socket modes. The handler's previous MUTE, session and CSRF code remains covered by isolated fake-service tests but cannot be enabled by the CLI. The systemd unit omits all control flags. The nginx template authenticates the entire site, strips the Basic Auth password and overwrites `X-Kenwood-Authenticated-User` with its authenticated `$remote_user`. The Gateway trusts that header only for a connection whose Unix peer UID matches the configured nginx worker UID. Do not expose the development TCP listener to a LAN when considering future controls.
+The legacy `--enable-dev-mute` flag remains rejected. `--enable-offline-mute` is a default-off test gate. It requires `--systemd-socket`, a verified nginx worker UID, an exact `--https-origin`, and an explicit non-default fake `--socket`. TCP and LAN-preview modes cannot enable it. Before sending `MUTE`, the Gateway requires a random `OFFLINE_TEST` challenge response from the fake service **on the same connection**. The real XS8 Service does not implement that response. The production systemd unit has no offline gate or alternate service socket, so it remains read-only. A non-default pathname by itself is not proof that a service is fake; retain the challenge and never point test tooling at a live service.
 
-The dormant path uses a 30-minute, Secure, HttpOnly, SameSite=Strict session cookie and a one-use CSRF token. It checks an exact HTTPS Origin, method, content type and body; it does not treat a service `OK MUTE_TX` reply as proof of receiver execution. Its behavior remains offline-testable, but no deployed Phase 2A mode issues sessions or dispatches MUTE. A future release must explicitly reauthorize physical control after the trust-boundary tests pass.
+Run isolated tests from the repository root without changing the deployed nginx or systemd units:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_gateway.py'
+```
+
+The suite creates temporary Gateway and fake XS8 Unix sockets, then closes them. It uses an nginx-like authenticated request model; on Linux it exercises real `SO_PEERCRED`. It does not inspect the deployed nginx instance, terminate the live Gateway, or contact `/tmp/kenwood-xs8.sock`. Review `sudo nginx -T` and independently test forged identity headers against an **isolated** nginx instance before treating header replacement as deployed evidence. Do not start an offline-gated Gateway on the live `/run/kenwood-gateway.sock`.
+
+The offline path uses a 30-minute, Secure, HttpOnly, SameSite=Strict session cookie and a one-use CSRF token. It checks an exact HTTPS Origin, method, content type and body; it does not treat a fake service `OK MUTE_TX` reply as proof of receiver execution. A future release must explicitly reauthorize physical control after the trust-boundary tests pass.
 
 The MUTE button stays disabled in Phase 2A. The XS8 Service retains final authorization, including BOOT_INHIBIT. A process running as the nginx worker UID can reach the Gateway Unix socket directly; verify that account is not shared by unrelated local applications. HTTPS, Basic Auth, restricted socket permissions, peer UID validation, Origin and CSRF checks are all required before physical Web control is enabled.
 
