@@ -1,6 +1,6 @@
 # Web Remote and HTTP API v0.1
 
-The Gateway remains **read-only by default**. An explicit production `--enable-mute` option can enable only MUTE through the authenticated HTTPS and systemd Unix-socket route. Volume, input selection, and CD transport remain disabled. The checked-in systemd unit does not enable MUTE. See [MUTE deployment and rollback](mute-control.md) before opting in.
+The Gateway remains **read-only by default**. Explicit production `--enable-mute` and `--enable-source` options independently gate MUTE and the four evidenced source commands through authenticated HTTPS and the systemd Unix socket. TV1, TV2 and TAPE2 remain blocked pending controlled TX validation; volume and CD transport remain disabled. The checked-in systemd unit enables neither control. See [MUTE deployment](mute-control.md) and [source selection evidence and rollout](source-selection.md) before opting in.
 
 ## Run locally
 
@@ -37,9 +37,10 @@ python3 -m unittest discover -s tests -p 'test_gateway.py'
 | Endpoint | Result |
 | --- | --- |
 | `GET /api/v1/status` | JSON with `gateway`, `xs8_service`, and parsed service `status`. Returns HTTP 503 when the service is unavailable or its reply is invalid. |
-| `GET /api/v1/capabilities` | JSON classifications and enabled flags. MUTE is enabled only when its gate, session and XS8 eligibility checks pass. |
-| `GET /api/v1/session` | Returns 404 with MUTE disabled; otherwise issues a secure session cookie and one-use CSRF token. |
-| `POST /api/v1/mute` | Returns 501 with MUTE disabled. With the production gate, a valid request checks fresh XS8 eligibility and sends one `MUTE` to the local service. Other POST paths remain 501. |
+| `GET /api/v1/capabilities` | JSON classifications and enabled flags. MUTE and evidenced sources require their own gates, a session, and XS8 eligibility. |
+| `GET /api/v1/session` | Returns 404 when both control gates are disabled; otherwise issues a secure session cookie and one-use CSRF token. |
+| `POST /api/v1/mute` | Returns 501 with MUTE disabled. With the production gate, a valid request checks fresh XS8 eligibility and sends one `MUTE` to the local service. |
+| `POST /api/v1/source` | Returns 501 with source disabled. With the production gate, accepts one allowlisted `{ "source": "CD" }` style JSON body, checks fresh XS8 eligibility, and dispatches at most one command. TV1, TV2 and TAPE2 return 409 without dispatch. |
 
 `status` preserves the service's `last_gpio_tx`, `last_waveform`, and `receiver_execution` fields. `TX_OK` and `MATCH` do not prove that the Kenwood executed a command. The gateway opens one short-lived Unix socket connection per status request. It does not modify XS8 state.
 
@@ -55,7 +56,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_gateway
 
 The suite creates temporary Gateway and fake XS8 Unix sockets, then closes them. It uses an nginx-like authenticated request model; on Linux it exercises real `SO_PEERCRED`. It does not inspect the deployed nginx instance, terminate the live Gateway, or contact `/tmp/kenwood-xs8.sock`. Review `sudo nginx -T` and independently test forged identity headers against an **isolated** nginx instance before treating header replacement as deployed evidence. Do not start an offline-gated Gateway on the live `/run/kenwood-gateway.sock`.
 
-Both MUTE modes use a 30-minute, Secure, HttpOnly, SameSite=Strict session cookie and a one-use CSRF token. They check exact HTTPS Origin, method, content type and body. Production mode additionally requires the default real XS8 Service socket and a fresh eligible STATUS before the one MUTE dispatch. A service `OK MUTE_TX` reply is transmission evidence, never proof of receiver execution.
+Both MUTE modes and production source selection use a 30-minute, Secure, HttpOnly, SameSite=Strict session cookie and a one-use CSRF token. They check exact HTTPS Origin, method, content type and body. Production controls additionally require the default real XS8 Service socket and a fresh eligible STATUS before one dispatch. Service TX replies are transmission evidence, never proof of receiver execution.
 
 The XS8 Service retains final authorization, including BOOT_INHIBIT and FAULT_LATCHED. A process running as the nginx worker UID can reach the Gateway Unix socket directly; verify that account is not shared by unrelated local applications. HTTPS, Basic Auth, restricted socket permissions, peer UID validation, Origin and CSRF checks remain required for physical Web control.
 
@@ -65,7 +66,6 @@ The following paths return HTTP 501 and do not access the XS8 service:
 
 | Endpoint | Proposed request | Safety condition before implementation |
 | --- | --- | --- |
-| `POST /api/v1/source` | `{ "source": "CD" }` (or another documented source) | Validate each source command and receiver state on hardware. |
 | `POST /api/v1/volume/step` | `{ "direction": "UP" }` or `DOWN` | Implement a bounded, atomic step in the single-owner XS8 service. STOP obligation and failure handling must remain server-side; browser release events cannot be the sole stop mechanism. |
 | `POST /api/v1/cd/transport` | `{ "action": "PLAY_PAUSE" }`, `STOP`, `PREVIOUS`, or `NEXT` | Validate commands and context before exposure. |
 

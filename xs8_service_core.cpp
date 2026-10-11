@@ -79,6 +79,26 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
     if (line == "STATUS") return status();
     if (!client_connected_) return "ERR NO_CLIENT\n";
     if (!tx_.monitor_healthy()) return "ERR MONITOR_FAILED\n";
+    if (line.compare(0, 14, "SELECT_SOURCE ") == 0) {
+        const std::string name = line.substr(14);
+        uint8_t byte = 0;
+        if (name == "CD") byte = 0x84;
+        else if (name == "TUNER") byte = 0x82;
+        else if (name == "PHONO") byte = 0x83;
+        else if (name == "TAPE1") byte = 0x85;
+        else if (name == "TV1" || name == "TV2" || name == "TAPE2")
+            return "ERR SOURCE_UNVERIFIED\n";
+        else return "ERR UNKNOWN_SOURCE\n";
+        if (volume_.state() != VolumeControl::State::IDLE ||
+            volume_.stop_owed() || volume_.context_may_be_open())
+            return std::string("ERR ") + state_name(volume_.state()) + "\n";
+        const bool verified = tx_.send(byte);
+        const ServiceTxEvidence evidence = tx_.last_evidence();
+        return std::string(verified ? "OK SOURCE_TX " : "ERR SOURCE_UNCERTAIN ") +
+            "gpio_tx=" + (evidence.gpio_completed ? "TX_OK" : "TX_FAIL") +
+            " waveform=" + waveform_name(evidence.waveform) +
+            " receiver_execution=UNVERIFIED\n";
+    }
     if (line == "MUTE")
         return volume_.mute(now) ? "OK MUTE_TX\n" : "ERR MUTE_UNCERTAIN\n";
     const bool press = line == "VOLUME_PRESS UP" ||

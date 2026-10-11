@@ -26,6 +26,9 @@
 }
 
 .mute:not(:disabled) { background:#a64532; border-color:#a64532; color:#fff; cursor:pointer; }
+.source-grid button:not(:disabled) { background:#f6f5f0; color:#343b37; cursor:pointer; }
+.source-grid button[data-source="TAPE2"] { position:relative; display:flex; align-items:center; justify-content:center; }
+.source-grid button[data-source="TAPE2"] small { position:absolute; top:calc(50% + 10px); left:0; right:0; font-size:9px; line-height:1; font-weight:600; color:#7d827e; letter-spacing:.12em; }
 .transport-grid svg {
   display: block;
   width: 22px;

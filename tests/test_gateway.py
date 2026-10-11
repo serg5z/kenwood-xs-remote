@@ -205,6 +205,15 @@ class GatewayTest(unittest.TestCase):
         return self.request_full("POST", "/api/v1/mute",
                                  body=overrides.pop("body", "{}"), headers=headers)
 
+    def source(self, token, cookie, name, **overrides):
+        headers = {"Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+                   "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": token,
+                   "Cookie": cookie, "Content-Type": "application/json"}
+        headers.update(overrides.pop("headers", {}))
+        return self.request_full("POST", "/api/v1/source",
+                                 body=overrides.pop("body", json.dumps({"source": name})),
+                                 headers=headers)
+
     def test_status_parsing(self):
         fake = FakeService(self.socket_path, STATUS)
         code, body = self.request("GET", "/api/v1/status")
@@ -418,6 +427,95 @@ class MuteGatewayTest(GatewayTest):
         self.assertEqual(code, 200)
         self.assertTrue(json.loads(body)["mute_available"])
         self.assertEqual(fake.commands, [b"STATUS\n"])
+
+
+class SourceGatewayTest(GatewayTest):
+    def enable_source(self):
+        handler = self.server.RequestHandlerClass
+        handler.production_source_enabled = True
+        handler.https_origin = "https://woodland-pi.local"
+        self.server.proxy_peer_verified = True
+
+    def test_all_seven_and_single_dispatch(self):
+        self.enable_source()
+        for name in xs8_gateway.SOURCES:
+            with self.subTest(source=name):
+                token, cookie = self.session()
+                if name in xs8_gateway.EVIDENCED_SOURCES:
+                    fake = RecordingService(self.socket_path,
+                        mute_reply=b"OK SOURCE_TX gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n")
+                    code, body, _ = self.source(token, cookie, name)
+                    fake.close()
+                    self.assertEqual(code, 200)
+                    self.assertEqual(fake.commands.count(f"SELECT_SOURCE {name}\n".encode()), 1)
+                    self.assertEqual(json.loads(body)["receiver_execution"], "UNVERIFIED")
+                    self.assertEqual(self.source(token, cookie, name)[0], 403)
+                else:
+                    self.assertEqual(self.source(token, cookie, name)[0], 409)
+
+    def test_authorization_and_invalid_body_never_dispatch(self):
+        self.enable_source()
+        token, cookie = self.session()
+        with mock.patch.object(xs8_gateway, "send_source") as dispatch:
+            self.assertEqual(self.source(token, cookie, "CD", headers={"Origin": "https://evil"})[0], 403)
+            self.assertEqual(self.source(token, cookie, "CD", headers={"X-CSRF-Token": "bad"})[0], 403)
+            self.assertEqual(self.source(token, cookie, "CD", headers={"Cookie": "bad=1"})[0], 401)
+            self.assertEqual(self.source(token, cookie, "CD", headers={"X-Kenwood-Authenticated-User": ""})[0], 401)
+            for body in ('{"source":"CD","source":"TUNER"}', '{"source":"BAD"}',
+                         '{"source":1}', '{}', '[]', '{"source":"CD","extra":1}'):
+                self.assertEqual(self.source(token, cookie, "CD", body=body)[0], 400)
+            dispatch.assert_not_called()
+
+    def test_blocked_status_and_uncertain_service(self):
+        self.enable_source()
+        for state in ("BOOT_INHIBIT", "FAULT_LATCHED", "HOLDING_DOWN"):
+            with self.subTest(state=state):
+                token, cookie = self.session()
+                fake = RecordingService(self.socket_path,
+                    status=STATUS.replace(b"state=IDLE", f"state={state}".encode()))
+                code, _, _ = self.source(token, cookie, "CD")
+                fake.close()
+                self.assertEqual(code, 409)
+                self.assertNotIn(b"SELECT_SOURCE CD\n", fake.commands)
+        token, cookie = self.session()
+        fake = RecordingService(self.socket_path,
+            mute_reply=b"ERR SOURCE_UNCERTAIN gpio_tx=TX_OK waveform=MISSING receiver_execution=UNVERIFIED\n")
+        code, body, _ = self.source(token, cookie, "CD")
+        fake.close()
+        self.assertEqual(code, 502)
+        self.assertEqual(json.loads(body)["result"], "SERVICE_UNCERTAIN")
+        self.assertEqual(json.loads(body)["gpio_tx"], "TX_OK")
+        self.assertEqual(json.loads(body)["waveform"], "MISSING")
+        self.assertEqual(fake.commands.count(b"SELECT_SOURCE CD\n"), 1)
+
+    def test_source_gate_off_and_cli_requires_secure_socket(self):
+        self.assertEqual(self.source("x", "x", "CD")[0], 501)
+        for options in (("--enable-source",),
+                        ("--enable-source", "--systemd-socket", "--nginx-uid", "33"),
+                        ("--enable-source", "--systemd-socket", "--nginx-uid", "33",
+                         "--https-origin", "https://woodland-pi.local", "--socket", self.socket_path)):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    xs8_gateway.parse_args(list(options))
+
+    def test_rapid_repeat_is_rejected_server_side(self):
+        self.enable_source()
+        token, cookie = self.session()
+        with mock.patch.object(xs8_gateway, "read_status", return_value={
+                "state": "IDLE", "monitor": "HEALTHY", "stop_owed": "0",
+                "context_may_be_open": "0"}), mock.patch.object(
+                    xs8_gateway, "send_source", return_value={
+                        "gpio_tx": "TX_OK", "waveform": "MATCH",
+                        "receiver_execution": "UNVERIFIED"}) as dispatch:
+            self.assertEqual(self.source(token, cookie, "CD")[0], 200)
+            code, body, _ = self.request_full("GET", "/api/v1/session", headers={
+                "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+            self.assertEqual(code, 200)
+            next_token = json.loads(body)["csrf_token"]
+            code, body, _ = self.source(next_token, cookie, "CD")
+            self.assertEqual(code, 429)
+            self.assertEqual(json.loads(body)["result"], "TOO_FAST")
+            dispatch.assert_called_once()
 
 
 class BindingTest(unittest.TestCase):

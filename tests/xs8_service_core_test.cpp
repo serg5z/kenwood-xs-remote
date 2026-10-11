@@ -17,6 +17,7 @@ struct FakeTx final : ServiceTransmitter {
     std::vector<uint8_t> sent;
     std::deque<bool> stop_matches;
     bool healthy = true;
+    bool fail_next = false;
     ServiceTxEvidence last{}, last_stop{};
     bool monitor_healthy() const override { return healthy; }
     ServiceTxEvidence last_evidence() const override { return last; }
@@ -35,9 +36,11 @@ struct FakeTx final : ServiceTransmitter {
             last_stop = last;
             return match;
         }
-        last.waveform = healthy ? WaveformEvidence::MATCH
+        const bool match = healthy && !fail_next;
+        fail_next = false;
+        last.waveform = match ? WaveformEvidence::MATCH
                                 : WaveformEvidence::MISSING;
-        return healthy;
+        return match;
     }
 };
 
@@ -103,6 +106,57 @@ static void test_release_and_mute_order()
     assert(core.command("MUTE", at(30), at(30)) == "OK MUTE_TX\n");
     assert(tx.sent == (std::vector<uint8_t>{0x17, 0xE9, 0x09, 0x07,
                                             0x17, 0xD8, 0x07}));
+}
+
+static void test_source_selection()
+{
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(10); });
+    core.connected();
+    const std::pair<const char*, uint8_t> supported[] = {
+        {"CD", 0x84}, {"TUNER", 0x82}, {"PHONO", 0x83}, {"TAPE1", 0x85}
+    };
+    for (const auto& source : supported) {
+        assert(core.command(std::string("SELECT_SOURCE ") + source.first,
+                            at(10), at(10)) ==
+               "OK SOURCE_TX gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n");
+        assert(tx.sent.back() == source.second);
+    }
+    const size_t count = tx.sent.size();
+    for (const char* name : {"TV1", "TV2", "TAPE2"})
+        assert(core.command(std::string("SELECT_SOURCE ") + name, at(10), at(10)) ==
+               "ERR SOURCE_UNVERIFIED\n");
+    assert(core.command("SELECT_SOURCE UNKNOWN", at(10), at(10)) ==
+           "ERR UNKNOWN_SOURCE\n");
+    assert(tx.sent.size() == count);
+    tx.fail_next = true;
+    assert(core.command("SELECT_SOURCE CD", at(10), at(10)) ==
+           "ERR SOURCE_UNCERTAIN gpio_tx=TX_OK waveform=MISSING receiver_execution=UNVERIFIED\n");
+    assert(tx.sent.size() == count + 1); // No automatic retransmission.
+    tx.healthy = false;
+    assert(core.command("SELECT_SOURCE CD", at(11), at(11)) ==
+           "ERR MONITOR_FAILED\n");
+    assert(tx.sent.size() == count + 1);
+
+    FakeTx inhibited_tx;
+    Xs8ServiceCore inhibited(inhibited_tx, Ms(2000), false);
+    inhibited.connected();
+    assert(inhibited.command("SELECT_SOURCE CD", at(1), at(1)) ==
+           "ERR BOOT_INHIBIT\n");
+    FakeTx holding_tx;
+    Xs8ServiceCore holding(holding_tx, Ms(2000), true);
+    holding.connected();
+    holding.command("VOLUME_PRESS DOWN", at(1), at(1));
+    const size_t holding_count = holding_tx.sent.size();
+    assert(holding.command("SELECT_SOURCE CD", at(2), at(2)) ==
+           "ERR HOLDING_DOWN\n");
+    assert(holding_tx.sent.size() == holding_count);
+    holding_tx.stop_matches = {false, false, false};
+    holding.command("VOLUME_RELEASE DOWN", at(3), at(3));
+    const size_t fault_count = holding_tx.sent.size();
+    assert(holding.command("SELECT_SOURCE CD", at(4), at(4)) ==
+           "ERR FAULT_LATCHED\n");
+    assert(holding_tx.sent.size() == fault_count);
 }
 
 static void test_release_and_watchdog()
@@ -176,6 +230,7 @@ static void test_failed_stop_verification_and_monitor()
 int main()
 {
     test_startup_and_parsing();
+    test_source_selection();
     test_serialized_commands_and_disconnect();
     test_down_hold_disconnect_before_max_hold();
     test_release_and_mute_order();

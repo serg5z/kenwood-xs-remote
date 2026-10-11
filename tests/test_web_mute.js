@@ -9,6 +9,7 @@ let sessionAvailable = true;
 const posts = [];
 const elements = new Map();
 const muteButton = { disabled: true, addEventListener: (_, handler) => { click = handler; } };
+const sourceButtons = [];
 
 function element(id) {
   if (id === 'mute-button') return muteButton;
@@ -17,7 +18,7 @@ function element(id) {
 }
 
 const context = {
-  document: { getElementById: element },
+  document: { getElementById: element, querySelectorAll: () => sourceButtons },
   setInterval: (handler) => { refresh = handler; },
   fetch: async (url, options) => {
     if (url === '/api/v1/status') return {
@@ -30,6 +31,8 @@ const context = {
       ok: sessionAvailable,
       json: async () => ({ csrf_token: 'test-token', mute_available: sessionAvailable && serviceState === 'IDLE' }),
     };
+    if (url === '/api/v1/capabilities') return { ok: true,
+      json: async () => ({ operations: { source: { enabled: false, available_sources: [] } } }) };
     if (url === '/api/v1/mute') {
       posts.push(options);
       return { ok: true, json: async () => ({ result: 'SERVICE_TX_OK', receiver_execution: 'UNVERIFIED' }) };
