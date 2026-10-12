@@ -44,3 +44,37 @@ The service executes a discrete pair synchronously on its control thread. Other 
 `make test` builds a test executable using the production socket loop and a fake GPIO/monitor backend, without linking libgpiod or requesting GPIO. Its Unix-socket tests keep a CEC connection open while short-lived CD PRESS, HEARTBEAT, RELEASE and STATUS requests interleave. They check stale tokens, lease expiry, detached-hold shutdown, unrelated-client disconnects and volume-owner STOP cleanup. These tests establish software routing and safety obligations; they do not validate physical waveform timing or receiver execution.
 
 The Gateway accepts the optional CD STATUS fields and keeps authenticated active controls ineligible while `cd_state=ACTIVE|HOLDING|FAULT_LATCHED` or a CD RELEASE remains owed. STATUS remains read-only and available. Simultaneous CD holding and volume/MUTE transmission is deliberately unvalidated and rejected because volume/MUTE enters `0x17`, while CD KEY UP is validated in ROOT.
+
+## Physical API validation: 2026-10-12
+
+The operator reports successful execution of the **Docker/QEMU cross-built
+ARMv6 service** on Raspberry Pi B+ Rev 1.2 with the KR-V6070 and connected CD
+changer. The [dated hardware report](../research/notes/xs8-cd-hold-api-validation-2026-10-12.md)
+records the evidence and supplied final STATUS fields.
+
+- `CD_TRACK_NEXT`: physically advanced one track.
+- `CD_TRACK_PREVIOUS`: physically restarted the current track in the tested state.
+- Explicit `CD_PRESS` / `CD_RELEASE`: successful KEY DOWN / KEY UP reported.
+- Lease timeout: automatic logical `0x72` RELEASE reported.
+- Fresh PRESS after expiry: accepted with a new token.
+- Six HEARTBEAT renewals: successful over approximately 3 seconds.
+- SEEK_FORWARD: physically stopped after explicit RELEASE.
+
+Final STATUS reported `state=IDLE`, `monitor=HEALTHY`, `cd_state=IDLE`,
+`cd_release_owed=0`, `cd_lease_expired=0`, `cd_last_result=CLIENT_RELEASE`,
+`last_byte=0x72`, `last_waveform=MATCH` and `receiver_integrity=HEALTHY`.
+These are software/monitor observations. The operator's physical NEXT,
+PREVIOUS and seek observations separately establish execution in those trials;
+TX_OK or MATCH alone never establishes receiver execution.
+
+Validation remains specific to this setup and the reported trials. No raw
+captures, complete per-trial replies, measured discrete gaps, deployed binary
+checksum or exact runtime/startup configuration were supplied. One-track
+behavior is not guaranteed across scheduling delays or playback states; the
+3-second renewal test does not establish indefinite physical endurance. This
+report does not newly validate held SEEK_BACKWARD/held TRACK_PREVIOUS, fault
+injection, shutdown cleanup, power-loss recovery, concurrent active CEC/Web
+control or another receiver/changer. Existing RELEASE/fault interlocks and the
+software inability to guarantee physical termination remain applicable.
+CONTEXT research restrictions are unchanged; no `0x17` research entry was
+validated or enabled by these ROOT trials.
