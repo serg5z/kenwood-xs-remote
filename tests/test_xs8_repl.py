@@ -3,7 +3,9 @@ import os
 import socketserver
 import tempfile
 import threading
+import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -18,6 +20,10 @@ class Handler(socketserver.StreamRequestHandler):
         command = self.rfile.readline().decode().strip()
         with self.server.lock:
             self.server.commands.append(command)
+            if (command.startswith("RESEARCH_TX_READ ") and
+                    self.server.drop_next_tx_read):
+                self.server.drop_next_tx_read = False
+                return  # Fake a peer closing before its reply.
             if command == "STATUS":
                 reply = "OK state=IDLE stop_owed=0 monitor=HEALTHY"
             elif command == "QUERY_STATUS":
@@ -78,6 +84,7 @@ class ReplTests(unittest.TestCase):
         self.server.first_reads = 0
         self.server.busy_next_read = False
         self.server.tx_wait_once = False
+        self.server.drop_next_tx_read = False
         self.thread = threading.Thread(target=self.server.serve_forever,
                                        daemon=True)
         self.thread.start()
@@ -139,6 +146,41 @@ class ReplTests(unittest.TestCase):
         self.assertIn("STATUS", self.server.commands)
         self.assertTrue(any("requested=0xFC" in x for x in self.output))
         self.assertTrue(any("requested=0xEC" in x for x in self.output))
+
+    def test_chain_observation_survives_closed_read_socket(self):
+        self.server.drop_next_tx_read = True
+        self.console.command("send 0xFC 0xEC --gap-ms 200")
+        self.assertEqual(self.server.commands.count(
+            "RESEARCH_CHAIN 2 200 1500 0xFC 0xEC"), 1)
+        self.assertGreaterEqual(self.server.commands.count(
+            "RESEARCH_TX_READ 1 0"), 2)
+        self.assertTrue(any("RESEARCH_TX_DONE" in x for x in self.output))
+        self.assertTrue(any("RESEARCH_DONE" in x for x in self.output))
+
+    def test_broken_pipe_on_read_retries_without_resending_chain(self):
+        original = repl.request
+        attempts = [0]
+
+        def transport(path, command):
+            if command == "RESEARCH_READ 1 0" and attempts[0] == 0:
+                attempts[0] += 1
+                raise BrokenPipeError("fake single-client handoff race")
+            return original(path, command)
+
+        with patch.object(repl, "request", side_effect=transport):
+            self.console.command("send 0xFC 0xEC --gap-ms 200")
+        self.assertEqual(attempts[0], 1)
+        self.assertEqual(self.server.commands.count(
+            "RESEARCH_CHAIN 2 200 1500 0xFC 0xEC"), 1)
+        self.assertTrue(any("RESEARCH_DONE" in x for x in self.output))
+
+    def test_observation_retry_expires_without_resending_tx(self):
+        with patch.object(repl, "request", side_effect=BrokenPipeError):
+            with self.assertRaisesRegex(ConnectionError,
+                                        "observation read unavailable"):
+                self.console._read_session("RESEARCH_READ 1 0",
+                                           time.monotonic() - 1)
+        self.assertEqual(self.server.commands, [])
 
     def test_parse_chain_limits_and_legacy_send(self):
         self.assertEqual(repl.parse_send(["send", "0x9C", "750"], 1500),

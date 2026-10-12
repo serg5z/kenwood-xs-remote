@@ -89,6 +89,21 @@ class Console:
         self.default_window = 1500
         self.history = []
 
+    def _read_session(self, command, deadline):
+        """Retry only indexed, read-only session requests after socket handoff."""
+        while True:
+            try:
+                reply = request(self.socket_path, command)
+                if reply != "ERR BUSY":
+                    return reply
+            except OSError as error:
+                if time.monotonic() >= deadline:
+                    raise ConnectionError(
+                        f"observation read unavailable: {command}") from error
+            if time.monotonic() >= deadline:
+                raise ConnectionError(f"observation read busy: {command}")
+            self.pause(0.05)
+
     def command(self, line):
         parts = shlex.split(line)
         if not parts:
@@ -141,26 +156,25 @@ class Console:
         try:
             while True:
                 if not tx_done:
-                    tx_report = request(self.socket_path,
-                                        f"RESEARCH_TX_READ {session} {tx_index}")
+                    tx_report = self._read_session(
+                        f"RESEARCH_TX_READ {session} {tx_index}", busy_until)
                     if tx_report.startswith("OK RESEARCH_TX_RECORD "):
                         self.output(tx_report)
                         tx_index += 1
                     elif tx_report.startswith("OK RESEARCH_TX_DONE "):
                         self.output(tx_report)
                         tx_done = True
-                    elif tx_report != "ERR BUSY" and not tx_report.startswith(
-                            "OK RESEARCH_TX_WAIT "):
+                    elif tx_report.startswith("OK RESEARCH_TX_WAIT "):
+                        self.pause(0.05)
+                    else:
                         self.output(tx_report)
                         self.history.append(f"{command}: {reply}; {tx_report}")
                         return
-                report = request(self.socket_path,
-                                 f"RESEARCH_READ {session} {index}")
+                report = self._read_session(
+                    f"RESEARCH_READ {session} {index}", busy_until)
                 if report.startswith("OK RESEARCH_RECORD "):
                     self.output(report)
                     index += 1
-                elif report == "ERR BUSY" and time.monotonic() < busy_until:
-                    self.pause(0.05)  # Another client owns the socket; never resend TX.
                 elif report.startswith("OK RESEARCH_WAIT "):
                     self.pause(0.05)
                 elif report.startswith("OK RESEARCH_DONE ") and not tx_done:
