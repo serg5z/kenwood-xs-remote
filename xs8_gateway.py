@@ -33,6 +33,9 @@ CD_FIELDS = {"cd_state", "cd_action", "cd_release_owed",
              "cd_lease_expired", "cd_last_result"}
 SOURCES = ("CD", "TUNER", "PHONO", "TV1", "TV2", "TAPE1", "TAPE2")
 EVIDENCED_SOURCES = ("CD", "TUNER", "PHONO", "TAPE1")
+CD_TRACK_ACTIONS = ("NEXT", "PREVIOUS")
+CD_BLOCKED_ACTIONS = ("PLAY_PAUSE", "STOP", "SEEK_FORWARD", "SEEK_BACKWARD")
+CD_WAVEFORMS = ("MATCH", "MISMATCH", "INVALID", "MISSING", "NOT_OBSERVED")
 
 
 class ServiceError(Exception):
@@ -136,6 +139,47 @@ def send_source(socket_path, source, timeout=1.0):
     raise MuteServiceError("INVALID_REPLY", "Invalid XS8 source reply")
 
 
+def send_cd_track(socket_path, action, timeout=3.0):
+    """One discrete PRESS/RELEASE pair; the service owns RELEASE and fault latching."""
+    if action not in CD_TRACK_ACTIONS:
+        raise MuteServiceError("REJECTED", "CD action is not allowlisted")
+    line = _send_control(socket_path, f"CD_TRACK_{action}\n".encode("ascii"),
+                         timeout, fake_only=False, max_reply=512)
+    parts = line.split()
+    if len(parts) == 9 and parts[2] == f"action={action}" and \
+            parts[8] == "receiver_execution=UNVERIFIED":
+        keys = ("press_gpio_tx", "press_waveform", "release_gpio_tx",
+                "release_waveform", "cd_result")
+        evidence = {}
+        for key, part in zip(keys, parts[3:8]):
+            name, _, value = part.partition("=")
+            if name != key:
+                break
+            evidence[key] = value
+        valid = (len(evidence) == 5 and
+                 evidence["press_gpio_tx"] in ("TX_OK", "TX_FAIL") and
+                 evidence["release_gpio_tx"] in ("TX_OK", "TX_FAIL") and
+                 evidence["press_waveform"] in CD_WAVEFORMS and
+                 evidence["release_waveform"] in CD_WAVEFORMS)
+        if valid:
+            evidence["receiver_execution"] = "UNVERIFIED"
+            if parts[:2] == ["OK", "CD_TRACK_TX"] and evidence == {
+                    "press_gpio_tx": "TX_OK", "press_waveform": "MATCH",
+                    "release_gpio_tx": "TX_OK", "release_waveform": "MATCH",
+                    "cd_result": "TX_VERIFIED", "receiver_execution": "UNVERIFIED"}:
+                return evidence
+            if parts[:2] == ["ERR", "CD_TRACK_UNCERTAIN"] and evidence["cd_result"] in (
+                    "PRESS_UNCERTAIN", "RELEASE_UNCERTAIN"):
+                raise MuteServiceError("SERVICE_UNCERTAIN", line, evidence)
+    if line == "ERR CD_FAULT_LATCHED":
+        raise MuteServiceError("CD_FAULT_LATCHED", line)
+    # A malformed TX report is uncertain, never a clean pre-TX refusal.
+    if (line.startswith("ERR ") and len(parts) >= 2 and
+            parts[1] not in ("CD_TRACK_TX", "CD_TRACK_UNCERTAIN")):
+        raise MuteServiceError("REJECTED", line)
+    raise MuteServiceError("INVALID_REPLY", "Invalid XS8 CD track reply")
+
+
 def send_receiver_query(socket_path):
     line = _send_control(socket_path, b"QUERY_STATUS\n", timeout=3.0,
                          fake_only=False, max_reply=2048)
@@ -235,7 +279,8 @@ def receiver_state(status):
             "receiver_execution": "UNVERIFIED"}
 
 
-def capabilities(mute_available=False, source_available=False, query_available=False):
+def capabilities(mute_available=False, source_available=False, query_available=False,
+                 cd_track_available=False):
     return {
         "api_version": "v0.1",
         "operations": {
@@ -256,8 +301,10 @@ def capabilities(mute_available=False, source_available=False, query_available=F
                 "reason": "TX and waveform do not confirm receiver execution; TV1, TV2 and TAPE2 lack controlled TX evidence",
             },
             "cd_transport": {
-                "classification": "unsupported", "enabled": False,
-                "reason": "CD transport is not implemented",
+                "classification": "unverified", "enabled": cd_track_available,
+                "available_actions": list(CD_TRACK_ACTIONS),
+                "blocked_actions": list(CD_BLOCKED_ACTIONS),
+                "reason": "TX and waveform do not confirm a track change; PLAY/PAUSE, STOP and held SEEK are not exposed",
             },
         },
     }
@@ -269,6 +316,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
     production_mute_enabled = False
     production_source_enabled = False
     receiver_query_enabled = False
+    cd_track_enabled = False
     https_origin = None
     sessions = None
 
@@ -276,7 +324,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return self.dev_mute_enabled or self.production_mute_enabled
 
     def control_enabled(self):
-        return self.mute_enabled() or self.production_source_enabled or self.receiver_query_enabled
+        return (self.mute_enabled() or self.production_source_enabled or
+                self.receiver_query_enabled or self.cd_track_enabled)
 
     def authenticated_user(self):
         # nginx overwrites this header with $remote_user after Basic Auth.
@@ -302,12 +351,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return None
         return session
 
-    def service_ready(self):
+    def service_status(self):
         try:
-            status = read_status(self.socket_path)
+            return read_status(self.socket_path)
         except ServiceError:
-            return False
-        return self.status_allows_mute(status)
+            return None
 
     @staticmethod
     def status_allows_mute(status):
@@ -315,6 +363,26 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 and status["stop_owed"] == "0" and status["context_may_be_open"] == "0"
                 and status.get("cd_state", "IDLE") == "IDLE"
                 and status.get("cd_release_owed", "0") == "0")
+
+    @classmethod
+    def status_allows_cd_track(cls, status):
+        # A service without CD STATUS fields cannot report a latched CD fault.
+        return "cd_state" in status and cls.status_allows_mute(status)
+
+    @staticmethod
+    def cd_fault(status):
+        # An active pair or hold legitimately owes RELEASE; an idle one does not.
+        return (status.get("cd_state") == "FAULT_LATCHED" or
+                (status.get("cd_state") == "IDLE" and
+                 status.get("cd_release_owed") == "1"))
+
+    def availability(self, status):
+        ready = status is not None and self.status_allows_mute(status)
+        return {"mute": self.mute_enabled() and ready,
+                "source": self.production_source_enabled and ready,
+                "query": self.receiver_query_enabled and ready,
+                "cd_track": (self.cd_track_enabled and status is not None and
+                             self.status_allows_cd_track(status))}
 
     def send_body(self, code, body, content_type, headers=None):
         self.send_response(code)
@@ -345,10 +413,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                  "status": status, "receiver": receiver_state(status)})
             return
         if path == "/api/v1/capabilities":
-            ready = self.current_session() is not None and self.service_ready()
-            self.send_json(200, capabilities(self.mute_enabled() and ready,
-                                              self.production_source_enabled and ready,
-                                              self.receiver_query_enabled and ready))
+            status = self.service_status() if self.current_session() is not None else None
+            available = self.availability(status)
+            self.send_json(200, capabilities(available["mute"], available["source"],
+                                              available["query"], available["cd_track"]))
             return
         if path == "/api/v1/session" and self.control_enabled():
             user = self.authenticated_user()
@@ -364,11 +432,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 headers = {"Set-Cookie": f"xs8_session={session_id}; Path=/; Secure; HttpOnly; SameSite=Strict"}
             else:
                 headers = None
-            ready = self.service_ready()
+            available = self.availability(self.service_status())
             self.send_json(200, {"csrf_token": session["csrf"],
-                                 "mute_available": self.mute_enabled() and ready,
-                                 "source_available": self.production_source_enabled and ready,
-                                 "receiver_query_available": self.receiver_query_enabled and ready}, headers)
+                                 "mute_available": available["mute"],
+                                 "source_available": available["source"],
+                                 "receiver_query_available": available["query"],
+                                 "cd_track_available": available["cd_track"]}, headers)
             return
         assets = {
             "/": ("index.html", "text/html; charset=utf-8"),
@@ -386,7 +455,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         is_mute = path == "/api/v1/mute" and self.mute_enabled()
         is_source = path == "/api/v1/source" and self.production_source_enabled
         is_query = path == "/api/v1/receiver/query" and self.receiver_query_enabled
-        if (not (is_mute or is_source or is_query) or
+        is_cd = path == "/api/v1/cd/track" and self.cd_track_enabled
+        if (not (is_mute or is_source or is_query or is_cd) or
                 not getattr(self.server, "proxy_peer_verified", False)):
             length = self.headers.get("Content-Length", "")
             if len(length) <= 4 and length.isdecimal() and 0 < int(length) <= 4096:
@@ -426,6 +496,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if body != b"{}":
                 self.send_json(400, {"error": "Expected JSON body {}"})
                 return
+        elif is_cd:
+            try:
+                pairs = json.loads(body, object_pairs_hook=list)
+                action = (pairs[0][1] if isinstance(pairs, list) and
+                          len(pairs) == 1 and isinstance(pairs[0], tuple) and
+                          pairs[0][0] == "action" else None)
+            except (UnicodeError, ValueError, TypeError, IndexError):
+                action = None
+            if not isinstance(action, str) or action not in CD_TRACK_ACTIONS:
+                self.send_json(400, {"error": "Expected one allowlisted CD action"})
+                return
+            now = time.monotonic()
+            if now - session.get("last_cd_track_request", float("-inf")) < 1.0:
+                session["csrf"] = secrets.token_urlsafe(32)
+                self.send_json(429, {"result": "TOO_FAST",
+                                     "receiver_execution": "UNVERIFIED"})
+                return
+            session["last_cd_track_request"] = now
         else:
             try:
                 pairs = json.loads(body, object_pairs_hook=list)
@@ -458,29 +546,48 @@ class GatewayHandler(BaseHTTPRequestHandler):
             session["last_query_request"] = now
         # Single use: a repeated request with the same token cannot dispatch again.
         session["csrf"] = secrets.token_urlsafe(32)
-        if (is_source or is_query or self.production_mute_enabled):
+        if (is_source or is_query or is_cd or self.production_mute_enabled):
             try:
                 status = read_status(self.socket_path)
             except ServiceError:
                 self.send_json(503, {"result": "UNAVAILABLE", "receiver_execution": "UNVERIFIED"})
                 return
-            if not self.status_allows_mute(status):
+            if is_cd and self.cd_fault(status):
+                self.send_json(409, {"result": "CD_FAULT_LATCHED",
+                                     "physical_check_required": True,
+                                     "receiver_execution": "UNVERIFIED"})
+                return
+            if is_cd and status.get("cd_state") in ("ACTIVE", "HOLDING"):
+                self.send_json(409, {"result": "CD_BUSY", "receiver_execution": "UNVERIFIED"})
+                return
+            if not (self.status_allows_cd_track(status) if is_cd
+                    else self.status_allows_mute(status)):
                 self.send_json(409, {"result": "NOT_ELIGIBLE", "receiver_execution": "UNVERIFIED"})
                 return
         try:
             reply = (send_mute(self.socket_path, fake_only=not self.production_mute_enabled)
                      if is_mute else send_receiver_query(self.socket_path) if is_query
+                     else send_cd_track(self.socket_path, action) if is_cd
                      else send_source(self.socket_path, source))
         except MuteServiceError as exc:
-            code = {"UNAVAILABLE": 503, "REJECTED": 409, "TIMEOUT": 504}.get(exc.result, 502)
+            code = {"UNAVAILABLE": 503, "REJECTED": 409, "CD_FAULT_LATCHED": 409,
+                    "TIMEOUT": 504}.get(exc.result, 502)
             payload = {"result": exc.result, "error": str(exc),
                        "receiver_execution": "UNVERIFIED"}
-            if is_source and exc.evidence:
+            if (is_source or is_cd) and exc.evidence:
                 payload.update(exc.evidence)
+            if is_cd:
+                payload["action"] = action
+                # Anything but a clean refusal may have moved the changer.
+                payload["physical_check_required"] = exc.result not in (
+                    "UNAVAILABLE", "REJECTED")
             self.send_json(code, payload)
             return
         payload = {"result": "SERVICE_TX_OK", "receiver_execution": "UNVERIFIED"}
-        if is_query:
+        if is_cd:
+            payload["action"] = action
+            payload.update(reply)
+        elif is_query:
             payload["result"] = reply
         elif is_mute:
             payload["service_reply"] = reply
@@ -540,6 +647,8 @@ def parse_args(argv=None):
                         help="enable evidenced source selection through the real local XS8 Service")
     parser.add_argument("--enable-receiver-query", action="store_true",
                         help="enable one explicit authenticated receiver status query")
+    parser.add_argument("--enable-cd-track", action="store_true",
+                        help="enable discrete CD NEXT/PREVIOUS through the real local XS8 Service")
     parser.add_argument("--https-origin", help="required exact HTTPS Origin for active controls")
     parser.add_argument("--systemd-socket", action="store_true",
                         help="serve read-only HTTP using the systemd Unix listener")
@@ -549,10 +658,10 @@ def parse_args(argv=None):
     if args.enable_dev_mute:
         parser.error("MUTE development gate is disabled in phase 2A")
     if args.enable_offline_mute and (args.enable_mute or args.enable_source or
-                                    args.enable_receiver_query):
+                                    args.enable_receiver_query or args.enable_cd_track):
         parser.error("offline and production MUTE modes are mutually exclusive")
     if (args.enable_offline_mute or args.enable_mute or args.enable_source or
-            args.enable_receiver_query):
+            args.enable_receiver_query or args.enable_cd_track):
         if not args.systemd_socket or not args.https_origin:
             parser.error("active controls require --systemd-socket and --https-origin")
         try:
@@ -610,6 +719,7 @@ def main(argv=None):
                     "production_mute_enabled": args.enable_mute,
                     "production_source_enabled": args.enable_source,
                     "receiver_query_enabled": args.enable_receiver_query,
+                    "cd_track_enabled": args.enable_cd_track,
                     "https_origin": args.https_origin, "sessions": {}})
     if args.systemd_socket:
         try:
@@ -617,11 +727,12 @@ def main(argv=None):
         except (OSError, ValueError) as exc:
             print(f"XS8 gateway socket activation failed: {exc}", file=sys.stderr)
             return 1
-        mode = ("PRODUCTION CONTROLS" if args.enable_mute and args.enable_source else
-                "PRODUCTION SOURCE" if args.enable_source else
-                "PRODUCTION MUTE" if args.enable_mute else
-                "RECEIVER QUERY" if args.enable_receiver_query else
-                "OFFLINE FAKE MUTE TEST" if args.enable_offline_mute else "read-only")
+        mode = ("OFFLINE FAKE MUTE TEST" if args.enable_offline_mute else
+                " + ".join(name for name, enabled in (
+                    ("PRODUCTION MUTE", args.enable_mute),
+                    ("PRODUCTION SOURCE", args.enable_source),
+                    ("RECEIVER QUERY", args.enable_receiver_query),
+                    ("CD TRACK", args.enable_cd_track)) if enabled) or "read-only")
         print(f"XS8 gateway listening on {GATEWAY_SOCKET} ({mode})")
     else:
         server = HTTPServer((args.bind, args.port), handler)

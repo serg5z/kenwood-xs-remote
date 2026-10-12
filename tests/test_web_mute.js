@@ -15,7 +15,7 @@ const sourceButtons = [];
 function element(id) {
   if (id === 'mute-button') return muteButton;
   if (id === 'sync-button') return syncButton;
-  if (!elements.has(id)) elements.set(id, { textContent: '' });
+  if (!elements.has(id)) elements.set(id, { textContent: '', dataset: {}, addEventListener() {} });
   return elements.get(id);
 }
 

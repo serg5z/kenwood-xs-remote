@@ -24,7 +24,7 @@ const context = {
     getElementById(id) {
       if (id === 'mute-button') return mute;
       if (id === 'sync-button') return sync;
-      if (!elements.has(id)) elements.set(id, { textContent: '' });
+      if (!elements.has(id)) elements.set(id, { textContent: '', dataset: {}, addEventListener() {} });
       return elements.get(id);
     },
     querySelectorAll() { return sources; },

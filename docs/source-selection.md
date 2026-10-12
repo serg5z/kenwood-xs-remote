@@ -1,6 +1,6 @@
 # Source selection v1: evidence and controlled rollout
 
-The service accepts `SELECT_SOURCE <name>` for the seven names below. It transmits only the four commands established in the controlled ROOT + CD-playing sweep. The Gateway additionally requires its explicit `--enable-source` gate, verified nginx Unix-socket peer UID, authenticated identity, exact HTTPS Origin, a session-bound one-use CSRF token, and a fresh eligible service STATUS. The checked-in systemd unit has no control gate. Volume and CD transport remain disabled in the Web UI.
+The service accepts `SELECT_SOURCE <name>` for the seven names below. It transmits only the four commands established in the controlled ROOT + CD-playing sweep. The Gateway additionally requires its explicit `--enable-source` gate, verified nginx Unix-socket peer UID, authenticated identity, exact HTTPS Origin, a session-bound one-use CSRF token, and a fresh eligible service STATUS. The checked-in systemd unit has no control gate. Volume remains disabled in the Web UI; CD NEXT/PREVIOUS has its own [default-off gate](web-api.md#cd-track-nextprevious-phase-a).
 
 All TX values here are **current logical TX bytes** (LSB first, short LOW = 0, long LOW = 1). Historical legacy TX converts as `logical = reverse8(~legacy)`. RX labels remain in their original decoder notation and are **not** converted with the TX formula. A received source broadcast or a TX waveform match does not prove that the receiver executed a Web request.
 

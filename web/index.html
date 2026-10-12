@@ -44,19 +44,11 @@
           <section class="control-group transport" aria-labelledby="transport-title">
             <div class="section-heading"><h2 id="transport-title">CD transport</h2><span>PLAYBACK</span></div>
             <div class="transport-grid">
-              <button disabled type="button" aria-label="Previous track">
+              <button id="cd-previous" disabled type="button" data-cd-action="PREVIOUS" aria-label="Previous track">
                 <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 5v14M19 6 9 12l10 6V6Z"/></svg>
                 <small>PREV</small>
               </button>
-              <button disabled type="button" aria-label="Play or pause">
-                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m4 5 9 7-9 7V5ZM17 5v14M21 5v14"/></svg>
-                <small>PLAY / PAUSE</small>
-              </button>
-              <button disabled type="button" aria-label="Stop">
-                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="5" width="14" height="14" rx="1"/></svg>
-                <small>STOP</small>
-              </button>
-              <button disabled type="button" aria-label="Next track">
+              <button id="cd-next" disabled type="button" data-cd-action="NEXT" aria-label="Next track">
                 <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m5 6 10 6-10 6V6ZM19 5v14"/></svg>
                 <small>NEXT</small>
               </button>
@@ -87,6 +79,7 @@
         <div><dt>Monitor health</dt><dd id="monitor">—</dd></div>
         <div><dt>Last TX</dt><dd id="tx">—</dd></div>
         <div><dt>Last waveform</dt><dd id="waveform">—</dd></div>
+        <div><dt>CD transport</dt><dd id="cd-state">—</dd></div>
       </dl>
       <p>TX_OK and waveform MATCH do not confirm receiver execution.</p>
     </details>

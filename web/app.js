@@ -2,14 +2,19 @@ const text = (id, value) => { document.getElementById(id).textContent = value; }
 const muteButton = document.getElementById('mute-button');
 const syncButton = document.getElementById('sync-button');
 const sourceButtons = [...document.querySelectorAll('.source-grid button[data-source]')];
+const cdButtons = [document.getElementById('cd-previous'), document.getElementById('cd-next')];
 let csrfToken = null;
 let serviceReady = false;
 let muteReady = false;
 let sourceReady = false;
 let queryReady = false;
+let cdReady = false;
+let cdFault = false;
 let enabledSources = [];
+let enabledCdActions = [];
 let controlBusy = false;
 let lastSourceAttempt = 0;
+let lastCdAttempt = 0;
 let controlResult = null;
 let refreshController = null;
 let refreshVersion = 0;
@@ -22,9 +27,16 @@ function updateControls() {
     button.disabled = controlBusy || !csrfToken || !serviceReady || !sourceReady ||
       !enabledSources.includes(button.dataset.source);
   }
+  for (const button of cdButtons) {
+    button.disabled = controlBusy || !csrfToken || !serviceReady || !cdReady ||
+      !enabledCdActions.includes(button.dataset.cdAction);
+  }
   const available = !controlBusy && serviceReady && csrfToken &&
-    (muteReady || sourceReady || queryReady);
-  text('availability-text', controlResult
+    (muteReady || sourceReady || queryReady || cdReady);
+  // A latched CD fault needs physical attention; never hide it behind a result.
+  text('availability-text', cdFault && !controlBusy
+    ? 'CD FAULT LATCHED · STOP AND INSPECT CHANGER'
+    : controlResult
     ? `${controlResult}${available ? '' : ' · CONTROLS UNAVAILABLE'}`
     : (available ? 'CONTROLS READY · RECEIVER ACTION UNVERIFIED'
       : 'CONTROLS UNAVAILABLE · SERVICE OR AUTHORIZATION NOT READY'));
@@ -56,7 +68,7 @@ function renderStatus(data) {
     renderReceiver(null, false);
     text('service', data ? 'Unavailable' : 'Unknown');
     text('summary-state', data ? 'Service unavailable' : 'Connection lost');
-    for (const id of ['state', 'monitor', 'tx', 'waveform']) text(id, '—');
+    for (const id of ['state', 'monitor', 'tx', 'waveform', 'cd-state']) text(id, '—');
     return;
   }
   const status = data.status;
@@ -67,6 +79,9 @@ function renderStatus(data) {
   text('monitor', status.monitor);
   text('tx', `${status.last_byte} · ${status.last_gpio_tx}`);
   text('waveform', status.last_waveform);
+  text('cd-state', status.cd_state
+    ? `${status.cd_state} · ${status.cd_last_result || '—'}${status.cd_release_owed === '1' ? ' · RELEASE OWED' : ''}`
+    : '—');
 }
 
 function applyRefresh(statusData, sessionData, capabilitiesData) {
@@ -80,6 +95,14 @@ function applyRefresh(statusData, sessionData, capabilitiesData) {
   sourceReady = !!csrfToken && sessionData.source_available === true &&
     !!source && source.enabled === true && Array.isArray(source.available_sources);
   enabledSources = sourceReady ? source.available_sources : [];
+  const cd = capabilitiesData && capabilitiesData.operations &&
+    capabilitiesData.operations.cd_transport;
+  cdFault = !!status && (status.cd_state === 'FAULT_LATCHED' ||
+    (status.cd_state === 'IDLE' && status.cd_release_owed === '1'));
+  cdReady = !!csrfToken && sessionData.cd_track_available === true &&
+    !!status && status.cd_state === 'IDLE' && status.cd_release_owed === '0' &&
+    !!cd && cd.enabled === true && Array.isArray(cd.available_actions);
+  enabledCdActions = cdReady ? cd.available_actions : [];
   const query = capabilitiesData && capabilitiesData.operations &&
     capabilitiesData.operations.receiver_query;
   queryReady = !!csrfToken && sessionData.receiver_query_available === true &&
@@ -119,7 +142,8 @@ async function refresh() {
         if (session.ok && typeof session.data.csrf_token === 'string') {
           sessionData = session.data;
           if (session.data.source_available === true ||
-              session.data.receiver_query_available === true) {
+              session.data.receiver_query_available === true ||
+              session.data.cd_track_available === true) {
             try {
               const capabilities = await fetchJson('/api/v1/capabilities', {
                 cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
@@ -153,6 +177,7 @@ async function sendControl(url, body, success, failure) {
   }
   const token = csrfToken;
   csrfToken = null; muteReady = false; sourceReady = false; queryReady = false;
+  cdReady = false;
   updateControls();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 6000);
@@ -166,6 +191,7 @@ async function sendControl(url, body, success, failure) {
   } catch (_) {
     controlResult = url.endsWith('/mute') ? 'MUTE RESULT UNKNOWN · CHECK RECEIVER'
       : url.endsWith('/query') ? 'SYNC RESULT UNKNOWN · CHECK RECEIVER'
+      : url.endsWith('/cd/track') ? 'CD RESULT UNKNOWN · CHECK CHANGER'
       : 'SOURCE RESULT UNKNOWN · CHECK RECEIVER';
   } finally {
     clearTimeout(timeout);
@@ -196,6 +222,26 @@ for (const button of sourceButtons) {
     await sendControl('/api/v1/source', JSON.stringify({ source: button.dataset.source }),
       `${button.dataset.source} TX REPORTED · SELECTION UNVERIFIED`,
       (data) => `SOURCE ${data.result || 'FAILED'} · SELECTION UNVERIFIED`);
+  });
+}
+
+function cdFailure(label, data) {
+  const result = data && data.result || 'FAILED';
+  if (result === 'CD_FAULT_LATCHED') return 'CD FAULT LATCHED · STOP AND INSPECT CHANGER';
+  if (data && data.physical_check_required === true) {
+    return `${label} ${result} · CHECK CHANGER`;
+  }
+  return `${label} ${result} · NOTHING SENT`;
+}
+
+for (const button of cdButtons) {
+  button.addEventListener('click', async () => {
+    if (button.disabled || controlBusy || Date.now() - lastCdAttempt < 1000) return;
+    lastCdAttempt = Date.now();
+    const label = button.dataset.cdAction === 'NEXT' ? 'NEXT' : 'PREV';
+    await sendControl('/api/v1/cd/track', JSON.stringify({ action: button.dataset.cdAction }),
+      `${label} TX VERIFIED · TRACK CHANGE UNVERIFIED`,
+      (data) => cdFailure(label, data));
   });
 }
 
