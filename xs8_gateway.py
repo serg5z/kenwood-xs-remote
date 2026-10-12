@@ -10,6 +10,7 @@ import socket
 import socketserver
 import struct
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -36,6 +37,12 @@ EVIDENCED_SOURCES = ("CD", "TUNER", "PHONO", "TAPE1")
 CD_TRACK_ACTIONS = ("NEXT", "PREVIOUS")
 CD_BLOCKED_ACTIONS = ("PLAY_PAUSE", "STOP", "SEEK_FORWARD", "SEEK_BACKWARD")
 CD_WAVEFORMS = ("MATCH", "MISMATCH", "INVALID", "MISSING", "NOT_OBSERVED")
+# Experimental spacing from one completed CD track dispatch to the next accepted
+# one. The only physical evidence for separate presses is one ~100 ms
+# RELEASE-to-PRESS chain; the bounds keep at least 2x that margin and allow
+# returning to the Phase A 1 s value.
+CD_TRACK_INTERVAL_MS = 250
+CD_TRACK_INTERVAL_RANGE_MS = (200, 1000)
 
 
 class ServiceError(Exception):
@@ -280,7 +287,7 @@ def receiver_state(status):
 
 
 def capabilities(mute_available=False, source_available=False, query_available=False,
-                 cd_track_available=False):
+                 cd_track_available=False, cd_track_interval_ms=CD_TRACK_INTERVAL_MS):
     return {
         "api_version": "v0.1",
         "operations": {
@@ -304,6 +311,7 @@ def capabilities(mute_available=False, source_available=False, query_available=F
                 "classification": "unverified", "enabled": cd_track_available,
                 "available_actions": list(CD_TRACK_ACTIONS),
                 "blocked_actions": list(CD_BLOCKED_ACTIONS),
+                "min_interval_ms": cd_track_interval_ms,
                 "reason": "TX and waveform do not confirm a track change; PLAY/PAUSE, STOP and held SEEK are not exposed",
             },
         },
@@ -317,6 +325,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
     production_source_enabled = False
     receiver_query_enabled = False
     cd_track_enabled = False
+    cd_track_interval_ms = CD_TRACK_INTERVAL_MS
     https_origin = None
     sessions = None
 
@@ -416,7 +425,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             status = self.service_status() if self.current_session() is not None else None
             available = self.availability(status)
             self.send_json(200, capabilities(available["mute"], available["source"],
-                                              available["query"], available["cd_track"]))
+                                              available["query"], available["cd_track"],
+                                              self.cd_track_interval_ms))
             return
         if path == "/api/v1/session" and self.control_enabled():
             user = self.authenticated_user()
@@ -450,7 +460,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         self.send_json(404, {"error": "Not found"})
 
+    def cd_track_state(self):
+        # Server-wide, not per session: spacing protects the one changer.
+        return self.server.__dict__.setdefault(
+            "cd_track", {"lock": threading.Lock(), "completed": float("-inf")})
+
+    def dispatch_cd_track(self, action):
+        try:
+            return send_cd_track(self.socket_path, action)
+        finally:
+            # Any dispatch outcome, including timeout, starts the interval.
+            self.cd_track_state()["completed"] = time.monotonic()
+
     def do_POST(self):
+        self.held_cd_lock = None
+        try:
+            self.handle_post()
+        finally:
+            if self.held_cd_lock is not None:
+                self.held_cd_lock.release()
+
+    def handle_post(self):
         path = urlsplit(self.path).path
         is_mute = path == "/api/v1/mute" and self.mute_enabled()
         is_source = path == "/api/v1/source" and self.production_source_enabled
@@ -507,13 +537,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not isinstance(action, str) or action not in CD_TRACK_ACTIONS:
                 self.send_json(400, {"error": "Expected one allowlisted CD action"})
                 return
-            now = time.monotonic()
-            if now - session.get("last_cd_track_request", float("-inf")) < 1.0:
+            state = self.cd_track_state()
+            if not state["lock"].acquire(blocking=False):
+                session["csrf"] = secrets.token_urlsafe(32)
+                self.send_json(409, {"result": "CD_BUSY", "receiver_execution": "UNVERIFIED"})
+                return
+            self.held_cd_lock = state["lock"]
+            if (time.monotonic() - state["completed"]) * 1000 < self.cd_track_interval_ms:
                 session["csrf"] = secrets.token_urlsafe(32)
                 self.send_json(429, {"result": "TOO_FAST",
+                                     "min_interval_ms": self.cd_track_interval_ms,
                                      "receiver_execution": "UNVERIFIED"})
                 return
-            session["last_cd_track_request"] = now
         else:
             try:
                 pairs = json.loads(body, object_pairs_hook=list)
@@ -567,7 +602,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         try:
             reply = (send_mute(self.socket_path, fake_only=not self.production_mute_enabled)
                      if is_mute else send_receiver_query(self.socket_path) if is_query
-                     else send_cd_track(self.socket_path, action) if is_cd
+                     else self.dispatch_cd_track(action) if is_cd
                      else send_source(self.socket_path, source))
         except MuteServiceError as exc:
             code = {"UNAVAILABLE": 503, "REJECTED": 409, "CD_FAULT_LATCHED": 409,
@@ -649,6 +684,11 @@ def parse_args(argv=None):
                         help="enable one explicit authenticated receiver status query")
     parser.add_argument("--enable-cd-track", action="store_true",
                         help="enable discrete CD NEXT/PREVIOUS through the real local XS8 Service")
+    parser.add_argument("--cd-track-interval-ms", type=int,
+                        help="experimental minimum ms from one completed CD track "
+                             f"command to the next (default {CD_TRACK_INTERVAL_MS}, "
+                             f"range {CD_TRACK_INTERVAL_RANGE_MS[0]}-"
+                             f"{CD_TRACK_INTERVAL_RANGE_MS[1]})")
     parser.add_argument("--https-origin", help="required exact HTTPS Origin for active controls")
     parser.add_argument("--systemd-socket", action="store_true",
                         help="serve read-only HTTP using the systemd Unix listener")
@@ -657,6 +697,14 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.enable_dev_mute:
         parser.error("MUTE development gate is disabled in phase 2A")
+    if args.cd_track_interval_ms is not None:
+        low, high = CD_TRACK_INTERVAL_RANGE_MS
+        if not args.enable_cd_track:
+            parser.error("--cd-track-interval-ms requires --enable-cd-track")
+        if not low <= args.cd_track_interval_ms <= high:
+            parser.error(f"--cd-track-interval-ms must be {low}-{high}")
+    else:
+        args.cd_track_interval_ms = CD_TRACK_INTERVAL_MS
     if args.enable_offline_mute and (args.enable_mute or args.enable_source or
                                     args.enable_receiver_query or args.enable_cd_track):
         parser.error("offline and production MUTE modes are mutually exclusive")
@@ -720,6 +768,7 @@ def main(argv=None):
                     "production_source_enabled": args.enable_source,
                     "receiver_query_enabled": args.enable_receiver_query,
                     "cd_track_enabled": args.enable_cd_track,
+                    "cd_track_interval_ms": args.cd_track_interval_ms,
                     "https_origin": args.https_origin, "sessions": {}})
     if args.systemd_socket:
         try:
@@ -732,7 +781,8 @@ def main(argv=None):
                     ("PRODUCTION MUTE", args.enable_mute),
                     ("PRODUCTION SOURCE", args.enable_source),
                     ("RECEIVER QUERY", args.enable_receiver_query),
-                    ("CD TRACK", args.enable_cd_track)) if enabled) or "read-only")
+                    (f"CD TRACK {args.cd_track_interval_ms} ms", args.enable_cd_track))
+                    if enabled) or "read-only")
         print(f"XS8 gateway listening on {GATEWAY_SOCKET} ({mode})")
     else:
         server = HTTPServer((args.bind, args.port), handler)

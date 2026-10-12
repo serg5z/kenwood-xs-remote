@@ -14,7 +14,10 @@ let enabledSources = [];
 let enabledCdActions = [];
 let controlBusy = false;
 let lastSourceAttempt = 0;
-let lastCdAttempt = 0;
+// Spacing from one completed CD request to the next, as configured by the
+// Gateway. Without a valid value, keep the conservative Phase A 1 s.
+let cdIntervalMs = 1000;
+let lastCdCompleted = -Infinity;
 let controlResult = null;
 let refreshController = null;
 let refreshVersion = 0;
@@ -103,6 +106,8 @@ function applyRefresh(statusData, sessionData, capabilitiesData) {
     !!status && status.cd_state === 'IDLE' && status.cd_release_owed === '0' &&
     !!cd && cd.enabled === true && Array.isArray(cd.available_actions);
   enabledCdActions = cdReady ? cd.available_actions : [];
+  cdIntervalMs = cd && Number.isInteger(cd.min_interval_ms) &&
+    cd.min_interval_ms >= 200 && cd.min_interval_ms <= 1000 ? cd.min_interval_ms : 1000;
   const query = capabilitiesData && capabilitiesData.operations &&
     capabilitiesData.operations.receiver_query;
   queryReady = !!csrfToken && sessionData.receiver_query_available === true &&
@@ -195,6 +200,7 @@ async function sendControl(url, body, success, failure) {
       : 'SOURCE RESULT UNKNOWN · CHECK RECEIVER';
   } finally {
     clearTimeout(timeout);
+    if (url.endsWith('/cd/track')) lastCdCompleted = Date.now();
     controlBusy = false;
     updateControls();
     await refresh();
@@ -236,8 +242,8 @@ function cdFailure(label, data) {
 
 for (const button of cdButtons) {
   button.addEventListener('click', async () => {
-    if (button.disabled || controlBusy || Date.now() - lastCdAttempt < 1000) return;
-    lastCdAttempt = Date.now();
+    // Taps while a request or its token refresh is pending are dropped, never queued.
+    if (button.disabled || controlBusy || Date.now() - lastCdCompleted < cdIntervalMs) return;
     const label = button.dataset.cdAction === 'NEXT' ? 'NEXT' : 'PREV';
     await sendControl('/api/v1/cd/track', JSON.stringify({ action: button.dataset.cdAction }),
       `${label} TX VERIFIED · TRACK CHANGE UNVERIFIED`,
