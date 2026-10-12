@@ -6,6 +6,7 @@
 #include "xs8_research.h"
 
 #include <atomic>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -15,6 +16,7 @@
 #include <cctype>
 #include <optional>
 #include <string>
+#include <vector>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -137,9 +139,9 @@ bool parse_research_window(const std::string& line, long& window)
         window >= 1 && window <= kMaxResearchWindowMs;
 }
 
-bool parse_research_index(const std::string& line, uint64_t& id, size_t& index)
+bool parse_research_index(const std::string& line, const char *prefix,
+                          uint64_t& id, size_t& index)
 {
-    constexpr const char *prefix = "RESEARCH_READ ";
     if (line.compare(0, std::strlen(prefix), prefix) != 0) return false;
     const std::string args = line.substr(std::strlen(prefix));
     const size_t separator = args.find(' ');
@@ -198,12 +200,15 @@ int main(int argc, char **argv)
     const char *socket_path = "/tmp/kenwood-xs8.sock";
     bool authorized = false;
     bool research_tx_enabled = false;
+    bool research_chain_enabled = false;
     long hold_ms = 2000;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--allow-unrecovered-start") == 0)
             authorized = true;
         else if (std::strcmp(argv[i], "--enable-research-tx") == 0)
             research_tx_enabled = true;
+        else if (std::strcmp(argv[i], "--enable-research-chain") == 0)
+            research_chain_enabled = true;
         else if (std::strcmp(argv[i], "--socket") == 0 && i + 1 < argc)
             socket_path = argv[++i];
         else if (std::strcmp(argv[i], "--max-hold-ms") == 0 && i + 1 < argc) {
@@ -215,6 +220,7 @@ int main(int argc, char **argv)
         } else {
             std::fprintf(stderr, "Usage: %s [--socket PATH] "
                 "[--allow-unrecovered-start] [--enable-research-tx] "
+                "[--enable-research-chain] "
                 "[--max-hold-ms 100..3000]\n",
                 argv[0]);
             return 2;
@@ -247,13 +253,15 @@ int main(int argc, char **argv)
     Xs8ServiceCore core(transmitter, VolumeControl::Ms(hold_ms), authorized,
                         [] { return stopping != 0; });
     std::fprintf(stderr, "XS8 service listening on %s; state=%s "
-                         "research_tx=%s\n",
+                         "research_tx=%s research_chain=%s\n",
         socket_path, authorized ? "IDLE (operator authorized)" : "BOOT_INHIBIT",
-        research_tx_enabled ? "ENABLED" : "DISABLED");
+        research_tx_enabled ? "ENABLED" : "DISABLED",
+        research_chain_enabled ? "ENABLED" : "DISABLED");
     int client = -1;
     std::string input;
     std::optional<Xs8QueryStatus> query;
     std::optional<Xs8ResearchSession> research;
+    std::optional<Xs8ResearchChain> chain;
     uint64_t next_research_id = 1;
     bool research_tx_uncertain = false;
     uint64_t query_cursor = 0;
@@ -274,6 +282,50 @@ int main(int argc, char **argv)
             } while (copied == 16);
             if (!xs8_monitor_healthy(monitor)) research->monitor_failed();
             int64_t now_ns = xs8_gpio_now_ns();
+            if (chain && chain->active() && research->id() == chain->id()) {
+                if (stopping || now_ns <= 0 ||
+                    !xs8_monitor_healthy(monitor) ||
+                    !research->integrity_ok()) {
+                    chain->abort(now_ns > 0 ? (uint64_t)now_ns : 0,
+                        stopping ? "SHUTDOWN" : "CAPTURE_OR_MONITOR_FAILED",
+                        *research);
+                } else {
+                    chain->tick((uint64_t)now_ns,
+                        [&] { return core.research_ready(
+                            VolumeControl::Clock::now(), true); },
+                        [&](uint8_t byte) {
+                            std::fprintf(stderr,
+                                "XS8 RESEARCH_CHAIN id=%llu requested=0x%02X\n",
+                                (unsigned long long)chain->id(), byte);
+                            std::string outcome = core.research_send(
+                                byte, VolumeControl::Clock::now(), true);
+                            const bool attempted =
+                                outcome.find(" gpio_tx=") != std::string::npos;
+                            const ServiceTxEvidence evidence =
+                                transmitter.last_evidence();
+                            const char *waveform =
+                                !attempted ? "NOT_OBSERVED" :
+                                evidence.waveform == WaveformEvidence::MATCH ? "MATCH" :
+                                evidence.waveform == WaveformEvidence::MISMATCH ? "MISMATCH" :
+                                evidence.waveform == WaveformEvidence::INVALID ? "INVALID" :
+                                evidence.waveform == WaveformEvidence::MISSING ? "MISSING" :
+                                "NOT_OBSERVED";
+                            const bool completed = attempted &&
+                                evidence.gpio_completed;
+                            std::fprintf(stderr,
+                                "XS8 RESEARCH_CHAIN id=%llu outcome=%s\n",
+                                (unsigned long long)chain->id(), outcome.c_str());
+                            return Xs8ResearchChain::Attempt{byte,
+                                attempted ? transmitter.last_start_ns() : 0,
+                                attempted ? transmitter.last_end_ns() : 0,
+                                completed, waveform};
+                        }, *research);
+                    if (chain->uncertain()) research_tx_uncertain = true;
+                }
+                if (!chain->active())
+                    std::fprintf(stderr, "XS8 RESEARCH_CHAIN %s",
+                                 chain->read(4).c_str());
+            }
             if (now_ns <= 0) {
                 research->monitor_failed();
                 research->finish(research->deadline_ns());
@@ -408,6 +460,55 @@ int main(int argc, char **argv)
                 long research_window = 0;
                 uint64_t research_id = 0;
                 size_t research_index = 0;
+                std::vector<uint8_t> chain_bytes;
+                long chain_gap = 0;
+                if (xs8_parse_research_chain(line, chain_bytes, chain_gap,
+                                         research_window)) {
+                    std::string denied;
+                    if (!research_tx_enabled || !research_chain_enabled)
+                        denied = "ERR RESEARCH reason=CHAIN_DISABLED\n";
+                    else if (research_tx_uncertain)
+                        denied = "ERR RESEARCH reason=TX_UNCERTAIN_LATCHED\n";
+                    else if (research && research->active())
+                        denied = "ERR RESEARCH reason=SESSION_BUSY\n";
+                    else if (stopping)
+                        denied = "ERR RESEARCH reason=SHUTDOWN\n";
+                    else if (std::find(chain_bytes.begin(), chain_bytes.end(),
+                                       0x17) != chain_bytes.end())
+                        denied = "ERR RESEARCH reason=CONTEXT_ENTRY_FORBIDDEN\n";
+                    else denied = core.research_ready(received);
+                    if (!denied.empty()) {
+                        if (!reply(client, denied)) failed = true;
+                        continue;
+                    }
+                    const int64_t start = xs8_gpio_now_ns();
+                    if (start <= 0) {
+                        if (!reply(client,
+                                   "ERR RESEARCH reason=CLOCK_FAILED\n"))
+                            failed = true;
+                        continue;
+                    }
+                    const uint64_t id = next_research_id++;
+                    research.emplace(id, xs8_monitor_checkpoint(monitor),
+                        (uint64_t)start, UINT64_MAX, false);
+                    research->set_chain();
+                    chain.emplace(id, chain_bytes,
+                        (uint64_t)chain_gap * 1000000ULL,
+                        (uint64_t)research_window * 1000000ULL);
+                    std::fprintf(stderr,
+                        "XS8 RESEARCH_CHAIN id=%llu count=%zu gap_ms=%ld "
+                        "window_ms=%ld context=ROOT_ASSUMED\n",
+                        (unsigned long long)id, chain_bytes.size(),
+                        chain_gap, research_window);
+                    char detail[160];
+                    std::snprintf(detail, sizeof(detail),
+                        "OK RESEARCH_CHAIN id=%llu count=%zu gap_ms=%ld "
+                        "window_ms=%ld context=ROOT_ASSUMED\n",
+                        (unsigned long long)id, chain_bytes.size(),
+                        chain_gap, research_window);
+                    if (!reply(client, detail)) failed = true;
+                    continue;
+                }
                 if (parse_research_send(line, research_byte, research_window)) {
                     std::string result;
                     if (!research_tx_enabled)
@@ -498,13 +599,30 @@ int main(int argc, char **argv)
                     if (!reply(client, detail)) failed = true;
                     continue;
                 }
-                if (parse_research_index(line, research_id,
+                if (parse_research_index(line, "RESEARCH_READ ", research_id,
                                          research_index)) {
                     if (!research || research->id() != research_id) {
                         if (!reply(client,
                                    "ERR RESEARCH reason=UNKNOWN_SESSION\n"))
                             failed = true;
+                    } else if (chain && chain->active() &&
+                               chain->id() == research_id) {
+                        char detail[80];
+                        std::snprintf(detail, sizeof(detail),
+                            "OK RESEARCH_WAIT id=%llu count=0\n",
+                            (unsigned long long)research_id);
+                        if (!reply(client, detail)) failed = true;
                     } else if (!reply(client, research->read(research_index)))
+                        failed = true;
+                    continue;
+                }
+                if (parse_research_index(line, "RESEARCH_TX_READ ",
+                                         research_id, research_index)) {
+                    if (!chain || chain->id() != research_id) {
+                        if (!reply(client,
+                                   "ERR RESEARCH reason=UNKNOWN_SESSION\n"))
+                            failed = true;
+                    } else if (!reply(client, chain->read(research_index)))
                         failed = true;
                     continue;
                 }
@@ -514,6 +632,14 @@ int main(int argc, char **argv)
                                    "ERR RESEARCH reason=UNKNOWN_SESSION\n"))
                             failed = true;
                     } else {
+                        if (chain && chain->id() == research_id &&
+                            chain->active()) {
+                            int64_t now_ns = xs8_gpio_now_ns();
+                            chain->abort(now_ns > 0 ? (uint64_t)now_ns : 0,
+                                         "CANCELLED", *research);
+                            if (chain->uncertain())
+                                research_tx_uncertain = true;
+                        }
                         research->cancel();
                         std::fprintf(stderr, "XS8 RESEARCH_CANCEL id=%llu\n",
                             (unsigned long long)research_id);
@@ -532,6 +658,11 @@ int main(int argc, char **argv)
                     continue;
                 }
                 if (line == "QUERY_STATUS") {
+                    if (chain && chain->active()) {
+                        if (!reply(client, "ERR RESEARCH reason=SESSION_BUSY\n"))
+                            failed = true;
+                        continue;
+                    }
                     if (!input.empty()) {
                         if (!reply(client, "ERR QUERY_STATUS reason=PIPELINED\n"))
                             failed = true;
@@ -561,6 +692,12 @@ int main(int argc, char **argv)
                 }
                 if (line == "STATUS")
                     core.set_receiver_status(receiver.status_fields());
+                else if (chain && chain->active() &&
+                         line.compare(0, 15, "VOLUME_RELEASE ") != 0) {
+                    if (!reply(client, "ERR RESEARCH reason=SESSION_BUSY\n"))
+                        failed = true;
+                    continue;
+                }
                 if (!reply(client, core.command(line, received, received))) {
                     failed = true;
                     break;

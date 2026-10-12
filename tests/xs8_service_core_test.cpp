@@ -304,6 +304,8 @@ static void test_research_tx_interlocks()
     inhibited.connected();
     assert(inhibited.research_send(0x9C, at(1)) ==
            "ERR RESEARCH reason=BOOT_INHIBIT\n");
+    assert(inhibited.research_send(0x9C, at(1), true) ==
+           "ERR RESEARCH reason=BOOT_INHIBIT\n");
     assert(inhibited_tx.sent.empty());
 
     FakeTx tx;
@@ -318,10 +320,17 @@ static void test_research_tx_interlocks()
            "ERR RESEARCH_TX gpio_tx=TX_OK waveform=MISSING "
            "receiver_execution=UNVERIFIED");
     assert(tx.sent == (std::vector<uint8_t>{0x9C, 0x42}));
+    core.disconnected(at(2));
+    assert(core.research_send(0x11, at(3)) ==
+           "ERR RESEARCH reason=NO_CLIENT\n");
+    assert(core.research_send(0x11, at(3), true) ==
+           "OK RESEARCH_TX gpio_tx=TX_OK waveform=MATCH "
+           "receiver_execution=UNVERIFIED");
+    assert(tx.sent.back() == 0x11);
     tx.healthy = false;
-    assert(core.research_send(0xBC, at(3)) ==
+    assert(core.research_send(0xBC, at(3), true) ==
            "ERR RESEARCH reason=MONITOR_FAILED\n");
-    assert(tx.sent.size() == 2);
+    assert(tx.sent.size() == 3);
 
     FakeTx holding_tx;
     Xs8ServiceCore holding(holding_tx, Ms(2000), true);

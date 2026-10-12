@@ -26,6 +26,21 @@ class Handler(socketserver.StreamRequestHandler):
                 reply = ("OK RESEARCH_TX gpio_tx=TX_OK waveform=MATCH "
                          "receiver_execution=UNVERIFIED id=1 "
                          "tx_start_ns=10 tx_end_ns=100 deadline_ns=200")
+            elif command.startswith("RESEARCH_CHAIN "):
+                reply = "OK RESEARCH_CHAIN id=1 count=2 gap_ms=200 window_ms=1500"
+            elif command == "RESEARCH_TX_READ 1 0":
+                if self.server.tx_wait_once:
+                    self.server.tx_wait_once = False
+                    reply = "OK RESEARCH_TX_WAIT id=1 count=0 planned=2"
+                else:
+                    reply = ("OK RESEARCH_TX_RECORD id=1 index=0 requested=0xFC "
+                             "tx_start_ns=10 tx_end_ns=100 gpio_tx=TX_OK waveform=MATCH")
+            elif command == "RESEARCH_TX_READ 1 1":
+                reply = ("OK RESEARCH_TX_RECORD id=1 index=1 requested=0xEC "
+                         "tx_start_ns=200000100 tx_end_ns=200000200 "
+                         "gpio_tx=TX_OK waveform=MATCH")
+            elif command == "RESEARCH_TX_READ 1 2":
+                reply = "OK RESEARCH_TX_DONE id=1 count=2 planned=2 aborted=0"
             elif command.startswith("RESEARCH_OBSERVE "):
                 reply = "OK RESEARCH_OBSERVE id=1 start_ns=10 deadline_ns=200"
             elif command == "RESEARCH_READ 1 0":
@@ -62,6 +77,7 @@ class ReplTests(unittest.TestCase):
         self.server.commands = []
         self.server.first_reads = 0
         self.server.busy_next_read = False
+        self.server.tx_wait_once = False
         self.thread = threading.Thread(target=self.server.serve_forever,
                                        daemon=True)
         self.thread.start()
@@ -110,6 +126,33 @@ class ReplTests(unittest.TestCase):
         self.console.command("send 0x9C")
         self.assertIn("RESEARCH_CANCEL 1", self.server.commands)
         self.assertEqual(self.server.commands.count("RESEARCH_SEND 0x9C 1500"), 1)
+
+    def test_chain_is_one_request_with_individual_tx_reports(self):
+        self.server.tx_wait_once = True
+        self.console.pause = lambda _: self.assertIn(
+            "state=IDLE", repl.request(self.path, "STATUS"))
+        self.console.command("send 0xFC 0xEC --gap-ms 200")
+        self.assertEqual(self.server.commands.count(
+            "RESEARCH_CHAIN 2 200 1500 0xFC 0xEC"), 1)
+        self.assertIn("RESEARCH_TX_READ 1 2", self.server.commands)
+        self.assertIn("RESEARCH_READ 1 1", self.server.commands)
+        self.assertIn("STATUS", self.server.commands)
+        self.assertTrue(any("requested=0xFC" in x for x in self.output))
+        self.assertTrue(any("requested=0xEC" in x for x in self.output))
+
+    def test_parse_chain_limits_and_legacy_send(self):
+        self.assertEqual(repl.parse_send(["send", "0x9C", "750"], 1500),
+                         "RESEARCH_SEND 0x9C 750")
+        self.assertEqual(repl.parse_send(
+            ["send", "0xFC", "0xEC", "--observe-ms", "750"], 1500),
+            "RESEARCH_CHAIN 2 200 750 0xFC 0xEC")
+        for args in (["send"], ["send", "0xFC", "0xEC", "0xAA", "0xBB", "0xCC"],
+                     ["send", "0xFC", "0xEC", "--gap-ms", "0"],
+                     ["send", "0xFC", "0xEC", "--gap-ms", "1001"],
+                     ["send", "0xFC", "0xEC", "--observe-ms", "5001"],
+                     ["send", "0xFC", "0xEC", "--gap-ms", "200", "--gap-ms", "200"]):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                repl.parse_send(args, 1500)
 
 
 if __name__ == "__main__":

@@ -145,13 +145,15 @@ std::string Xs8ServiceCore::begin_query_status(Time now)
     return {};
 }
 
-std::string Xs8ServiceCore::research_ready(Time now)
+std::string Xs8ServiceCore::research_ready(Time now, bool accepted_session)
 {
     const auto before = volume_.state();
     const bool unresolved = volume_.stop_owed() ||
                             volume_.context_may_be_open();
     tick(now);
-    if (!client_connected_) return "ERR RESEARCH reason=NO_CLIENT\n";
+    // A previously authorized chained session outlives its request socket.
+    if (!client_connected_ && !accepted_session)
+        return "ERR RESEARCH reason=NO_CLIENT\n";
     if (!tx_.monitor_healthy()) return "ERR RESEARCH reason=MONITOR_FAILED\n";
     if (before != VolumeControl::State::IDLE ||
         volume_.state() != VolumeControl::State::IDLE)
@@ -161,9 +163,10 @@ std::string Xs8ServiceCore::research_ready(Time now)
     return {};
 }
 
-std::string Xs8ServiceCore::research_send(uint8_t byte, Time now)
+std::string Xs8ServiceCore::research_send(uint8_t byte, Time now,
+                                         bool accepted_session)
 {
-    std::string denied = research_ready(now);
+    std::string denied = research_ready(now, accepted_session);
     if (!denied.empty()) return denied;
     const bool verified = tx_.send(byte);
     const ServiceTxEvidence evidence = tx_.last_evidence();

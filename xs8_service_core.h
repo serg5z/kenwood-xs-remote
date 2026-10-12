@@ -36,8 +36,9 @@ public:
     std::string begin_query_status(Time now);
     // Empty when a single ROOT research TX may be attempted. Caller also
     // enforces the separate default-off research authorization flag.
-    std::string research_ready(Time now);
-    std::string research_send(uint8_t byte, Time now);
+    std::string research_ready(Time now, bool accepted_session = false);
+    std::string research_send(uint8_t byte, Time now,
+                              bool accepted_session = false);
     void disconnected(Time now);
     void tick(Time now);
     bool shutdown(Time now);
