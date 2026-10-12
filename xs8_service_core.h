@@ -34,6 +34,10 @@ public:
     std::string command(const std::string& line, Time received, Time now);
     // Empty result means one query frame was verified and RX collection may begin.
     std::string begin_query_status(Time now);
+    // Empty when a single ROOT research TX may be attempted. Caller also
+    // enforces the separate default-off research authorization flag.
+    std::string research_ready(Time now);
+    std::string research_send(uint8_t byte, Time now);
     void disconnected(Time now);
     void tick(Time now);
     bool shutdown(Time now);

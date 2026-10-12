@@ -297,6 +297,46 @@ static void test_query_status_gates_and_single_tx()
     assert(root_tx.sent.back() == 0x07);
 }
 
+static void test_research_tx_interlocks()
+{
+    FakeTx inhibited_tx;
+    Xs8ServiceCore inhibited(inhibited_tx, Ms(2000), false);
+    inhibited.connected();
+    assert(inhibited.research_send(0x9C, at(1)) ==
+           "ERR RESEARCH reason=BOOT_INHIBIT\n");
+    assert(inhibited_tx.sent.empty());
+
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true);
+    core.connected();
+    assert(core.research_send(0x9C, at(1)) ==
+           "OK RESEARCH_TX gpio_tx=TX_OK waveform=MATCH "
+           "receiver_execution=UNVERIFIED");
+    assert(tx.sent == (std::vector<uint8_t>{0x9C}));
+    tx.fail_next = true;
+    assert(core.research_send(0x42, at(2)) ==
+           "ERR RESEARCH_TX gpio_tx=TX_OK waveform=MISSING "
+           "receiver_execution=UNVERIFIED");
+    assert(tx.sent == (std::vector<uint8_t>{0x9C, 0x42}));
+    tx.healthy = false;
+    assert(core.research_send(0xBC, at(3)) ==
+           "ERR RESEARCH reason=MONITOR_FAILED\n");
+    assert(tx.sent.size() == 2);
+
+    FakeTx holding_tx;
+    Xs8ServiceCore holding(holding_tx, Ms(2000), true);
+    holding.connected();
+    holding.command("VOLUME_PRESS DOWN", at(10), at(10));
+    const size_t count = holding_tx.sent.size();
+    assert(holding.research_send(0x9C, at(20)) ==
+           "ERR RESEARCH reason=HOLDING_DOWN\n");
+    assert(holding_tx.sent.size() == count);
+    holding_tx.stop_matches = {false, false, false};
+    holding.command("VOLUME_RELEASE DOWN", at(30), at(30));
+    assert(holding.research_send(0x9C, at(31)) ==
+           "ERR RESEARCH reason=FAULT_LATCHED\n");
+}
+
 int main()
 {
     test_startup_and_parsing();
@@ -307,5 +347,6 @@ int main()
     test_release_and_watchdog();
     test_failed_stop_verification_and_monitor();
     test_query_status_gates_and_single_tx();
+    test_research_tx_interlocks();
     std::cout << "XS8 service core tests passed\n";
 }

@@ -145,6 +145,34 @@ std::string Xs8ServiceCore::begin_query_status(Time now)
     return {};
 }
 
+std::string Xs8ServiceCore::research_ready(Time now)
+{
+    const auto before = volume_.state();
+    const bool unresolved = volume_.stop_owed() ||
+                            volume_.context_may_be_open();
+    tick(now);
+    if (!client_connected_) return "ERR RESEARCH reason=NO_CLIENT\n";
+    if (!tx_.monitor_healthy()) return "ERR RESEARCH reason=MONITOR_FAILED\n";
+    if (before != VolumeControl::State::IDLE ||
+        volume_.state() != VolumeControl::State::IDLE)
+        return std::string("ERR RESEARCH reason=") + state_name(before) + "\n";
+    if (unresolved || volume_.stop_owed() || volume_.context_may_be_open())
+        return "ERR RESEARCH reason=UNRESOLVED_STATE\n";
+    return {};
+}
+
+std::string Xs8ServiceCore::research_send(uint8_t byte, Time now)
+{
+    std::string denied = research_ready(now);
+    if (!denied.empty()) return denied;
+    const bool verified = tx_.send(byte);
+    const ServiceTxEvidence evidence = tx_.last_evidence();
+    return std::string(verified ? "OK RESEARCH_TX" : "ERR RESEARCH_TX") +
+        " gpio_tx=" + (evidence.gpio_completed ? "TX_OK" : "TX_FAIL") +
+        " waveform=" + waveform_name(evidence.waveform) +
+        " receiver_execution=UNVERIFIED";
+}
+
 void Xs8ServiceCore::disconnected(Time now)
 {
     if (!client_connected_) return;

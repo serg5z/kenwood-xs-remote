@@ -3,6 +3,7 @@
 #include "xs8_monitor.h"
 #include "xs8_query_status.h"
 #include "xs8_receiver_state.h"
+#include "xs8_research.h"
 
 #include <atomic>
 #include <cerrno>
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <optional>
 #include <string>
 #include <fcntl.h>
@@ -25,6 +27,7 @@
 namespace {
 constexpr unsigned int kFrameObservationMs = 300;
 constexpr size_t kMaxLine = 128;
+constexpr long kMaxResearchWindowMs = 5000;
 volatile std::sig_atomic_t stopping = 0;
 
 void on_signal(int) { stopping = 1; }
@@ -110,6 +113,60 @@ bool parse_number(const char *text, long& value)
     return end != text && !*end && errno != ERANGE;
 }
 
+bool parse_research_send(const std::string& line, uint8_t& byte, long& window)
+{
+    constexpr const char *prefix = "RESEARCH_SEND ";
+    if (line.compare(0, std::strlen(prefix), prefix) != 0) return false;
+    const std::string args = line.substr(std::strlen(prefix));
+    if (args.size() < 6 || args[0] != '0' || args[1] != 'x' ||
+        !std::isxdigit(static_cast<unsigned char>(args[2])) ||
+        !std::isxdigit(static_cast<unsigned char>(args[3])) || args[4] != ' ')
+        return false;
+    if (!parse_number(args.c_str() + 5, window) || window < 1 ||
+        window > kMaxResearchWindowMs) return false;
+    byte = static_cast<uint8_t>(std::strtoul(args.substr(2, 2).c_str(),
+                                             nullptr, 16));
+    return true;
+}
+
+bool parse_research_window(const std::string& line, long& window)
+{
+    constexpr const char *prefix = "RESEARCH_OBSERVE ";
+    return line.compare(0, std::strlen(prefix), prefix) == 0 &&
+        parse_number(line.c_str() + std::strlen(prefix), window) &&
+        window >= 1 && window <= kMaxResearchWindowMs;
+}
+
+bool parse_research_index(const std::string& line, uint64_t& id, size_t& index)
+{
+    constexpr const char *prefix = "RESEARCH_READ ";
+    if (line.compare(0, std::strlen(prefix), prefix) != 0) return false;
+    const std::string args = line.substr(std::strlen(prefix));
+    const size_t separator = args.find(' ');
+    if (separator == std::string::npos || args.find(' ', separator + 1) !=
+                                         std::string::npos) return false;
+    long parsed_id, parsed_index;
+    if (!parse_number(args.substr(0, separator).c_str(), parsed_id) ||
+        !parse_number(args.substr(separator + 1).c_str(), parsed_index) ||
+        parsed_id < 1 || parsed_index < 0 ||
+        parsed_index > static_cast<long>(Xs8ResearchSession::kMaxRecords))
+        return false;
+    id = static_cast<uint64_t>(parsed_id);
+    index = static_cast<size_t>(parsed_index);
+    return true;
+}
+
+bool parse_research_cancel(const std::string& line, uint64_t& id)
+{
+    constexpr const char *prefix = "RESEARCH_CANCEL ";
+    long parsed_id;
+    if (line.compare(0, std::strlen(prefix), prefix) != 0 ||
+        !parse_number(line.c_str() + std::strlen(prefix), parsed_id) ||
+        parsed_id < 1) return false;
+    id = static_cast<uint64_t>(parsed_id);
+    return true;
+}
+
 int open_socket(const char *path)
 {
     if (std::strlen(path) >= sizeof(sockaddr_un::sun_path)) {
@@ -140,10 +197,13 @@ int main(int argc, char **argv)
 {
     const char *socket_path = "/tmp/kenwood-xs8.sock";
     bool authorized = false;
+    bool research_tx_enabled = false;
     long hold_ms = 2000;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--allow-unrecovered-start") == 0)
             authorized = true;
+        else if (std::strcmp(argv[i], "--enable-research-tx") == 0)
+            research_tx_enabled = true;
         else if (std::strcmp(argv[i], "--socket") == 0 && i + 1 < argc)
             socket_path = argv[++i];
         else if (std::strcmp(argv[i], "--max-hold-ms") == 0 && i + 1 < argc) {
@@ -154,7 +214,8 @@ int main(int argc, char **argv)
             }
         } else {
             std::fprintf(stderr, "Usage: %s [--socket PATH] "
-                "[--allow-unrecovered-start] [--max-hold-ms 100..3000]\n",
+                "[--allow-unrecovered-start] [--enable-research-tx] "
+                "[--max-hold-ms 100..3000]\n",
                 argv[0]);
             return 2;
         }
@@ -185,16 +246,48 @@ int main(int argc, char **argv)
     GpioServiceTransmitter transmitter(bus, *monitor, receiver);
     Xs8ServiceCore core(transmitter, VolumeControl::Ms(hold_ms), authorized,
                         [] { return stopping != 0; });
-    std::fprintf(stderr, "XS8 service listening on %s; state=%s\n",
-        socket_path, authorized ? "IDLE (operator authorized)" : "BOOT_INHIBIT");
+    std::fprintf(stderr, "XS8 service listening on %s; state=%s "
+                         "research_tx=%s\n",
+        socket_path, authorized ? "IDLE (operator authorized)" : "BOOT_INHIBIT",
+        research_tx_enabled ? "ENABLED" : "DISABLED");
     int client = -1;
     std::string input;
     std::optional<Xs8QueryStatus> query;
+    std::optional<Xs8ResearchSession> research;
+    uint64_t next_research_id = 1;
+    bool research_tx_uncertain = false;
     uint64_t query_cursor = 0;
     uint64_t state_cursor = xs8_monitor_checkpoint(monitor);
     while (!stopping) {
         xs8_monitor_poll(monitor, 0);
         core.tick(VolumeControl::Clock::now());
+        if (research && research->active()) {
+            xs8_monitor_record records[16];
+            size_t copied = 0;
+            do {
+                if (xs8_monitor_snapshot(monitor, research->cursor_ptr(),
+                                         records, 16, &copied) < 0) {
+                    research->overflow();
+                    break;
+                }
+                research->observe(records, copied);
+            } while (copied == 16);
+            if (!xs8_monitor_healthy(monitor)) research->monitor_failed();
+            int64_t now_ns = xs8_gpio_now_ns();
+            if (now_ns <= 0) {
+                research->monitor_failed();
+                research->finish(research->deadline_ns());
+            } else if ((uint64_t)now_ns >= research->deadline_ns()) {
+                xs8_monitor_record partial{};
+                bool has_partial = xs8_monitor_partial(
+                    monitor, research->deadline_ns(), &partial);
+                if (has_partial &&
+                    partial.decoded.time_ns > research->deadline_ns())
+                    has_partial = false;
+                research->finish((uint64_t)now_ns,
+                                 has_partial ? &partial : nullptr);
+            }
+        }
         xs8_monitor_record state_records[16];
         size_t state_count = 0;
         do {
@@ -311,6 +404,133 @@ int main(int argc, char **argv)
                 input.erase(0, newline + 1);
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 auto received = VolumeControl::Clock::now();
+                uint8_t research_byte = 0;
+                long research_window = 0;
+                uint64_t research_id = 0;
+                size_t research_index = 0;
+                if (parse_research_send(line, research_byte, research_window)) {
+                    std::string result;
+                    if (!research_tx_enabled)
+                        result = "ERR RESEARCH reason=TX_DISABLED\n";
+                    else if (research_tx_uncertain)
+                        result = "ERR RESEARCH reason=TX_UNCERTAIN_LATCHED\n";
+                    else if (research_byte == 0x17)
+                        result = "ERR RESEARCH reason=CONTEXT_ENTRY_FORBIDDEN\n";
+                    else if (research && research->active())
+                        result = "ERR RESEARCH reason=SESSION_BUSY\n";
+                    else if (stopping)
+                        result = "ERR RESEARCH reason=SHUTDOWN\n";
+                    else result = core.research_ready(received);
+                    if (!result.empty()) {
+                        if (!reply(client, result)) failed = true;
+                        continue;
+                    }
+                    uint64_t checkpoint = xs8_monitor_checkpoint(monitor);
+                    int64_t before = xs8_gpio_now_ns();
+                    if (before <= 0) {
+                        if (!reply(client,
+                                   "ERR RESEARCH reason=CLOCK_FAILED\n"))
+                            failed = true;
+                        continue;
+                    }
+                    std::fprintf(stderr,
+                        "XS8 RESEARCH_SEND requested=0x%02X window_ms=%ld "
+                        "context=ROOT_ASSUMED\n", research_byte,
+                        research_window);
+                    result = core.research_send(research_byte, received);
+                    std::fprintf(stderr, "XS8 RESEARCH_SEND outcome=%s\n",
+                                 result.c_str());
+                    int64_t after = xs8_gpio_now_ns();
+                    if (after <= 0) after = before;
+                    if (result.compare(0, 3, "ERR") == 0)
+                        research_tx_uncertain = true;
+                    research.emplace(next_research_id++, checkpoint,
+                        (uint64_t)before,
+                        (uint64_t)after +
+                            (uint64_t)research_window * 1000000ULL,
+                        true, research_byte, transmitter.last_start_ns(),
+                        transmitter.last_end_ns());
+                    char detail[180];
+                    std::snprintf(detail, sizeof(detail),
+                        " id=%llu tx_start_ns=%llu tx_end_ns=%llu "
+                        "deadline_ns=%llu context=ROOT_ASSUMED\n",
+                        (unsigned long long)research->id(),
+                        (unsigned long long)transmitter.last_start_ns(),
+                        (unsigned long long)transmitter.last_end_ns(),
+                        (unsigned long long)research->deadline_ns());
+                    if (!reply(client, result + detail)) failed = true;
+                    continue;
+                }
+                if (parse_research_window(line, research_window)) {
+                    if (research && research->active()) {
+                        if (!reply(client,
+                                   "ERR RESEARCH reason=SESSION_BUSY\n"))
+                            failed = true;
+                        continue;
+                    }
+                    if (!xs8_monitor_healthy(monitor)) {
+                        if (!reply(client,
+                                   "ERR RESEARCH reason=MONITOR_FAILED\n"))
+                            failed = true;
+                        continue;
+                    }
+                    const int64_t start = xs8_gpio_now_ns();
+                    if (start <= 0) {
+                        if (!reply(client,
+                                   "ERR RESEARCH reason=CLOCK_FAILED\n"))
+                            failed = true;
+                        continue;
+                    }
+                    research.emplace(next_research_id++,
+                        xs8_monitor_checkpoint(monitor), (uint64_t)start,
+                        (uint64_t)start +
+                            (uint64_t)research_window * 1000000ULL, false);
+                    std::fprintf(stderr,
+                        "XS8 RESEARCH_OBSERVE id=%llu window_ms=%ld\n",
+                        (unsigned long long)research->id(), research_window);
+                    char detail[160];
+                    std::snprintf(detail, sizeof(detail),
+                        "OK RESEARCH_OBSERVE id=%llu start_ns=%llu "
+                        "deadline_ns=%llu\n",
+                        (unsigned long long)research->id(),
+                        (unsigned long long)start,
+                        (unsigned long long)research->deadline_ns());
+                    if (!reply(client, detail)) failed = true;
+                    continue;
+                }
+                if (parse_research_index(line, research_id,
+                                         research_index)) {
+                    if (!research || research->id() != research_id) {
+                        if (!reply(client,
+                                   "ERR RESEARCH reason=UNKNOWN_SESSION\n"))
+                            failed = true;
+                    } else if (!reply(client, research->read(research_index)))
+                        failed = true;
+                    continue;
+                }
+                if (parse_research_cancel(line, research_id)) {
+                    if (!research || research->id() != research_id) {
+                        if (!reply(client,
+                                   "ERR RESEARCH reason=UNKNOWN_SESSION\n"))
+                            failed = true;
+                    } else {
+                        research->cancel();
+                        std::fprintf(stderr, "XS8 RESEARCH_CANCEL id=%llu\n",
+                            (unsigned long long)research_id);
+                        char detail[80];
+                        std::snprintf(detail, sizeof(detail),
+                            "OK RESEARCH_CANCEL id=%llu\n",
+                            (unsigned long long)research_id);
+                        if (!reply(client, detail)) failed = true;
+                    }
+                    continue;
+                }
+                if (line.compare(0, 9, "RESEARCH_") == 0) {
+                    if (!reply(client,
+                               "ERR RESEARCH reason=INVALID_REQUEST\n"))
+                        failed = true;
+                    continue;
+                }
                 if (line == "QUERY_STATUS") {
                     if (!input.empty()) {
                         if (!reply(client, "ERR QUERY_STATUS reason=PIPELINED\n"))

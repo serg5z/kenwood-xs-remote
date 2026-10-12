@@ -1,2 +1,4 @@
 /cec-xs-bridge
 /.build/
+__pycache__/
+*.py[cod]
