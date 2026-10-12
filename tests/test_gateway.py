@@ -25,6 +25,9 @@ RECEIVER_STATUS = STATUS.replace(b"\n", (
     b" receiver_source_evidence=PASSIVE receiver_monitor=ON"
     b" receiver_monitor_ns=1000000100 receiver_monitor_evidence=QUERY"
     b" receiver_integrity=HEALTHY\n"))
+CD_HOLD_STATUS = STATUS.replace(b"\n", (
+    b" cd_state=HOLDING cd_action=TRACK_NEXT cd_release_owed=1"
+    b" cd_lease_expired=0 cd_last_result=HOLDING\n"))
 QUERY_REPLY = (b"OK QUERY_STATUS reason=NONE gpio_tx=TX_OK waveform=MATCH "
                b"bytes=lsb/legacy@start_ns-end_ns:validity "
                b"tx=0x13/0x37@1-2:VALID rx1=0x47/0x1D@3-4:VALID "
@@ -240,6 +243,16 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(parsed["status"]["state"], "IDLE")
         self.assertEqual(parsed["status"]["last_gpio_tx"], "TX_OK")
         self.assertEqual(parsed["status"]["receiver_execution"], "UNVERIFIED")
+
+    def test_cd_hold_status_remains_available_but_controls_are_ineligible(self):
+        fake = FakeService(self.socket_path, CD_HOLD_STATUS)
+        code, body = self.request("GET", "/api/v1/status")
+        fake.close()
+        self.assertEqual(code, 200)
+        self.assertEqual(fake.commands, [b"STATUS\n"])
+        status = json.loads(body)["status"]
+        self.assertEqual(status["cd_state"], "HOLDING")
+        self.assertFalse(xs8_gateway.GatewayHandler.status_allows_mute(status))
 
     def test_invalid_service_reply(self):
         fake = FakeService(self.socket_path, b"OK state=IDLE\n")
@@ -1023,7 +1036,8 @@ class ActivatedGatewayTest(unittest.TestCase):
                        STATUS.replace(b"state=IDLE", b"state=FAULT_LATCHED"),
                        STATUS.replace(b"monitor=HEALTHY", b"monitor=FAILED"),
                        STATUS.replace(b"stop_owed=0", b"stop_owed=1"),
-                       STATUS.replace(b"context_may_be_open=0", b"context_may_be_open=1")):
+                       STATUS.replace(b"context_may_be_open=0", b"context_may_be_open=1"),
+                       CD_HOLD_STATUS):
             with self.subTest(status=status):
                 fake = RecordingService(self.service_path, status=status)
                 try:

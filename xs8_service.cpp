@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -24,11 +25,12 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-/* Local protocol: one client at a time, one command and response per line.
- * The socket thread is the GPIO TX owner; RX edge collection stays passive. */
+/* Local line protocol. One control thread owns all GPIO TX and services a
+ * bounded set of socket clients; RX edge collection stays passive. */
 namespace {
 constexpr unsigned int kFrameObservationMs = 300;
 constexpr size_t kMaxLine = 128;
+constexpr size_t kMaxClients = 8;
 constexpr long kMaxResearchWindowMs = 5000;
 volatile std::sig_atomic_t stopping = 0;
 
@@ -263,9 +265,25 @@ int main(int argc, char **argv)
         socket_path, authorized ? "IDLE (operator authorized)" : "BOOT_INHIBIT",
         research_tx_enabled ? "ENABLED" : "DISABLED",
         research_chain_enabled ? "ENABLED" : "DISABLED");
-    int client = -1;
-    std::string input;
+    struct Client { int fd; uint64_t id; std::string input; };
+    std::vector<Client> clients;
+    uint64_t next_client_id = 1;
+    size_t next_poll_client = 0;
+    int query_client = -1;
     std::optional<Xs8QueryStatus> query;
+    auto close_client = [&](size_t index) {
+        if (index >= clients.size()) return;
+        const int fd = clients[index].fd;
+        const uint64_t id = clients[index].id;
+        if (query_client == fd) {
+            if (query) query->cancel();
+            query.reset();
+            query_client = -1;
+        }
+        core.disconnected(VolumeControl::Clock::now(), id);
+        close(fd);
+        clients.erase(clients.begin() + index);
+    };
     std::optional<Xs8ResearchSession> research;
     std::optional<Xs8ResearchChain> chain;
     uint64_t next_research_id = 1;
@@ -360,18 +378,6 @@ int main(int argc, char **argv)
         } while (state_count == 16);
         if (!xs8_monitor_healthy(monitor)) receiver.monitor_failed();
         if (query) {
-            pollfd pending_client = {client, POLLIN, 0};
-            if (poll(&pending_client, 1, 0) > 0 &&
-                (pending_client.revents &
-                 (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
-                query->cancel();
-                query.reset();
-                core.disconnected(VolumeControl::Clock::now());
-                close(client);
-                client = -1;
-                input.clear();
-                continue;
-            }
             xs8_monitor_record records[8];
             size_t copied = 0;
             do {
@@ -393,19 +399,26 @@ int main(int argc, char **argv)
             if (query->done(now_ns > 0 ? (uint64_t)now_ns : 0)) {
                 if (now_ns > 0)
                     receiver.apply_query(*query, (uint64_t)now_ns);
-                bool sent = reply(client, query->response(
+                const bool sent = reply(query_client, query->response(
                     now_ns > 0 ? (uint64_t)now_ns : 0));
                 query.reset();
+                const int completed_client = query_client;
+                query_client = -1;
                 if (!sent) {
-                    core.disconnected(VolumeControl::Clock::now());
-                    close(client);
-                    client = -1;
-                    input.clear();
+                    for (size_t i = 0; i < clients.size(); ++i)
+                        if (clients[i].fd == completed_client) {
+                            close_client(i);
+                            break;
+                        }
                 }
             }
         }
-        pollfd fds[2] = {{server, POLLIN, 0}, {client, POLLIN, 0}};
-        int count = poll(fds, client >= 0 ? 2 : 1, 20);
+        std::array<pollfd, kMaxClients + 1> fds{};
+        fds[0] = {server, POLLIN, 0};
+        for (size_t i = 0; i < clients.size(); ++i)
+            fds[i + 1] = {clients[i].fd, POLLIN, 0};
+        const size_t polled_clients = clients.size();
+        int count = poll(fds.data(), polled_clients + 1, 20);
         if (count < 0) {
             if (errno == EINTR) continue;
             std::perror("XS8 socket poll");
@@ -419,37 +432,38 @@ int main(int argc, char **argv)
             int accepted = accept(server, nullptr, nullptr);
             if (accepted >= 0) {
                 bool nonblocking = set_nonblocking(accepted);
-                if (client >= 0 || !nonblocking) {
+                if (clients.size() >= kMaxClients || !nonblocking) {
                     if (nonblocking) reply(accepted, "ERR BUSY\n");
                     close(accepted);
                 } else {
-                    client = accepted;
-                    input.clear();
-                    core.connected();
+                    const uint64_t id = next_client_id++;
+                    clients.push_back({accepted, id, {}});
+                    core.connected(id);
                 }
             }
         }
-        if (client < 0) continue;
-        if (!(fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)))
-            continue;
-        if (fds[1].revents & POLLNVAL) {
-            if (query) query->cancel();
-            core.disconnected(VolumeControl::Clock::now());
-            close(client);
-            client = -1;
-            input.clear();
+        size_t selected = clients.size();
+        for (size_t offset = 0; offset < polled_clients; ++offset) {
+            const size_t i = (next_poll_client + offset) % polled_clients;
+            if (fds[i + 1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
+                selected = i;
+                break;
+            }
+        }
+        if (selected >= clients.size()) continue;
+        next_poll_client = (selected + 1) % polled_clients;
+        if (fds[selected + 1].revents & POLLNVAL) {
+            close_client(selected);
             continue;
         }
+        const int client = clients[selected].fd;
+        const uint64_t client_id = clients[selected].id;
+        std::string& input = clients[selected].input;
         char buffer[256];
         ssize_t size = read(client, buffer, sizeof(buffer));
-        if (query) {
+        if (query && query_client == client) {
             if (size < 0 && (errno == EAGAIN || errno == EINTR)) continue;
-            query->cancel();
-            query.reset();
-            core.disconnected(VolumeControl::Clock::now());
-            close(client);
-            client = -1;
-            input.clear();
+            close_client(selected);
             continue;
         }
         if (size > 0) {
@@ -462,6 +476,12 @@ int main(int argc, char **argv)
                 input.erase(0, newline + 1);
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 auto received = VolumeControl::Clock::now();
+                if (query && line != "STATUS" &&
+                    line.compare(0, 15, "VOLUME_RELEASE ") != 0) {
+                    if (!reply(client, "ERR QUERY_STATUS reason=SESSION_BUSY\n"))
+                        failed = true;
+                    continue;
+                }
                 uint8_t research_byte = 0;
                 long research_window = 0;
                 uint64_t research_id = 0;
@@ -664,6 +684,12 @@ int main(int argc, char **argv)
                     continue;
                 }
                 if (line == "QUERY_STATUS") {
+                    if (query) {
+                        if (!reply(client,
+                                   "ERR QUERY_STATUS reason=SESSION_BUSY\n"))
+                            failed = true;
+                        continue;
+                    }
                     if (chain && chain->active()) {
                         if (!reply(client, "ERR RESEARCH reason=SESSION_BUSY\n"))
                             failed = true;
@@ -691,6 +717,7 @@ int main(int argc, char **argv)
                         }
                         query.emplace(transmitter.last_start_ns(),
                                       transmitter.last_end_ns());
+                        query_client = client;
                         break;
                     }
                     if (!reply(client, result)) failed = true;
@@ -705,7 +732,8 @@ int main(int argc, char **argv)
                     continue;
                 }
                 if (line == "CD_TRACK_NEXT" ||
-                    line == "CD_TRACK_PREVIOUS") {
+                    line == "CD_TRACK_PREVIOUS" ||
+                    line.compare(0, 9, "CD_PRESS ") == 0) {
                     if (stopping) {
                         if (!reply(client, "ERR SHUTDOWN\n")) failed = true;
                         continue;
@@ -717,7 +745,8 @@ int main(int argc, char **argv)
                         continue;
                     }
                 }
-                if (!reply(client, core.command(line, received, received))) {
+                if (!reply(client, core.command(line, received, received,
+                                                client_id))) {
                     failed = true;
                     break;
                 }
@@ -726,16 +755,9 @@ int main(int argc, char **argv)
             if (input.size() > kMaxLine) failed = true;
             if (!failed) continue;
         } else if (size < 0 && (errno == EAGAIN || errno == EINTR)) continue;
-        core.disconnected(VolumeControl::Clock::now());
-        close(client);
-        client = -1;
-        input.clear();
+        close_client(selected);
     }
-    if (client >= 0) {
-        if (query) query->cancel();
-        core.disconnected(VolumeControl::Clock::now());
-        close(client);
-    }
+    while (!clients.empty()) close_client(0);
     bool cleaned = core.shutdown(VolumeControl::Clock::now());
     if (core.stop_owed() ||
         core.state() == VolumeControl::State::FAULT_LATCHED)

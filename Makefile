@@ -36,7 +36,7 @@ all: .build/cec-xs-bridge .build/cec-xs-client .build/xs8_send .build/xs8-servic
 .build/volume_control_test: volume_control.cpp volume_control.h tests/volume_control_test.cpp | .build
 	$(CXX) $(CXXFLAGS) -Werror -I. volume_control.cpp tests/volume_control_test.cpp -o $@
 
-test: .build/volume_control_test .build/xs8_decode_test .build/xs8_rt_test .build/xs8_service_core_test .build/xs8_query_status_test .build/xs8_receiver_state_test .build/xs8_research_test .build/cec_client_core_test .build/cec_service_socket_test
+test: .build/volume_control_test .build/xs8_decode_test .build/xs8_rt_test .build/xs8_service_core_test .build/xs8_query_status_test .build/xs8_receiver_state_test .build/xs8_research_test .build/cec_client_core_test .build/cec_service_socket_test .build/xs8_service_socket_test
 	./.build/volume_control_test
 	./.build/xs8_decode_test
 	./.build/xs8_rt_test
@@ -47,6 +47,7 @@ test: .build/volume_control_test .build/xs8_decode_test .build/xs8_rt_test .buil
 	./.build/cec_client_core_test
 	./.build/cec_service_socket_test
 	python3 -m unittest tests/test_xs8_repl.py
+	python3 -m unittest tests/test_xs8_service_socket.py
 
 .build/xs8_decode_test: xs8_decode.c xs8_decode.h tests/xs8_decode_test.c | .build
 	$(CC) $(CFLAGS) -std=c11 -Werror -I. xs8_decode.c tests/xs8_decode_test.c -o $@
@@ -71,3 +72,6 @@ test: .build/volume_control_test .build/xs8_decode_test .build/xs8_rt_test .buil
 
 .build/cec_service_socket_test: cec_client_core.cpp cec_client_core.h cec_service_socket.h tests/cec_service_socket_test.cpp | .build
 	$(CXX) $(CXXFLAGS) -Werror -I. cec_client_core.cpp tests/cec_service_socket_test.cpp -o $@ -pthread
+
+.build/xs8_service_socket_test: xs8_service.cpp xs8_service_core.cpp xs8_service_core.h xs8_query_status.cpp xs8_query_status.h xs8_receiver_state.cpp xs8_receiver_state.h xs8_research.cpp xs8_research.h volume_control.cpp volume_control.h xs8_gpio.h xs8_monitor.h tests/stubs/gpiod.h tests/xs8_service_fake_backend.cpp | .build
+	$(CXX) $(CXXFLAGS) -Werror -Itests/stubs -I. xs8_service.cpp xs8_service_core.cpp xs8_query_status.cpp xs8_receiver_state.cpp xs8_research.cpp volume_control.cpp tests/xs8_service_fake_backend.cpp -o $@ -pthread

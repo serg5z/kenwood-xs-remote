@@ -29,6 +29,8 @@ RECEIVER_FIELDS = {
     "receiver_monitor", "receiver_monitor_ns", "receiver_monitor_evidence",
     "receiver_integrity",
 }
+CD_FIELDS = {"cd_state", "cd_action", "cd_release_owed",
+             "cd_lease_expired", "cd_last_result"}
 SOURCES = ("CD", "TUNER", "PHONO", "TV1", "TV2", "TAPE1", "TAPE2")
 EVIDENCED_SOURCES = ("CD", "TUNER", "PHONO", "TAPE1")
 
@@ -176,12 +178,19 @@ def read_status(socket_path, timeout=1.0):
         fields = {}
         for part in parts[1:]:
             key, value = part.split("=", 1)
-            if key not in STATUS_FIELDS | RECEIVER_FIELDS or not value or key in fields:
+            if key not in STATUS_FIELDS | RECEIVER_FIELDS | CD_FIELDS or not value or key in fields:
                 raise ValueError("invalid STATUS field")
             fields[key] = value
-        if not STATUS_FIELDS <= set(fields) or set(fields) - STATUS_FIELDS not in (
-                set(), RECEIVER_FIELDS):
+        extras = set(fields) - STATUS_FIELDS
+        if (not STATUS_FIELDS <= set(fields) or
+                extras not in (set(), RECEIVER_FIELDS, CD_FIELDS,
+                               RECEIVER_FIELDS | CD_FIELDS)):
             raise ValueError("incomplete STATUS reply")
+        if CD_FIELDS <= set(fields) and (
+                fields["cd_state"] not in ("IDLE", "ACTIVE", "HOLDING", "FAULT_LATCHED") or
+                fields["cd_release_owed"] not in ("0", "1") or
+                fields["cd_lease_expired"] not in ("0", "1")):
+            raise ValueError("invalid CD status")
         if RECEIVER_FIELDS <= set(fields):
             if (fields["receiver_source"] not in SOURCES + ("UNKNOWN",) or
                     fields["receiver_monitor"] not in ("ON", "OFF", "UNKNOWN") or
@@ -303,7 +312,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
     @staticmethod
     def status_allows_mute(status):
         return (status["state"] == "IDLE" and status["monitor"] == "HEALTHY"
-                and status["stop_owed"] == "0" and status["context_may_be_open"] == "0")
+                and status["stop_owed"] == "0" and status["context_may_be_open"] == "0"
+                and status.get("cd_state", "IDLE") == "IDLE"
+                and status.get("cd_release_owed", "0") == "0")
 
     def send_body(self, code, body, content_type, headers=None):
         self.send_response(code)

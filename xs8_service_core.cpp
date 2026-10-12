@@ -1,7 +1,9 @@
 #include "xs8_service_core.h"
 
 #include <chrono>
+#include <charconv>
 #include <cstdio>
+#include <random>
 #include <thread>
 
 namespace {
@@ -38,24 +40,50 @@ const char *receiver_name(ReceiverEvidence)
 {
     return "UNVERIFIED";
 }
+
+bool cd_token(const std::string& line, const char *prefix, uint64_t& token)
+{
+    const size_t length = std::char_traits<char>::length(prefix);
+    if (line.size() <= length || line.compare(0, length, prefix) != 0)
+        return false;
+    const char *first = line.data() + length;
+    const char *last = line.data() + line.size();
+    const auto parsed = std::from_chars(first, last, token);
+    return parsed.ec == std::errc{} && parsed.ptr == last && token != 0;
+}
+
+bool new_cd_token(uint64_t previous, uint64_t& token)
+{
+    try {
+        std::random_device random;
+        for (unsigned int attempt = 0; attempt < 8; ++attempt) {
+            token = (uint64_t(random()) << 32) | uint64_t(random());
+            if (token != 0 && token != previous) return true;
+        }
+    } catch (...) {}
+    return false;
+}
 }
 
 Xs8ServiceCore::Xs8ServiceCore(ServiceTransmitter& tx,
     VolumeControl::Ms max_hold, bool operator_authorized,
     std::function<bool()> stopping, std::function<Time()> now,
-    std::function<void(Time)> wait_until)
+    std::function<void(Time)> wait_until, VolumeControl::Ms cd_lease)
     : tx_(tx), volume_(tx, VolumeControl::Ms(1200), max_hold,
                        std::move(stopping), std::move(now)),
       wait_until_(wait_until ? std::move(wait_until) :
           std::function<void(Time)>([](Time deadline) {
               std::this_thread::sleep_until(deadline);
-          }))
+          })), cd_lease_(cd_lease)
 {
     // This sends no command. No automatic recovery is available in phase 1.
     volume_.startup(false, operator_authorized);
 }
 
-void Xs8ServiceCore::connected() { client_connected_ = true; }
+void Xs8ServiceCore::connected(uint64_t client_id)
+{
+    clients_.insert(client_id);
+}
 
 std::string Xs8ServiceCore::status() const
 {
@@ -78,8 +106,11 @@ std::string Xs8ServiceCore::status() const
         " last_stop_waveform=" + waveform_name(stop.waveform) +
         " receiver_execution=" + receiver_name(evidence.receiver) +
         " cd_state=" + (cd_fault_ ? "FAULT_LATCHED" :
+                         cd_hold_ ? "HOLDING" :
                          cd_active_ ? "ACTIVE" : "IDLE") +
+        " cd_action=" + cd_action_ +
         " cd_release_owed=" + (cd_release_owed_ ? "1" : "0") +
+        " cd_lease_expired=" + (cd_lease_expired_ ? "1" : "0") +
         " cd_last_result=" + cd_last_result_ +
         receiver_status_ + "\n";
 }
@@ -104,14 +135,98 @@ bool Xs8ServiceCore::attempt_cd_release()
     return !cd_release_owed_;
 }
 
-std::string Xs8ServiceCore::cd_track(uint8_t press_byte, const char *action)
+std::string Xs8ServiceCore::cd_preflight() const
 {
     if (cd_shutdown_requested_) return "ERR SHUTDOWN\n";
     if (cd_fault_ || cd_release_owed_) return "ERR CD_FAULT_LATCHED\n";
+    if (cd_lease_expired_) return "ERR CD_LEASE_EXPIRED\n";
     if (volume_.state() != VolumeControl::State::IDLE ||
         volume_.stop_owed() || volume_.context_may_be_open())
         return std::string("ERR ") + state_name(volume_.state()) + "\n";
+    return {};
+}
+
+std::string Xs8ServiceCore::cd_press(uint8_t press_byte, const char *action,
+                                     Time now)
+{
+    const std::string denied = cd_preflight();
+    if (!denied.empty()) return denied;
+    uint64_t token = 0;
+    // Generate independently before KEY DOWN. A prior owner's token must not
+    // reveal the next token now that requests can use different connections.
+    if (!new_cd_token(cd_last_token_, token)) return "ERR CD_TOKEN_UNAVAILABLE\n";
     cd_active_ = true;
+    cd_release_owed_ = true;
+    cd_action_ = action;
+    bool verified = false;
+    bool threw = false;
+    try { verified = tx_.send(press_byte); }
+    catch (...) { threw = true; }
+    const auto press = threw ? ServiceTxEvidence{} : tx_.last_evidence();
+    const bool confirmed = verified && press.attempted &&
+        press.byte == press_byte && press.gpio_completed &&
+        press.waveform == WaveformEvidence::MATCH;
+    if (!confirmed) {
+        const bool released = attempt_cd_release();
+        cd_active_ = false;
+        cd_fault_ = true;
+        cd_last_result_ = released ? "PRESS_UNCERTAIN" : "RELEASE_UNCERTAIN";
+        std::fprintf(stderr, "XS8 CD_PRESS action=%s result=%s gpio_tx=%s "
+                             "waveform=%s release_gpio_tx=%s "
+                             "release_waveform=%s receiver_execution=UNVERIFIED\n",
+            action, cd_last_result_.c_str(),
+            press.gpio_completed ? "TX_OK" : "TX_FAIL",
+            waveform_name(press.waveform),
+            cd_release_evidence_.gpio_completed ? "TX_OK" : "TX_FAIL",
+            waveform_name(cd_release_evidence_.waveform));
+        return std::string("ERR CD_PRESS_UNCERTAIN action=") + action +
+            " gpio_tx=" + (press.gpio_completed ? "TX_OK" : "TX_FAIL") +
+            " waveform=" + waveform_name(press.waveform) +
+            " release_gpio_tx=" +
+            (cd_release_evidence_.gpio_completed ? "TX_OK" : "TX_FAIL") +
+            " release_waveform=" + waveform_name(cd_release_evidence_.waveform) +
+            " receiver_execution=UNVERIFIED\n";
+    }
+    cd_lease_renewed_ = now;
+    cd_hold_token_ = token;
+    cd_last_token_ = token;
+    cd_hold_ = true;
+    cd_last_result_ = "HOLDING";
+    std::fprintf(stderr, "XS8 CD_PRESS action=%s gpio_tx=TX_OK "
+                         "waveform=MATCH receiver_execution=UNVERIFIED\n",
+                         action);
+    return std::string("OK CD_PRESS_TX action=") + action +
+        " hold_token=" + std::to_string(cd_hold_token_) +
+        " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n";
+}
+
+std::string Xs8ServiceCore::cd_release(const char *reason)
+{
+    if (!cd_hold_) return "ERR CD_NOT_ACTIVE\n";
+    const bool verified = attempt_cd_release();
+    cd_hold_ = false;
+    cd_active_ = false;
+    cd_hold_token_ = 0;
+    cd_last_result_ = verified ? reason : "RELEASE_UNCERTAIN";
+    std::fprintf(stderr, "XS8 CD_RELEASE reason=%s gpio_tx=%s waveform=%s "
+                         "receiver_execution=UNVERIFIED\n", reason,
+        cd_release_evidence_.gpio_completed ? "TX_OK" : "TX_FAIL",
+        waveform_name(cd_release_evidence_.waveform));
+    return std::string(verified ? "OK CD_RELEASE_TX" :
+                       "ERR CD_RELEASE_UNCERTAIN") +
+        " reason=" + reason +
+        " gpio_tx=" +
+        (cd_release_evidence_.gpio_completed ? "TX_OK" : "TX_FAIL") +
+        " waveform=" + waveform_name(cd_release_evidence_.waveform) +
+        " receiver_execution=UNVERIFIED\n";
+}
+
+std::string Xs8ServiceCore::cd_track(uint8_t press_byte, const char *action)
+{
+    const std::string denied = cd_preflight();
+    if (!denied.empty()) return denied;
+    cd_active_ = true;
+    cd_action_ = action;
     cd_release_owed_ = true; // Set before PRESS: failure may still reach the bus.
     bool press_verified = false;
     bool press_threw = false;
@@ -159,15 +274,44 @@ std::string Xs8ServiceCore::cd_track(uint8_t press_byte, const char *action)
 }
 
 std::string Xs8ServiceCore::command(const std::string& line, Time received,
-                                    Time now)
+                                    Time now, uint64_t client_id)
 {
     tick(now);
     if (line == "STATUS") return status();
-    if (!client_connected_) return "ERR NO_CLIENT\n";
+    if (!clients_.count(client_id)) return "ERR NO_CLIENT\n";
+    if (line == "CD_RELEASE" || line.compare(0, 11, "CD_RELEASE ") == 0 ||
+        line == "CD_HEARTBEAT" ||
+        line.compare(0, 13, "CD_HEARTBEAT ") == 0) {
+        if (!cd_hold_) return "ERR CD_NOT_ACTIVE\n";
+        uint64_t token = 0;
+        const bool heartbeat = line.compare(0, 13, "CD_HEARTBEAT ") == 0;
+        if (!cd_token(line, heartbeat ? "CD_HEARTBEAT " : "CD_RELEASE ",
+                      token)) return "ERR CD_TOKEN_REQUIRED\n";
+        if (token != cd_hold_token_) return "ERR CD_NOT_OWNER\n";
+        if (heartbeat) {
+            cd_lease_renewed_ = now;
+            return "OK CD_LEASE_RENEWED\n";
+        }
+        return cd_release("CLIENT_RELEASE");
+    }
     if (cd_active_) return "ERR CD_TRACK_BUSY\n";
     if (cd_fault_ && line != "VOLUME_RELEASE UP" &&
         line != "VOLUME_RELEASE DOWN") return "ERR CD_FAULT_LATCHED\n";
+    if (cd_lease_expired_ &&
+        (line.compare(0, 9, "CD_PRESS ") == 0 ||
+         line == "CD_TRACK_NEXT" || line == "CD_TRACK_PREVIOUS"))
+        return "ERR CD_LEASE_EXPIRED\n";
     if (!tx_.monitor_healthy()) return "ERR MONITOR_FAILED\n";
+    if (line == "CD_PRESS TRACK_NEXT")
+        return cd_press(0xFC, "TRACK_NEXT", now);
+    if (line == "CD_PRESS TRACK_PREVIOUS")
+        return cd_press(0xEC, "TRACK_PREVIOUS", now);
+    if (line == "CD_PRESS SEEK_FORWARD")
+        return cd_press(0x7A, "SEEK_FORWARD", now);
+    if (line == "CD_PRESS SEEK_BACKWARD")
+        return cd_press(0x6A, "SEEK_BACKWARD", now);
+    if (line.compare(0, 9, "CD_PRESS ") == 0)
+        return "ERR CD_UNKNOWN_ACTION\n";
     if (line == "CD_TRACK_NEXT") return cd_track(0xFC, "NEXT");
     if (line == "CD_TRACK_PREVIOUS") return cd_track(0xEC, "PREVIOUS");
     if (line.compare(0, 14, "SELECT_SOURCE ") == 0) {
@@ -190,8 +334,15 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
             " waveform=" + waveform_name(evidence.waveform) +
             " receiver_execution=UNVERIFIED\n";
     }
-    if (line == "MUTE")
-        return volume_.mute(now) ? "OK MUTE_TX\n" : "ERR MUTE_UNCERTAIN\n";
+    if (line == "MUTE") {
+        volume_owner_client_ = client_id;
+        volume_owner_set_ = true;
+        const bool sent = volume_.mute(now);
+        if (volume_.state() == VolumeControl::State::IDLE &&
+            !volume_.stop_owed() && !volume_.context_may_be_open())
+            volume_owner_set_ = false;
+        return sent ? "OK MUTE_TX\n" : "ERR MUTE_UNCERTAIN\n";
+    }
     const bool press = line == "VOLUME_PRESS UP" ||
                        line == "VOLUME_PRESS DOWN";
     const bool release = line == "VOLUME_RELEASE UP" ||
@@ -201,9 +352,21 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
         line.compare(line.size() - 2, 2, "UP") == 0
         ? VolumeControl::Direction::UP : VolumeControl::Direction::DOWN;
     if (press) {
-        if (!volume_.press(direction, received, now))
+        if (volume_owner_set_ && volume_owner_client_ != client_id &&
+            (volume_.state() == VolumeControl::State::HOLDING_UP ||
+             volume_.state() == VolumeControl::State::HOLDING_DOWN))
+            return "ERR VOLUME_BUSY\n";
+        volume_owner_client_ = client_id;
+        volume_owner_set_ = true;
+        if (!volume_.press(direction, received, now)) {
+            if (volume_.state() == VolumeControl::State::IDLE &&
+                !volume_.stop_owed() && !volume_.context_may_be_open())
+                volume_owner_set_ = false;
             return std::string("ERR ") + state_name(volume_.state()) + "\n";
+        }
         owner_direction_ = direction;
+        volume_owner_client_ = client_id;
+        volume_owner_set_ = true;
         return "OK VOLUME_PRESS_TX\n";
     }
     return volume_.release(direction, now) ? "OK VOLUME_RELEASE_TX\n"
@@ -218,7 +381,7 @@ std::string Xs8ServiceCore::begin_query_status(Time now)
     const bool received_unresolved =
         volume_.stop_owed() || volume_.context_may_be_open();
     tick(now);
-    if (!client_connected_) return "ERR NO_CLIENT\n";
+    if (clients_.empty()) return "ERR NO_CLIENT\n";
     if (!tx_.monitor_healthy()) return "ERR MONITOR_FAILED\n";
     if (received_state != VolumeControl::State::IDLE)
         return std::string("ERR ") + state_name(received_state) + "\n";
@@ -246,7 +409,7 @@ std::string Xs8ServiceCore::research_ready(Time now, bool accepted_session)
                             volume_.context_may_be_open();
     tick(now);
     // A previously authorized chained session outlives its request socket.
-    if (!client_connected_ && !accepted_session)
+    if (clients_.empty() && !accepted_session)
         return "ERR RESEARCH reason=NO_CLIENT\n";
     if (!tx_.monitor_healthy()) return "ERR RESEARCH reason=MONITOR_FAILED\n";
     if (before != VolumeControl::State::IDLE ||
@@ -270,10 +433,11 @@ std::string Xs8ServiceCore::research_send(uint8_t byte, Time now,
         " receiver_execution=UNVERIFIED";
 }
 
-void Xs8ServiceCore::disconnected(Time now)
+void Xs8ServiceCore::disconnected(Time now, uint64_t client_id)
 {
-    if (!client_connected_) return;
-    client_connected_ = false;
+    if (!clients_.erase(client_id)) return;
+    if (!volume_owner_set_ || volume_owner_client_ != client_id) return;
+    volume_owner_set_ = false;
     if (volume_.state() == VolumeControl::State::HOLDING_UP ||
         volume_.state() == VolumeControl::State::HOLDING_DOWN)
         volume_.disconnect(owner_direction_, now);
@@ -283,6 +447,13 @@ void Xs8ServiceCore::disconnected(Time now)
 
 void Xs8ServiceCore::tick(Time now)
 {
+    if (cd_hold_ && !tx_.monitor_healthy()) {
+        cd_release("MONITOR_FAILED");
+        cd_fault_ = true;
+    } else if (cd_hold_ && now - cd_lease_renewed_ >= cd_lease_) {
+        cd_release("LEASE_EXPIRED");
+        cd_lease_expired_ = true;
+    }
     if (!tx_.monitor_healthy()) {
         if (!monitor_fault_handled_ &&
             (volume_.stop_owed() || volume_.context_may_be_open())) {
@@ -297,6 +468,10 @@ void Xs8ServiceCore::tick(Time now)
 bool Xs8ServiceCore::shutdown(Time now)
 {
     cd_shutdown_requested_ = true;
+    if (cd_hold_) {
+        cd_shutdown_release_attempted_ = true;
+        cd_release("SHUTDOWN");
+    }
     // A graceful exit makes one last RELEASE attempt if the first was not
     // confirmed. A crash or power loss cannot provide this guarantee.
     if (cd_release_owed_ && !cd_shutdown_release_attempted_) {

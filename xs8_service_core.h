@@ -3,8 +3,10 @@
 
 #include "volume_control.h"
 
+#include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_set>
 
 enum class WaveformEvidence { NOT_OBSERVED, MATCH, MISMATCH, INVALID, MISSING };
 enum class ReceiverEvidence { UNVERIFIED };
@@ -31,9 +33,11 @@ public:
     Xs8ServiceCore(ServiceTransmitter& tx, VolumeControl::Ms max_hold,
                    bool operator_authorized, std::function<bool()> stopping = {},
                    std::function<Time()> now = Clock::now,
-                   std::function<void(Time)> wait_until = {});
-    void connected();
-    std::string command(const std::string& line, Time received, Time now);
+                   std::function<void(Time)> wait_until = {},
+                   VolumeControl::Ms cd_lease = VolumeControl::Ms(2000));
+    void connected(uint64_t client_id = 0);
+    std::string command(const std::string& line, Time received, Time now,
+                        uint64_t client_id = 0);
     // Empty result means one query frame was verified and RX collection may begin.
     std::string begin_query_status(Time now);
     // Empty when a single ROOT research TX may be attempted. Caller also
@@ -41,7 +45,7 @@ public:
     std::string research_ready(Time now, bool accepted_session = false);
     std::string research_send(uint8_t byte, Time now,
                               bool accepted_session = false);
-    void disconnected(Time now);
+    void disconnected(Time now, uint64_t client_id = 0);
     void tick(Time now);
     bool shutdown(Time now);
     VolumeControl::State state() const { return volume_.state(); }
@@ -52,13 +56,25 @@ public:
 private:
     std::string status() const;
     std::string cd_track(uint8_t press_byte, const char *action);
+    std::string cd_press(uint8_t press_byte, const char *action, Time now);
+    std::string cd_release(const char *reason);
+    std::string cd_preflight() const;
     bool attempt_cd_release();
     ServiceTransmitter& tx_;
     VolumeControl volume_;
     std::function<void(Time)> wait_until_;
-    bool client_connected_ = false;
+    VolumeControl::Ms cd_lease_;
+    std::unordered_set<uint64_t> clients_;
+    uint64_t volume_owner_client_ = 0;
+    bool volume_owner_set_ = false;
     bool monitor_fault_handled_ = false;
     bool cd_active_ = false;
+    bool cd_hold_ = false;
+    Time cd_lease_renewed_{};
+    uint64_t cd_hold_token_ = 0;
+    uint64_t cd_last_token_ = 0;
+    bool cd_lease_expired_ = false;
+    std::string cd_action_ = "NONE";
     bool cd_release_owed_ = false;
     bool cd_fault_ = false;
     bool cd_shutdown_requested_ = false;

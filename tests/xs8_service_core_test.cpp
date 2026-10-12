@@ -13,6 +13,21 @@ static Clock::time_point at(int milliseconds)
     return Clock::time_point(Ms(milliseconds));
 }
 
+static std::string hold_token(const std::string& reply)
+{
+    const std::string field = " hold_token=";
+    const auto start = reply.find(field);
+    assert(start != std::string::npos);
+    const auto first = start + field.size();
+    const auto end = reply.find(' ', first);
+    return reply.substr(first, end - first);
+}
+
+static std::string wrong_token(const std::string& token)
+{
+    return token == "999999" ? "999998" : "999999";
+}
+
 struct FakeTx final : ServiceTransmitter {
     std::vector<uint8_t> sent;
     std::deque<bool> stop_matches;
@@ -491,6 +506,272 @@ static void test_cd_interlocks_and_monitor_failure()
     assert(core.cd_fault() && core.cd_release_owed());
 }
 
+static void test_cd_hold_press_release_and_interlocks()
+{
+    for (const auto& trial : {
+             std::pair<const char*, uint8_t>{"TRACK_NEXT", 0xFC},
+             {"TRACK_PREVIOUS", 0xEC}, {"SEEK_FORWARD", 0x7A},
+             {"SEEK_BACKWARD", 0x6A}}) {
+        FakeTx tx;
+        int waits = 0;
+        Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); },
+            [&](Clock::time_point) { ++waits; }, Ms(1500));
+        core.connected();
+        const std::string press = std::string("CD_PRESS ") + trial.first;
+        const auto pressed = core.command(press, at(10), at(10));
+        assert(pressed.find("OK CD_PRESS_TX") == 0);
+        const auto token = hold_token(pressed);
+        assert(tx.sent == (std::vector<uint8_t>{trial.second}));
+        assert(waits == 0 && core.cd_release_owed());
+        assert(core.command("STATUS", at(400), at(400)).find(
+               "cd_state=HOLDING") != std::string::npos);
+        assert(core.command(press, at(400), at(400)) == "ERR CD_TRACK_BUSY\n");
+        assert(core.command("CD_TRACK_NEXT", at(400), at(400)) ==
+               "ERR CD_TRACK_BUSY\n");
+        assert(core.command("VOLUME_PRESS UP", at(400), at(400)) ==
+               "ERR CD_TRACK_BUSY\n");
+        assert(core.command("MUTE", at(400), at(400)) ==
+               "ERR CD_TRACK_BUSY\n");
+        assert(core.research_ready(at(400)) ==
+               "ERR RESEARCH reason=CD_TRACK_BUSY\n");
+        assert(tx.sent == (std::vector<uint8_t>{trial.second}));
+        assert(core.command("CD_RELEASE", at(900), at(900)) ==
+               "ERR CD_TOKEN_REQUIRED\n");
+        assert(core.command("CD_RELEASE " + wrong_token(token),
+                            at(900), at(900)) ==
+               "ERR CD_NOT_OWNER\n");
+        assert(core.command("CD_RELEASE " + token, at(900), at(900)).find(
+               "OK CD_RELEASE_TX") == 0);
+        assert(tx.sent == (std::vector<uint8_t>{trial.second, 0x72}));
+        assert(!core.cd_release_owed() && !core.cd_fault());
+        assert(core.command("CD_RELEASE " + token, at(901), at(901)) ==
+               "ERR CD_NOT_ACTIVE\n");
+        assert(tx.sent.size() == 2);
+    }
+}
+
+static void test_cd_hold_watchdog_disconnect_and_shutdown()
+{
+    FakeTx timeout_tx;
+    Xs8ServiceCore timeout(timeout_tx, Ms(2000), true, {},
+                           [] { return at(0); }, {}, Ms(500));
+    timeout.connected();
+    timeout.command("CD_PRESS TRACK_NEXT", at(10), at(10));
+    timeout.tick(at(509));
+    assert(timeout_tx.sent == (std::vector<uint8_t>{0xFC}));
+    timeout.tick(at(510));
+    assert(timeout_tx.sent == (std::vector<uint8_t>{0xFC, 0x72}));
+    assert(!timeout.cd_fault() && !timeout.cd_release_owed());
+    assert(timeout.command("CD_PRESS TRACK_NEXT", at(511), at(511)) ==
+           "ERR CD_LEASE_EXPIRED\n");
+    timeout.tick(at(600));
+    assert(timeout_tx.sent.size() == 2);
+
+    FakeTx disconnect_tx;
+    Xs8ServiceCore disconnect(disconnect_tx, Ms(2000), true);
+    disconnect.connected();
+    const auto disconnect_token = hold_token(disconnect.command(
+        "CD_PRESS SEEK_BACKWARD", at(10), at(10)));
+    disconnect.disconnected(at(100));
+    assert(disconnect_tx.sent == (std::vector<uint8_t>{0x6A}));
+    assert(disconnect.cd_release_owed());
+    disconnect.connected();
+    assert(disconnect.command("CD_RELEASE " + disconnect_token,
+                              at(101), at(101)).find("OK CD_RELEASE_TX") == 0);
+    assert(disconnect_tx.sent == (std::vector<uint8_t>{0x6A, 0x72}));
+
+    FakeTx shutdown_tx;
+    Xs8ServiceCore shutdown(shutdown_tx, Ms(2000), true);
+    shutdown.connected();
+    shutdown.command("CD_PRESS TRACK_PREVIOUS", at(10), at(10));
+    assert(shutdown.shutdown(at(50)));
+    assert(shutdown_tx.sent == (std::vector<uint8_t>{0xEC, 0x72}));
+    assert(!shutdown.cd_release_owed());
+    assert(shutdown.command("CD_PRESS TRACK_NEXT", at(51), at(51)) ==
+           "ERR SHUTDOWN\n");
+}
+
+static void test_cd_lease_renewal_stale_token_and_recovery()
+{
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); },
+                        {}, Ms(2000));
+    core.connected();
+    const auto first = hold_token(core.command(
+        "CD_PRESS TRACK_NEXT", at(10), at(10)));
+    for (int time = 510; time <= 6010; time += 500) {
+        core.tick(at(time));
+        assert(tx.sent == (std::vector<uint8_t>{0xFC}));
+        assert(core.command("CD_HEARTBEAT " + first,
+                            at(time), at(time)) ==
+               "OK CD_LEASE_RENEWED\n");
+    }
+    assert(core.command("CD_HEARTBEAT " + wrong_token(first),
+                        at(6100), at(6100)) ==
+           "ERR CD_NOT_OWNER\n");
+    assert(core.command("CD_HEARTBEAT garbage", at(6100), at(6100)) ==
+           "ERR CD_TOKEN_REQUIRED\n");
+    assert(core.command("CD_RELEASE " + first, at(6500), at(6500)).find(
+           "OK CD_RELEASE_TX") == 0);
+    assert(tx.sent == (std::vector<uint8_t>{0xFC, 0x72}));
+
+    const auto second = hold_token(core.command(
+        "CD_PRESS SEEK_FORWARD", at(6600), at(6600)));
+    assert(second != first);
+    assert(core.command("CD_HEARTBEAT " + first, at(6700), at(6700)) ==
+           "ERR CD_NOT_OWNER\n");
+    assert(core.command("CD_RELEASE " + first, at(6700), at(6700)) ==
+           "ERR CD_NOT_OWNER\n");
+    assert(tx.sent == (std::vector<uint8_t>{0xFC, 0x72, 0x7A}));
+    core.disconnected(at(6800));
+    assert(tx.sent == (std::vector<uint8_t>{0xFC, 0x72, 0x7A}));
+    core.connected();
+    assert(core.command("CD_RELEASE " + second, at(6900), at(6900)).find(
+           "OK CD_RELEASE_TX") == 0);
+    const auto third = hold_token(core.command(
+        "CD_PRESS TRACK_PREVIOUS", at(6900), at(6900)));
+    assert(third != second);
+    assert(core.command("CD_RELEASE " + second, at(7000), at(7000)) ==
+           "ERR CD_NOT_OWNER\n");
+    assert(core.command("CD_RELEASE " + third, at(7000), at(7000)).find(
+           "OK CD_RELEASE_TX") == 0);
+
+    FakeTx expired_tx;
+    Xs8ServiceCore expired(expired_tx, Ms(2000), true, {},
+                           [] { return at(0); }, {}, Ms(2000));
+    expired.connected();
+    const auto expired_token = hold_token(expired.command(
+        "CD_PRESS TRACK_NEXT", at(10), at(10)));
+    expired.tick(at(2010));
+    assert(expired_tx.sent == (std::vector<uint8_t>{0xFC, 0x72}));
+    assert(!expired.cd_fault() && !expired.cd_release_owed());
+    assert(expired.command("CD_HEARTBEAT " + expired_token,
+                           at(2011), at(2011)) == "ERR CD_NOT_ACTIVE\n");
+    assert(expired.command("CD_PRESS TRACK_NEXT", at(2011), at(2011)) ==
+           "ERR CD_LEASE_EXPIRED\n");
+    expired.disconnected(at(2020));
+    expired.connected();
+    assert(expired.command("CD_PRESS TRACK_NEXT", at(2030), at(2030)) ==
+           "ERR CD_LEASE_EXPIRED\n");
+
+    FakeTx uncertain_tx;
+    Xs8ServiceCore uncertain(uncertain_tx, Ms(2000), true, {},
+                             [] { return at(0); }, {}, Ms(500));
+    uncertain.connected();
+    uncertain.command("CD_PRESS SEEK_FORWARD", at(10), at(10));
+    uncertain_tx.fail_release = true;
+    uncertain.tick(at(510));
+    assert(uncertain_tx.sent == (std::vector<uint8_t>{0x7A, 0x72}));
+    assert(uncertain.cd_fault() && uncertain.cd_release_owed());
+    assert(uncertain.command("CD_PRESS TRACK_NEXT", at(511), at(511)) ==
+           "ERR CD_FAULT_LATCHED\n");
+    uncertain.disconnected(at(512));
+    uncertain.connected();
+    assert(uncertain.command("CD_PRESS TRACK_NEXT", at(513), at(513)) ==
+           "ERR CD_FAULT_LATCHED\n");
+}
+
+static void test_cd_hold_uncertain_and_volume_exclusion()
+{
+    FakeTx press_tx;
+    press_tx.fail_next = true;
+    Xs8ServiceCore press(press_tx, Ms(2000), true);
+    press.connected();
+    assert(press.command("CD_PRESS TRACK_NEXT", at(10), at(10)).find(
+           "ERR CD_PRESS_UNCERTAIN") == 0);
+    assert(press_tx.sent == (std::vector<uint8_t>{0xFC, 0x72}));
+    assert(press.cd_fault() && !press.cd_release_owed());
+
+    FakeTx monitor_tx;
+    Xs8ServiceCore monitor(monitor_tx, Ms(2000), true);
+    monitor.connected();
+    monitor.command("CD_PRESS SEEK_BACKWARD", at(10), at(10));
+    monitor_tx.healthy = false;
+    monitor.tick(at(20));
+    assert(monitor_tx.sent == (std::vector<uint8_t>{0x6A, 0x72}));
+    assert(monitor.cd_fault() && monitor.cd_release_owed());
+    monitor.tick(at(30));
+    assert(monitor_tx.sent.size() == 2);
+
+    FakeTx release_tx;
+    Xs8ServiceCore release(release_tx, Ms(2000), true);
+    release.connected();
+    const auto release_token = hold_token(
+        release.command("CD_PRESS SEEK_FORWARD", at(10), at(10)));
+    release_tx.fail_release = true;
+    assert(release.command("CD_RELEASE " + release_token,
+                           at(100), at(100)).find(
+           "ERR CD_RELEASE_UNCERTAIN") == 0);
+    assert(release.cd_fault() && release.cd_release_owed());
+    assert(release.command("CD_PRESS TRACK_NEXT", at(101), at(101)) ==
+           "ERR CD_FAULT_LATCHED\n");
+    assert(!release.shutdown(at(110)));
+    assert(release_tx.sent == (std::vector<uint8_t>{0x7A, 0x72, 0x72}));
+    FakeTx restarted_tx;
+    Xs8ServiceCore restarted(restarted_tx, Ms(2000), false);
+    restarted.connected();
+    assert(restarted.command("CD_PRESS TRACK_NEXT", at(1), at(1)) ==
+           "ERR BOOT_INHIBIT\n");
+    assert(restarted_tx.sent.empty());
+
+    FakeTx disconnect_failure_tx;
+    Xs8ServiceCore disconnect_failure(disconnect_failure_tx, Ms(2000), true);
+    disconnect_failure.connected();
+    disconnect_failure.command("CD_PRESS TRACK_PREVIOUS", at(10), at(10));
+    disconnect_failure_tx.fail_release = true;
+    disconnect_failure.disconnected(at(20));
+    disconnect_failure.tick(at(2010));
+    assert(disconnect_failure_tx.sent ==
+           (std::vector<uint8_t>{0xEC, 0x72}));
+    assert(disconnect_failure.cd_fault() &&
+           disconnect_failure.cd_release_owed());
+
+    FakeTx volume_tx;
+    Xs8ServiceCore volume(volume_tx, Ms(2000), true);
+    volume.connected();
+    volume.command("VOLUME_PRESS DOWN", at(10), at(10));
+    assert(volume.command("CD_PRESS TRACK_NEXT", at(11), at(11)) ==
+           "ERR HOLDING_DOWN\n");
+    assert(volume_tx.sent == (std::vector<uint8_t>{0x17, 0xE9}));
+    assert(volume.command("VOLUME_RELEASE DOWN", at(20), at(20)) ==
+           "OK VOLUME_RELEASE_TX\n");
+}
+
+static void test_cd_hold_interleaved_clients_and_volume_owner()
+{
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true);
+    constexpr uint64_t cec = 1, cd = 2, web = 3;
+    core.connected(cec);
+    core.connected(cd);
+    const auto token = hold_token(core.command(
+        "CD_PRESS TRACK_NEXT", at(10), at(10), cd));
+    core.disconnected(at(20), cd); // Short-lived CD PRESS socket.
+    assert(tx.sent == (std::vector<uint8_t>{0xFC}));
+    core.connected(web);
+    assert(core.command("STATUS", at(30), at(30), web).find(
+           "cd_state=HOLDING") != std::string::npos);
+    assert(core.command("VOLUME_PRESS UP", at(40), at(40), cec) ==
+           "ERR CD_TRACK_BUSY\n");
+    assert(core.command("MUTE", at(40), at(40), cec) ==
+           "ERR CD_TRACK_BUSY\n");
+    assert(core.command("CD_HEARTBEAT " + token, at(510), at(510), web) ==
+           "OK CD_LEASE_RENEWED\n");
+    assert(tx.sent == (std::vector<uint8_t>{0xFC}));
+    core.disconnected(at(520), web);
+    core.connected(cd);
+    assert(core.command("CD_RELEASE " + token, at(530), at(530), cd).find(
+           "OK CD_RELEASE_TX") == 0);
+    assert(tx.sent == (std::vector<uint8_t>{0xFC, 0x72}));
+    assert(core.command("VOLUME_PRESS UP", at(540), at(540), cec) ==
+           "OK VOLUME_PRESS_TX\n");
+    core.disconnected(at(550), cd); // Other client cannot stop CEC volume.
+    assert(tx.sent == (std::vector<uint8_t>{0xFC, 0x72, 0x17, 0xF9}));
+    core.disconnected(at(560), cec); // CEC owner disconnect still sends STOP.
+    assert(tx.sent ==
+           (std::vector<uint8_t>{0xFC, 0x72, 0x17, 0xF9, 0x09, 0x07}));
+}
+
 int main()
 {
     test_startup_and_parsing();
@@ -507,5 +788,10 @@ int main()
     test_cd_release_failure_and_bounded_shutdown();
     test_cd_shutdown_during_gap_releases_once();
     test_cd_interlocks_and_monitor_failure();
+    test_cd_hold_press_release_and_interlocks();
+    test_cd_hold_watchdog_disconnect_and_shutdown();
+    test_cd_lease_renewal_stale_token_and_recovery();
+    test_cd_hold_uncertain_and_volume_exclusion();
+    test_cd_hold_interleaved_clients_and_volume_owner();
     std::cout << "XS8 service core tests passed\n";
 }
