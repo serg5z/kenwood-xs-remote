@@ -53,6 +53,8 @@ The firmware tracks an outstanding volume stop and retries STOP/ROOT transmissio
 
 **CD STOP is different:** in ROOT with a connected, active changer, logical TX `x9C` was observed to stop playback; RX `D6` followed after about 330 ms. `x09` is the observed continuous-volume STOP in the `x17` context, not an interchangeable CD STOP. Other ROOT STOP-like bytes were reported, but `x9C` has a clearer documented CD test. RX `D6` also appeared after other commands, so its semantics are unresolved. [CD STOP observations](../research/notes/kenwood-xs-reverse-engineering-reviewed.md)
 
+A later operator-reported physical ROOT trial found `x52` (legacy TX `B5`) powered on a standby KR-V6070; its connected changer powered through the receiver's switched AC outlet. ROOT `x41` (legacy TX `7D`) lit the CD PLAY indicator. A service-side `x41 → x9C` trial used a requested 500 ms TX-end-to-next-TX-start gap (approximately 506.7 ms observed) and ended in CD STOP. These results are state-bound physical reports without deposited raw traces. The earlier CD-playing sweep saw no visible action from `x41`, and an already-on follow-up saw none from `x52`; preserve those baseline differences. The PLAY-to-STOP result does not establish `x9C` as a generic key release. [Physical report](../research/notes/xs8-root-validation-2026-10-12.md), [earlier ROOT matrix](../research/notes/kenwood-xs-reverse-engineering-v18.md#L250-L276)
+
 ## Conservative application subset
 
 Use these only with the stated preconditions and an application-maintained context state. Their inclusion means the action was observed in this setup; it does **not** claim universal safety across receiver states. A lost frame or unknown context calls for a verified recovery procedure, not an assumed NOP.
