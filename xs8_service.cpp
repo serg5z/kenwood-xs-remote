@@ -44,15 +44,20 @@ public:
     }
     ServiceTxEvidence last_evidence() const override { return last_; }
     ServiceTxEvidence last_stop_evidence() const override { return last_stop_; }
+    VolumeControl::Time last_tx_end_time() const override {
+        return last_end_time_;
+    }
     uint64_t last_start_ns() const { return last_start_ns_; }
     uint64_t last_end_ns() const { return last_end_ns_; }
     bool send(uint8_t byte) override {
         last_ = {};
+        last_end_time_ = {};
         last_.attempted = true;
         last_.byte = byte;
         uint64_t checkpoint = xs8_monitor_checkpoint(&monitor_);
         int64_t start = 0;
         last_.gpio_completed = xs8_gpio_send(&bus_, byte, &start) == 0;
+        last_end_time_ = VolumeControl::Clock::now();
         int64_t end = xs8_gpio_now_ns();
         last_start_ns_ = start > 0 ? (uint64_t)start : 0;
         last_end_ns_ = end > 0 ? (uint64_t)end : 0;
@@ -93,6 +98,7 @@ private:
     ServiceTxEvidence last_stop_{};
     uint64_t last_start_ns_ = 0;
     uint64_t last_end_ns_ = 0;
+    VolumeControl::Time last_end_time_{};
 };
 
 bool set_nonblocking(int fd)
@@ -698,6 +704,19 @@ int main(int argc, char **argv)
                         failed = true;
                     continue;
                 }
+                if (line == "CD_TRACK_NEXT" ||
+                    line == "CD_TRACK_PREVIOUS") {
+                    if (stopping) {
+                        if (!reply(client, "ERR SHUTDOWN\n")) failed = true;
+                        continue;
+                    }
+                    if (research_tx_uncertain) {
+                        if (!reply(client,
+                                   "ERR RESEARCH reason=TX_UNCERTAIN_LATCHED\n"))
+                            failed = true;
+                        continue;
+                    }
+                }
                 if (!reply(client, core.command(line, received, received))) {
                     failed = true;
                     break;
@@ -718,8 +737,12 @@ int main(int argc, char **argv)
         close(client);
     }
     bool cleaned = core.shutdown(VolumeControl::Clock::now());
-    if (!cleaned || core.stop_owed())
+    if (core.stop_owed() ||
+        core.state() == VolumeControl::State::FAULT_LATCHED)
         std::fprintf(stderr, "WARNING: XS8 STOP unresolved; check receiver\n");
+    if (core.cd_fault() || core.cd_release_owed())
+        std::fprintf(stderr, "WARNING: CD transport uncertain; physically "
+                             "stop/inspect changer before authorized restart\n");
     close(server);
     unlink(socket_path);
     xs8_monitor_stop(monitor);

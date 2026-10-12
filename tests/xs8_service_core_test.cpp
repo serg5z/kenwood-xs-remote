@@ -18,18 +18,25 @@ struct FakeTx final : ServiceTransmitter {
     std::deque<bool> stop_matches;
     bool healthy = true;
     bool fail_next = false;
+    bool fail_gpio_next = false;
     bool fail_root = false;
+    bool fail_release = false;
+    bool fail_release_gpio = false;
     WaveformEvidence fail_waveform = WaveformEvidence::MISSING;
     ServiceTxEvidence last{}, last_stop{};
+    Clock::time_point end_time = at(10);
     bool monitor_healthy() const override { return healthy; }
     ServiceTxEvidence last_evidence() const override { return last; }
     ServiceTxEvidence last_stop_evidence() const override { return last_stop; }
+    Clock::time_point last_tx_end_time() const override { return end_time; }
     bool send(uint8_t byte) override {
         sent.push_back(byte);
         last = {};
         last.attempted = true;
         last.byte = byte;
-        last.gpio_completed = true;
+        last.gpio_completed = !fail_gpio_next &&
+            !(fail_release_gpio && byte == 0x72);
+        fail_gpio_next = false;
         if (byte == 0x09) {
             bool match = stop_matches.empty() ? healthy : stop_matches.front();
             if (!stop_matches.empty()) stop_matches.pop_front();
@@ -38,7 +45,9 @@ struct FakeTx final : ServiceTransmitter {
             last_stop = last;
             return match;
         }
-        const bool match = healthy && !fail_next && !(fail_root && byte == 0x07);
+        const bool match = last.gpio_completed && healthy && !fail_next &&
+            !(fail_root && byte == 0x07) &&
+            !(fail_release && byte == 0x72);
         fail_next = false;
         last.waveform = match ? WaveformEvidence::MATCH
                                 : fail_waveform;
@@ -346,6 +355,142 @@ static void test_research_tx_interlocks()
            "ERR RESEARCH reason=FAULT_LATCHED\n");
 }
 
+static void test_cd_track_success_timing_and_serialization()
+{
+    for (const auto& trial : {std::pair<const char*, uint8_t>{"CD_TRACK_NEXT", 0xFC},
+                              {"CD_TRACK_PREVIOUS", 0xEC}}) {
+        FakeTx tx;
+        Xs8ServiceCore *owner = nullptr;
+        int waits = 0;
+        Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); },
+            [&](Clock::time_point deadline) {
+                ++waits;
+                assert(deadline == at(110)); // TX end at 10 ms + 100 ms.
+                assert(tx.sent == (std::vector<uint8_t>{trial.second}));
+                assert(owner->command("CD_TRACK_NEXT", at(1), at(1)) ==
+                       "ERR CD_TRACK_BUSY\n");
+                assert(owner->command("MUTE", at(1), at(1)) ==
+                       "ERR CD_TRACK_BUSY\n");
+                assert(owner->research_ready(at(1)) ==
+                       "ERR RESEARCH reason=CD_TRACK_BUSY\n");
+                assert(owner->command("STATUS", at(1), at(1)).find(
+                       "cd_release_owed=1") != std::string::npos);
+            });
+        owner = &core;
+        core.connected();
+        const std::string result = core.command(trial.first, at(1), at(1));
+        assert(result.find("OK CD_TRACK_TX") == 0);
+        assert(result.find("release_waveform=MATCH") != std::string::npos);
+        assert(result.find("receiver_execution=UNVERIFIED") !=
+               std::string::npos);
+        assert(tx.sent == (std::vector<uint8_t>{trial.second, 0x72}));
+        assert(waits == 1 && !core.cd_release_owed() && !core.cd_fault());
+        assert(core.command("STATUS", at(2), at(2)).find(
+               "cd_last_result=TX_VERIFIED") != std::string::npos);
+    }
+}
+
+static void test_cd_track_uncertain_press_still_releases()
+{
+    FakeTx tx;
+    tx.fail_next = true;
+    int waits = 0;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); },
+        [&](Clock::time_point) { ++waits; });
+    core.connected();
+    const auto result = core.command("CD_TRACK_NEXT", at(1), at(1));
+    assert(result.find("ERR CD_TRACK_UNCERTAIN") == 0);
+    assert(result.find("cd_result=PRESS_UNCERTAIN") != std::string::npos);
+    assert(tx.sent == (std::vector<uint8_t>{0xFC, 0x72}));
+    assert(waits == 0 && core.cd_fault() && !core.cd_release_owed());
+    assert(core.command("STATUS", at(2), at(2)).find(
+           "state=FAULT_LATCHED") != std::string::npos);
+    assert(core.command("CD_TRACK_PREVIOUS", at(2), at(2)) ==
+           "ERR CD_FAULT_LATCHED\n");
+    assert(core.research_ready(at(2)) ==
+           "ERR RESEARCH reason=CD_FAULT_LATCHED\n");
+
+    FakeTx gpio_tx;
+    gpio_tx.fail_gpio_next = true;
+    Xs8ServiceCore gpio_core(gpio_tx, Ms(2000), true);
+    gpio_core.connected();
+    const auto gpio_result = gpio_core.command("CD_TRACK_PREVIOUS", at(1), at(1));
+    assert(gpio_result.find("press_gpio_tx=TX_FAIL") != std::string::npos);
+    assert(gpio_tx.sent == (std::vector<uint8_t>{0xEC, 0x72}));
+    assert(gpio_core.cd_fault() && !gpio_core.cd_release_owed());
+}
+
+static void test_cd_release_failure_and_bounded_shutdown()
+{
+    FakeTx tx;
+    tx.fail_release = true;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); },
+        [](Clock::time_point) {});
+    core.connected();
+    const auto result = core.command("CD_TRACK_PREVIOUS", at(1), at(1));
+    assert(result.find("cd_result=RELEASE_UNCERTAIN") != std::string::npos);
+    assert(tx.sent == (std::vector<uint8_t>{0xEC, 0x72}));
+    assert(core.cd_fault() && core.cd_release_owed());
+    assert(!core.shutdown(at(2)));
+    assert(tx.sent == (std::vector<uint8_t>{0xEC, 0x72, 0x72}));
+    assert(!core.shutdown(at(3)));
+    assert(tx.sent.size() == 3); // No unbounded shutdown retries.
+
+    FakeTx gpio_tx;
+    gpio_tx.fail_release_gpio = true;
+    Xs8ServiceCore gpio_core(gpio_tx, Ms(2000), true, {},
+                             [] { return at(0); }, [](Clock::time_point) {});
+    gpio_core.connected();
+    const auto gpio_result = gpio_core.command("CD_TRACK_NEXT", at(1), at(1));
+    assert(gpio_result.find("release_gpio_tx=TX_FAIL") != std::string::npos);
+    assert(gpio_core.cd_fault() && gpio_core.cd_release_owed());
+}
+
+static void test_cd_shutdown_during_gap_releases_once()
+{
+    FakeTx tx;
+    Xs8ServiceCore *owner = nullptr;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); },
+        [&](Clock::time_point) {
+            assert(owner->shutdown(at(20)));
+            assert(tx.sent == (std::vector<uint8_t>{0xFC, 0x72}));
+        });
+    owner = &core;
+    core.connected();
+    const auto result = core.command("CD_TRACK_NEXT", at(1), at(1));
+    assert(result.find("OK CD_TRACK_TX") == 0);
+    assert(tx.sent == (std::vector<uint8_t>{0xFC, 0x72}));
+    assert(!core.cd_release_owed());
+    assert(core.command("CD_TRACK_NEXT", at(2), at(2)) == "ERR SHUTDOWN\n");
+}
+
+static void test_cd_interlocks_and_monitor_failure()
+{
+    FakeTx inhibited_tx;
+    Xs8ServiceCore inhibited(inhibited_tx, Ms(2000), false);
+    inhibited.connected();
+    assert(inhibited.command("CD_TRACK_NEXT", at(1), at(1)) ==
+           "ERR BOOT_INHIBIT\n");
+    assert(inhibited_tx.sent.empty());
+
+    FakeTx holding_tx;
+    Xs8ServiceCore holding(holding_tx, Ms(2000), true);
+    holding.connected();
+    holding.command("VOLUME_PRESS DOWN", at(1), at(1));
+    assert(holding.command("CD_TRACK_NEXT", at(2), at(2)) ==
+           "ERR HOLDING_DOWN\n");
+    assert(holding_tx.sent == (std::vector<uint8_t>{0x17, 0xE9}));
+
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); },
+        [&](Clock::time_point) { tx.healthy = false; });
+    core.connected();
+    const auto result = core.command("CD_TRACK_NEXT", at(1), at(1));
+    assert(result.find("cd_result=RELEASE_UNCERTAIN") != std::string::npos);
+    assert(tx.sent == (std::vector<uint8_t>{0xFC, 0x72}));
+    assert(core.cd_fault() && core.cd_release_owed());
+}
+
 int main()
 {
     test_startup_and_parsing();
@@ -357,5 +502,10 @@ int main()
     test_failed_stop_verification_and_monitor();
     test_query_status_gates_and_single_tx();
     test_research_tx_interlocks();
+    test_cd_track_success_timing_and_serialization();
+    test_cd_track_uncertain_press_still_releases();
+    test_cd_release_failure_and_bounded_shutdown();
+    test_cd_shutdown_during_gap_releases_once();
+    test_cd_interlocks_and_monitor_failure();
     std::cout << "XS8 service core tests passed\n";
 }

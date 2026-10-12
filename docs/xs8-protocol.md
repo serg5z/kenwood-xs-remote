@@ -84,7 +84,7 @@ Use these only with the stated preconditions and an application-maintained conte
 
 This subset deliberately excludes the ROOT lock-producing family and bytes whose only evidence is silence, a library name, or an uncontrolled historical state. [Controlled ROOT map and lock family](../research/notes/kenwood-xs-reverse-engineering-reviewed.md)
 
-The validated CD TRACK/SEEK pairs above are **not** added to this conservative subset: their key-down operations can continue if a release is lost, and no application-level release obligation or recovery path is specified here.
+The standalone [CD track socket API](cd-transport-api.md) now owns a discrete `xFC/xEC → x72` release obligation and faults on uncertain delivery. Raw CD TRACK/SEEK key-down bytes are **not** added to this conservative subset: a lost release can leave the changer operating, and neither TX completion nor waveform match proves physical termination.
 
 ## Hazards and limits of evidence
 

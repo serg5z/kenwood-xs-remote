@@ -21,6 +21,7 @@ public:
     virtual bool monitor_healthy() const = 0;
     virtual ServiceTxEvidence last_evidence() const = 0;
     virtual ServiceTxEvidence last_stop_evidence() const = 0;
+    virtual VolumeControl::Time last_tx_end_time() const = 0;
 };
 
 class Xs8ServiceCore {
@@ -29,7 +30,8 @@ public:
     using Time = VolumeControl::Time;
     Xs8ServiceCore(ServiceTransmitter& tx, VolumeControl::Ms max_hold,
                    bool operator_authorized, std::function<bool()> stopping = {},
-                   std::function<Time()> now = Clock::now);
+                   std::function<Time()> now = Clock::now,
+                   std::function<void(Time)> wait_until = {});
     void connected();
     std::string command(const std::string& line, Time received, Time now);
     // Empty result means one query frame was verified and RX collection may begin.
@@ -44,13 +46,25 @@ public:
     bool shutdown(Time now);
     VolumeControl::State state() const { return volume_.state(); }
     bool stop_owed() const { return volume_.stop_owed(); }
+    bool cd_release_owed() const { return cd_release_owed_; }
+    bool cd_fault() const { return cd_fault_; }
     void set_receiver_status(const std::string& fields) { receiver_status_ = fields; }
 private:
     std::string status() const;
+    std::string cd_track(uint8_t press_byte, const char *action);
+    bool attempt_cd_release();
     ServiceTransmitter& tx_;
     VolumeControl volume_;
+    std::function<void(Time)> wait_until_;
     bool client_connected_ = false;
     bool monitor_fault_handled_ = false;
+    bool cd_active_ = false;
+    bool cd_release_owed_ = false;
+    bool cd_fault_ = false;
+    bool cd_shutdown_requested_ = false;
+    bool cd_shutdown_release_attempted_ = false;
+    std::string cd_last_result_ = "NONE";
+    ServiceTxEvidence cd_release_evidence_{};
     VolumeControl::Direction owner_direction_ = VolumeControl::Direction::DOWN;
     std::string receiver_status_ =
         " receiver_source=UNKNOWN receiver_source_ns=0 receiver_source_evidence=NONE"

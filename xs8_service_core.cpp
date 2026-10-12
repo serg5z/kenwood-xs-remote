@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <thread>
 
 namespace {
 const char *state_name(VolumeControl::State state)
@@ -41,9 +42,14 @@ const char *receiver_name(ReceiverEvidence)
 
 Xs8ServiceCore::Xs8ServiceCore(ServiceTransmitter& tx,
     VolumeControl::Ms max_hold, bool operator_authorized,
-    std::function<bool()> stopping, std::function<Time()> now)
+    std::function<bool()> stopping, std::function<Time()> now,
+    std::function<void(Time)> wait_until)
     : tx_(tx), volume_(tx, VolumeControl::Ms(1200), max_hold,
-                       std::move(stopping), std::move(now))
+                       std::move(stopping), std::move(now)),
+      wait_until_(wait_until ? std::move(wait_until) :
+          std::function<void(Time)>([](Time deadline) {
+              std::this_thread::sleep_until(deadline);
+          }))
 {
     // This sends no command. No automatic recovery is available in phase 1.
     volume_.startup(false, operator_authorized);
@@ -59,7 +65,8 @@ std::string Xs8ServiceCore::status() const
     if (evidence.attempted)
         std::snprintf(last_byte, sizeof(last_byte), "0x%02X", evidence.byte);
     else std::snprintf(last_byte, sizeof(last_byte), "NONE");
-    return std::string("OK state=") + state_name(volume_.state()) +
+    return std::string("OK state=") +
+        (cd_fault_ ? "FAULT_LATCHED" : state_name(volume_.state())) +
         " stop_owed=" + (volume_.stop_owed() ? "1" : "0") +
         " context_may_be_open=" +
         (volume_.context_may_be_open() ? "1" : "0") +
@@ -70,7 +77,85 @@ std::string Xs8ServiceCore::status() const
         " last_waveform=" + waveform_name(evidence.waveform) +
         " last_stop_waveform=" + waveform_name(stop.waveform) +
         " receiver_execution=" + receiver_name(evidence.receiver) +
+        " cd_state=" + (cd_fault_ ? "FAULT_LATCHED" :
+                         cd_active_ ? "ACTIVE" : "IDLE") +
+        " cd_release_owed=" + (cd_release_owed_ ? "1" : "0") +
+        " cd_last_result=" + cd_last_result_ +
         receiver_status_ + "\n";
+}
+
+bool Xs8ServiceCore::attempt_cd_release()
+{
+    bool verified = false;
+    bool threw = false;
+    try { verified = tx_.send(0x72); }
+    catch (...) { threw = true; }
+    cd_release_evidence_ = threw ? ServiceTxEvidence{} : tx_.last_evidence();
+    const auto evidence = cd_release_evidence_;
+    if (verified && evidence.attempted && evidence.byte == 0x72 &&
+        evidence.gpio_completed && evidence.waveform == WaveformEvidence::MATCH)
+        cd_release_owed_ = false;
+    else {
+        cd_fault_ = true;
+        std::fprintf(stderr,
+            "WARNING: CD KEY RELEASE 0x72 unconfirmed; inspect changer and "
+            "recover physically before restarting authorized control\n");
+    }
+    return !cd_release_owed_;
+}
+
+std::string Xs8ServiceCore::cd_track(uint8_t press_byte, const char *action)
+{
+    if (cd_shutdown_requested_) return "ERR SHUTDOWN\n";
+    if (cd_fault_ || cd_release_owed_) return "ERR CD_FAULT_LATCHED\n";
+    if (volume_.state() != VolumeControl::State::IDLE ||
+        volume_.stop_owed() || volume_.context_may_be_open())
+        return std::string("ERR ") + state_name(volume_.state()) + "\n";
+    cd_active_ = true;
+    cd_release_owed_ = true; // Set before PRESS: failure may still reach the bus.
+    bool press_verified = false;
+    bool press_threw = false;
+    try { press_verified = tx_.send(press_byte); }
+    catch (...) { press_threw = true; }
+    const auto press = press_threw ? ServiceTxEvidence{} : tx_.last_evidence();
+    const Time press_end = press_threw ? Time{} : tx_.last_tx_end_time();
+    bool gap_ready = press_end != Time{};
+    const bool press_confirmed = press_verified && press.attempted &&
+        press.byte == press_byte && press.gpio_completed &&
+        press.waveform == WaveformEvidence::MATCH && gap_ready;
+    if (press_confirmed) {
+        // Nominal TX-end-to-next-TX-start gap. If verification consumed the
+        // deadline, RELEASE follows immediately; no hard maximum is promised.
+        try { wait_until_(press_end + VolumeControl::Ms(100)); }
+        catch (...) { gap_ready = false; } // RELEASE still takes priority.
+    }
+    const bool release_verified = cd_shutdown_requested_ ? !cd_release_owed_ :
+        (cd_release_owed_ ? attempt_cd_release() : true);
+    const auto release = cd_release_evidence_;
+    cd_active_ = false;
+    if (!release_verified) {
+        cd_last_result_ = "RELEASE_UNCERTAIN";
+    } else if (!press_confirmed || !gap_ready) {
+        cd_fault_ = true;
+        cd_last_result_ = "PRESS_UNCERTAIN";
+    } else cd_last_result_ = "TX_VERIFIED";
+    std::fprintf(stderr,
+        "XS8 CD_TRACK action=%s result=%s press_gpio_tx=%s "
+        "press_waveform=%s release_gpio_tx=%s release_waveform=%s "
+        "receiver_execution=UNVERIFIED\n", action, cd_last_result_.c_str(),
+        press.gpio_completed ? "TX_OK" : "TX_FAIL",
+        waveform_name(press.waveform),
+        release.gpio_completed ? "TX_OK" : "TX_FAIL",
+        waveform_name(release.waveform));
+    return std::string(cd_last_result_ == "TX_VERIFIED" ?
+        "OK CD_TRACK_TX" : "ERR CD_TRACK_UNCERTAIN") +
+        " action=" + action +
+        " press_gpio_tx=" + (press.gpio_completed ? "TX_OK" : "TX_FAIL") +
+        " press_waveform=" + waveform_name(press.waveform) +
+        " release_gpio_tx=" + (release.gpio_completed ? "TX_OK" : "TX_FAIL") +
+        " release_waveform=" + waveform_name(release.waveform) +
+        " cd_result=" + cd_last_result_ +
+        " receiver_execution=UNVERIFIED\n";
 }
 
 std::string Xs8ServiceCore::command(const std::string& line, Time received,
@@ -79,7 +164,12 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
     tick(now);
     if (line == "STATUS") return status();
     if (!client_connected_) return "ERR NO_CLIENT\n";
+    if (cd_active_) return "ERR CD_TRACK_BUSY\n";
+    if (cd_fault_ && line != "VOLUME_RELEASE UP" &&
+        line != "VOLUME_RELEASE DOWN") return "ERR CD_FAULT_LATCHED\n";
     if (!tx_.monitor_healthy()) return "ERR MONITOR_FAILED\n";
+    if (line == "CD_TRACK_NEXT") return cd_track(0xFC, "NEXT");
+    if (line == "CD_TRACK_PREVIOUS") return cd_track(0xEC, "PREVIOUS");
     if (line.compare(0, 14, "SELECT_SOURCE ") == 0) {
         const std::string name = line.substr(14);
         uint8_t byte = 0;
@@ -122,6 +212,8 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
 
 std::string Xs8ServiceCore::begin_query_status(Time now)
 {
+    if (cd_active_) return "ERR CD_TRACK_BUSY\n";
+    if (cd_fault_ || cd_release_owed_) return "ERR CD_FAULT_LATCHED\n";
     const VolumeControl::State received_state = volume_.state();
     const bool received_unresolved =
         volume_.stop_owed() || volume_.context_may_be_open();
@@ -147,6 +239,8 @@ std::string Xs8ServiceCore::begin_query_status(Time now)
 
 std::string Xs8ServiceCore::research_ready(Time now, bool accepted_session)
 {
+    if (cd_active_) return "ERR RESEARCH reason=CD_TRACK_BUSY\n";
+    if (cd_fault_ || cd_release_owed_) return "ERR RESEARCH reason=CD_FAULT_LATCHED\n";
     const auto before = volume_.state();
     const bool unresolved = volume_.stop_owed() ||
                             volume_.context_may_be_open();
@@ -200,4 +294,14 @@ void Xs8ServiceCore::tick(Time now)
     volume_.tick(now);
 }
 
-bool Xs8ServiceCore::shutdown(Time now) { return volume_.shutdown(now); }
+bool Xs8ServiceCore::shutdown(Time now)
+{
+    cd_shutdown_requested_ = true;
+    // A graceful exit makes one last RELEASE attempt if the first was not
+    // confirmed. A crash or power loss cannot provide this guarantee.
+    if (cd_release_owed_ && !cd_shutdown_release_attempted_) {
+        cd_shutdown_release_attempted_ = true;
+        attempt_cd_release();
+    }
+    return volume_.shutdown(now) && !cd_release_owed_ && !cd_fault_;
+}
