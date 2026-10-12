@@ -55,6 +55,20 @@ The firmware tracks an outstanding volume stop and retries STOP/ROOT transmissio
 
 A later operator-reported physical ROOT trial found `x52` (legacy TX `B5`) powered on a standby KR-V6070; its connected changer powered through the receiver's switched AC outlet. ROOT `x41` (legacy TX `7D`) lit the CD PLAY indicator. A service-side `x41 → x9C` trial used a requested 500 ms TX-end-to-next-TX-start gap (approximately 506.7 ms observed) and ended in CD STOP. These results are state-bound physical reports without deposited raw traces. The earlier CD-playing sweep saw no visible action from `x41`, and an already-on follow-up saw none from `x52`; preserve those baseline differences. The PLAY-to-STOP result does not establish `x9C` as a generic key release. [Physical report](../research/notes/xs8-root-validation-2026-10-12.md), [earlier ROOT matrix](../research/notes/kenwood-xs-reverse-engineering-v18.md#L250-L276)
 
+### CD transport PRESS and RELEASE in ROOT
+
+October 12 attended trials physically validated logical TX `x72` (legacy TX `B1`) as a common **CD transport KEY UP/RELEASE** after four ROOT-context key-down operations. Historical ROOT matrix labels `x6A` as continuous backward (`<<C`) and `x7A` as continuous forward (`>>C`), consistent with the reported SEEK directions. All bytes in this table are transmitted directly in ROOT, with no `x17`. The physical outcomes were operator-observed; per-trial raw edges and service replies were not deposited. `TX_OK` or waveform `MATCH` alone would not prove receiver execution. [Physical trial report](../research/notes/xs8-cd-key-release-2026-10-12.md), [historical directions](../research/notes/kenwood-xs-reverse-engineering-v18.md#L230-L269)
+
+| Operation | Logical TX sequence (legacy TX) | Reported physical outcome |
+|---|---|---|
+| TRACK NEXT press/release | `xFC → x72` (`C0 → B1`) | One track forward near a 100 ms requested gap; two tracks near 500 ms. |
+| TRACK PREVIOUS press/release | `xEC → x72` (`C8 → B1`) | Restarted the current track; `xEC → x72 → xEC → x72` moved to the previous track (`id=34`). |
+| SEEK BACKWARD press/release | `x6A → x72` (`A9 → B1`) | Seek started and terminated (`id=35`). |
+| SEEK FORWARD press/release | `x7A → x72` (`A1 → B1`) | Seek started and terminated, repeated twice (`id=36–37`). |
+| CD STOP/CANCEL after NEXT | `xFC → x9C` (`C0 → C6`) | Continuing skip cancelled **and playback stopped**. `x9C` is not equivalent to `x72` KEY UP. |
+
+The successful PRESS/RELEASE pairs requested **100 ms** from the end of one TX to the beginning of the next; actual gaps were reported collectively as approximately **104–109 ms**. These values are observations, not a hard maximum or a guaranteed single-track threshold. A queued sequence can abort before RELEASE, and an unobserved or malformed release frame can leave an operation active. The older ROOT+CD+playing sweep recorded **no visible effect** for `x72` without an active TRACK/SEEK operation; that state-dependent negative result remains part of the record. `x72` is established only for these four tested CD operations, not as a universal XS8 release. Volume `x09`, context exit `x07`, front-panel-lock release `x15`, and CD STOP `x9C` retain their distinct observed roles. [Older baseline](../research/notes/kenwood-xs-reverse-engineering-v18.md#L250-L269), [paired trials](../research/notes/xs8-cd-key-release-2026-10-12.md)
+
 ## Conservative application subset
 
 Use these only with the stated preconditions and an application-maintained context state. Their inclusion means the action was observed in this setup; it does **not** claim universal safety across receiver states. A lost frame or unknown context calls for a verified recovery procedure, not an assumed NOP.
@@ -70,9 +84,12 @@ Use these only with the stated preconditions and an application-maintained conte
 
 This subset deliberately excludes the ROOT lock-producing family and bytes whose only evidence is silence, a library name, or an uncontrolled historical state. [Controlled ROOT map and lock family](../research/notes/kenwood-xs-reverse-engineering-reviewed.md)
 
+The validated CD TRACK/SEEK pairs above are **not** added to this conservative subset: their key-down operations can continue if a release is lost, and no application-level release obligation or recovery path is specified here.
+
 ## Hazards and limits of evidence
 
 - Continuous volume can persist after one start frame. A lost `x09` can leave the receiver changing volume; a BUSY line that never clears defeats the bridge watchdog’s attempt to transmit STOP.
+- Continuous CD TRACK/SEEK can persist after key down. The observed `x72` pairs terminated the four tested operations, but TX completion and an RX waveform match do not guarantee physical termination after a lost or malformed release; `x9C` stops playback as well as skipping in the reported `xFC → x9C` trial. [CD release report](../research/notes/xs8-cd-key-release-2026-10-12.md)
 - In ROOT, `x35 x36 x45 x46 x55 x56 x65 x66 x67 x75 x76 x77 xA5 xA6 xD5 xD6` produced an observed persistent front-panel control lock. Their protocol semantics are unknown. They are **not** in the application subset. [Lock tests](../research/notes/kenwood-xs-reverse-engineering-reviewed.md)
 - RX silence or no recorded visible action is not evidence that a byte is a NOP. The broad ROOT sweep was performed with CD selected and playing; the `x17` sweep was targeted, and other states remain incompletely tested. [Sweep conditions](../research/notes/kenwood-xs-reverse-engineering-reviewed.md), [targeted-sweep caveat](../research/notes/kenwood-xs-reverse-engineering-v18.md)
 - Changer RX `D6`, `D8`, `DA`, and `DE` have observed associations, not established field meanings. Passive PAUSE was labeled RX `D2`, while active pause yielded RX `DA`; this contradiction remains open. [Changer reports](../research/notes/kenwood-xs-reverse-engineering-reviewed.md), [passive pause](../research/notes/kenwood-xs8-sniffing-notes.md)
