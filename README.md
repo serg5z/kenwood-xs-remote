@@ -57,6 +57,7 @@ A complementary **Web Remote** for receiver input selection and CD transport is 
 
 ## Documentation
 
+- [ARMv6 Docker build from Apple Silicon](docs/pi-build.md)
 - [Architecture and serial command flow](docs/architecture.md)
 - [Hardware wiring and checks](docs/hardware.md)
 - [XS8 engineering specification](docs/xs8-protocol.md)
