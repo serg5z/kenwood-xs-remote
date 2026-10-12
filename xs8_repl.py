@@ -82,10 +82,13 @@ def parse_send(parts, default_window):
 
 
 class Console:
-    def __init__(self, socket_path=DEFAULT_SOCKET, output=print, pause=time.sleep):
+    def __init__(self, socket_path=DEFAULT_SOCKET, output=print, pause=time.sleep,
+                 confirm=input):
         self.socket_path = socket_path
         self.output = output
         self.pause = pause
+        self.confirm = confirm
+        self.context_token = None
         self.default_window = 1500
         self.history = []
 
@@ -110,12 +113,18 @@ class Console:
             return True
         name = parts[0].lower()
         if name in ("quit", "exit") and len(parts) == 1:
+            self.close_preparation()
             return False
         if name == "help" and len(parts) == 1:
             self.output("status | query | send 0xNN [milliseconds] | "
                         "send 0xNN 0xNN [up to 4] [--gap-ms N] "
                         "[--observe-ms N] | observe N | "
-                        "set observe N | history | help | quit")
+                        "context prepare MUTE | context status | "
+                        "context observe [N] | context run (blocked) | "
+                        "context cancel | set observe N | history | help | quit")
+            return True
+        if name == "context":
+            self._context(parts)
             return True
         if name == "history" and len(parts) == 1:
             for entry in self.history:
@@ -138,23 +147,92 @@ class Console:
             return True
         raise ValueError("unknown command or arguments; type help")
 
-    def _experiment(self, command):
+    def _context(self, parts):
+        if parts == ["context", "status"]:
+            reply = request(self.socket_path, "RESEARCH_CONTEXT_STATUS")
+            self.output(reply)
+            if fields(reply).get("state") != "PREPARED":
+                self.context_token = None
+            return
+        if parts == ["context", "prepare", "MUTE"]:
+            if self.context_token:
+                raise ValueError("check context status or cancel the existing preparation")
+            self.output("MUTE profile: proposed 0x17 → 0xD8 → 0x07. "
+                        "Preparation reserves the service and records passive RX only. "
+                        "RUN is blocked pending independent recovery evidence.")
+            if self.confirm("Type PREPARE MUTE NO TX to confirm attended preparation: ") != \
+                    "PREPARE MUTE NO TX":
+                self.output("Preparation declined; no service command sent.")
+                return
+            reply = request(self.socket_path,
+                            "RESEARCH_CONTEXT_PREPARE MUTE CONFIRM_NO_TX")
+            self.output(re.sub(r"token=\d+", "token=<private>", reply))
+            token = fields(reply).get("token")
+            if reply.startswith("OK RESEARCH_CONTEXT_PREPARED ") and token and token.isdecimal():
+                self.context_token = token
+                self._experiment(
+                    f"RESEARCH_CONTEXT_OBSERVE {token} {self.default_window}", token)
+            return
+        if parts in (["context", "cancel"], ["context", "exit"]):
+            self.close_preparation()
+            return
+        if len(parts) in (2, 3) and parts[1] == "observe":
+            if not self.context_token:
+                raise ValueError("context prepare MUTE is required for passive preparation capture")
+            window = self.default_window if len(parts) == 2 else window_ms(parts[2])
+            self._experiment(
+                f"RESEARCH_CONTEXT_OBSERVE {self.context_token} {window}",
+                self.context_token)
+            return
+        if parts == ["context", "run"]:
+            if not self.context_token:
+                raise ValueError("context prepare MUTE is required; RUN remains blocked")
+            reply = request(self.socket_path,
+                            f"RESEARCH_CONTEXT_RUN {self.context_token}")
+            self.output(reply)
+            self.history.append("context run MUTE: " + reply)
+            return
+        raise ValueError("only MUTE preparation is allowlisted; context entry/send is disabled")
+
+    def close_preparation(self):
+        if not self.context_token:
+            return
+        token, self.context_token = self.context_token, None
+        try:
+            self.output(request(self.socket_path, f"RESEARCH_CONTEXT_CANCEL {token}"))
+        except OSError:
+            self.output("Preparation cancellation unavailable; its inactivity lease will expire. "
+                        "No XS8 context was entered.")
+
+    def _experiment(self, command, context_token=None):
+        display_command = re.sub(r"(RESEARCH_CONTEXT_OBSERVE) \d+",
+                                 r"\1 <token>", command)
         reply = request(self.socket_path, command)
         self.output(reply)
         if not reply.startswith("OK RESEARCH_") and not reply.startswith(
                 "ERR RESEARCH_TX "):
-            self.history.append(f"{command}: {reply}")
+            self.history.append(f"{display_command}: {reply}")
             return
         session = fields(reply).get("id")
         if not session or not session.isdecimal():
-            self.history.append(f"{command}: invalid session reply")
+            self.history.append(f"{display_command}: invalid session reply")
             return
         index = 0
         tx_index = 0
         tx_done = not command.startswith("RESEARCH_CHAIN ")
         busy_until = time.monotonic() + 10.0
+        heartbeat_at = time.monotonic() + 0.5
         try:
             while True:
+                if context_token and time.monotonic() >= heartbeat_at:
+                    renewed = request(self.socket_path,
+                                      f"RESEARCH_CONTEXT_HEARTBEAT {context_token}")
+                    if not renewed.startswith("OK RESEARCH_CONTEXT_LEASE_RENEWED "):
+                        self.output(renewed)
+                        self.history.append(f"{display_command}: preparation lease ended")
+                        self.context_token = None
+                        return
+                    heartbeat_at = time.monotonic() + 0.5
                 if not tx_done:
                     tx_report = self._read_session(
                         f"RESEARCH_TX_READ {session} {tx_index}", busy_until)
@@ -168,7 +246,7 @@ class Console:
                         self.pause(0.05)
                     else:
                         self.output(tx_report)
-                        self.history.append(f"{command}: {reply}; {tx_report}")
+                        self.history.append(f"{display_command}: {reply}; {tx_report}")
                         return
                 report = self._read_session(
                     f"RESEARCH_READ {session} {index}", busy_until)
@@ -181,15 +259,20 @@ class Console:
                     self.pause(0.05)
                 else:
                     self.output(report)
-                    self.history.append(f"{command}: {reply}; {report}")
+                    self.history.append(f"{display_command}: {reply}; {report}")
                     return
         except KeyboardInterrupt:
+            if context_token:
+                self.close_preparation()
+                self.output("Passive preparation interrupted; no XS8 TX was attempted.")
+                self.history.append(f"{display_command}: passive capture interrupted")
+                return
             try:
                 request(self.socket_path, f"RESEARCH_CANCEL {session}")
             except OSError:
                 pass
             self.output("Observation interrupted; XS8 transmission may already have occurred.")
-            self.history.append(f"{command}: interrupted after {index} records")
+            self.history.append(f"{display_command}: interrupted after {index} records")
 
 
 def main():
@@ -200,17 +283,21 @@ def main():
     print("XS8 research console. Type help. SEND requires the service's "
           "default-off --enable-research-tx authorization; chains also "
           "require --enable-research-chain.")
-    while True:
-        try:
-            if not console.command(input("xs8> ")):
+    try:
+        while True:
+            try:
+                if not console.command(input("xs8> ")):
+                    break
+            except EOFError:
                 break
-        except EOFError:
-            break
-        except KeyboardInterrupt:
-            print("Interrupted locally; a submitted XS8 command may still "
-                  "be running. No command was retried.")
-        except (OSError, ValueError) as error:
-            print(f"Error: {error}")
+            except KeyboardInterrupt:
+                console.close_preparation()
+                print("Interrupted locally; a submitted XS8 command may still "
+                      "be running. No command was retried.")
+            except (OSError, ValueError) as error:
+                print(f"Error: {error}")
+    finally:
+        console.close_preparation()
 
 
 if __name__ == "__main__":

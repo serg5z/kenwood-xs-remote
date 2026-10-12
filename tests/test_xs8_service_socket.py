@@ -18,6 +18,7 @@ class ServiceSocketTest(unittest.TestCase):
         self.process = subprocess.Popen([
             str(pathlib.Path(".build/xs8_service_socket_test").resolve()),
             "--socket", self.path, "--allow-unrecovered-start",
+            "--enable-research-tx", "--enable-research-chain",
         ], stdout=subprocess.DEVNULL, stderr=self.log)
         deadline = time.monotonic() + 3
         while not pathlib.Path(self.path).exists():
@@ -138,6 +139,84 @@ class ServiceSocketTest(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.01)
         self.assertEqual(self.transmitted(), ["0x17", "0xE9", "0x09", "0x07"])
+
+    def prepare_context(self):
+        reply = self.request("RESEARCH_CONTEXT_PREPARE MUTE CONFIRM_NO_TX")
+        self.assertTrue(reply.startswith("OK RESEARCH_CONTEXT_PREPARED"), reply)
+        self.assertIn("context_entered=0 recovery_ready=0", reply)
+        return re.search(r"token=(\d+)", reply).group(1)
+
+    def test_attended_context_preparation_is_exclusive_passive_and_run_blocked(self):
+        self.assertIn("CONFIRMATION_REQUIRED", self.request(
+            "RESEARCH_CONTEXT_PREPARE MUTE NO"))
+        self.assertIn("PROFILE_NOT_ALLOWLISTED", self.request(
+            "RESEARCH_CONTEXT_PREPARE PHONO CONFIRM_NO_TX"))
+        with self.connect() as cec:
+            token = self.prepare_context()
+            self.assertIn("state=RESEARCH_PREPARATION", self.request("STATUS"))
+            for command in ("VOLUME_PRESS UP", "MUTE", "CD_TRACK_NEXT", "QUERY_STATUS",
+                            "SELECT_SOURCE CD", "RESEARCH_SEND 0x17 100"):
+                reply = self.command(cec, command)
+                self.assertEqual(reply,
+                                 "ERR RESEARCH_CONTEXT reason=EXCLUSIVE_PREPARATION")
+            self.assertEqual(self.command(cec, "VOLUME_RELEASE UP"),
+                             "OK VOLUME_RELEASE_TX")
+            wrong = "1" if token != "1" else "2"
+            self.assertIn("NOT_OWNER", self.request("RESEARCH_CONTEXT_CANCEL " + wrong))
+            self.assertIn("NOT_OWNER", self.request("RESEARCH_CONTEXT_RUN " + wrong))
+            self.assertIn("RECOVERY_EVIDENCE_MISSING", self.request(
+                "RESEARCH_CONTEXT_RUN " + token))
+            observed = self.request(f"RESEARCH_CONTEXT_OBSERVE {token} 100")
+            experiment = re.search(r"id=(\d+)", observed).group(1)
+            self.assertIn("tx_attempted=0", observed)
+            deadline = time.monotonic() + 1
+            while not self.request(f"RESEARCH_READ {experiment} 0").startswith(
+                    "OK RESEARCH_DONE"):
+                self.assertLess(time.monotonic(), deadline)
+                self.request("RESEARCH_CONTEXT_HEARTBEAT " + token)
+                time.sleep(0.02)
+            status = self.request("RESEARCH_CONTEXT_STATUS")
+            self.assertIn("panel_check=NOT_OBSERVED", status)
+            self.assertNotIn("token=", status)
+            self.assertEqual(self.transmitted(), [])
+            self.assertIn("context_entered=0 tx_attempted=0", self.request(
+                "RESEARCH_CONTEXT_CANCEL " + token))
+            self.assertIn("state=IDLE", self.request("STATUS"))
+            self.assertEqual(self.request("RESEARCH_SEND 0x17 100"),
+                             "ERR RESEARCH reason=CONTEXT_ENTRY_FORBIDDEN")
+            self.assertEqual(self.request("RESEARCH_CHAIN 2 200 100 0x17 0xD8"),
+                             "ERR RESEARCH reason=CONTEXT_ENTRY_FORBIDDEN")
+            self.assertEqual(self.transmitted(), [])
+
+    def test_context_preparation_disappearance_and_shutdown_never_send_cleanup(self):
+        token = self.prepare_context()
+        deadline = time.monotonic() + 3
+        while "state=EXPIRED" not in self.request("RESEARCH_CONTEXT_STATUS"):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        self.assertIn("NO_SESSION", self.request("RESEARCH_CONTEXT_RUN " + token))
+        self.assertIn("state=IDLE", self.request("STATUS"))
+        next_token = self.prepare_context()
+        self.assertNotEqual(token, next_token)
+        self.assertIn("NOT_OWNER", self.request("RESEARCH_CONTEXT_RUN " + token))
+        self.process.terminate()
+        self.assertEqual(self.process.wait(timeout=3), 0)
+        self.assertEqual(self.transmitted(), [])
+
+    def test_context_preparation_cannot_bypass_volume_or_cd_release_obligations(self):
+        with self.connect() as cec:
+            self.assertEqual(self.command(cec, "VOLUME_PRESS DOWN"), "OK VOLUME_PRESS_TX")
+            self.assertIn("UNRESOLVED_CONTROL_STATE", self.request(
+                "RESEARCH_CONTEXT_PREPARE MUTE CONFIRM_NO_TX"))
+            self.assertIn("state=HOLDING_DOWN", self.request("STATUS"))
+            self.assertEqual(self.transmitted(), ["0x17", "0xE9"])
+            self.assertEqual(self.command(cec, "VOLUME_RELEASE DOWN"),
+                             "OK VOLUME_RELEASE_TX")
+        token = self.press("TRACK_NEXT")
+        self.assertIn("UNRESOLVED_CONTROL_STATE", self.request(
+            "RESEARCH_CONTEXT_PREPARE MUTE CONFIRM_NO_TX"))
+        self.assertTrue(self.request("CD_RELEASE " + token).startswith("OK CD_RELEASE_TX"))
+        self.assertEqual(self.transmitted(), ["0x17", "0xE9", "0x09", "0x07", "0xFC", "0x72"])
 
 
 if __name__ == "__main__":

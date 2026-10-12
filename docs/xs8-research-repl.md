@@ -4,6 +4,8 @@
 
 From the repository root, run `python3 xs8_repl.py [--socket /tmp/kenwood-xs8.sock]`. Starting the REPL sends no XS8 command. Type `help` for `status`, `query`, `send 0xNN [milliseconds]`, `observe N`, `set observe N`, `history`, and `quit`. The default post-TX observation window is 1500 ms; the server accepts windows of 1–5000 ms. `query` invokes the existing `QUERY_STATUS` request and does not depend on research TX authorization. `observe` is passive and can operate with research TX disabled if the monitor is healthy.
 
+The attended **preparation-only** `context` commands below are available. They never enter receiver context or transmit the proposed experiment. General `context enter/send` remains unimplemented, and raw logical `0x17` remains forbidden in both single-byte and chained research TX.
+
 Example transcript (illustrative; **not** a recorded hardware result):
 
 ```text
@@ -43,3 +45,104 @@ The service checks IDLE, monitor integrity, STOP obligation, and context before 
 ## Offline checks and Pi validation
 
 Run `make test` and `python3 -m unittest tests/test_xs8_repl.py` with no receiver connected. On the Raspberry Pi, build with `make .build/xs8-service`; validate the CLI first against a fake Unix-socket service. Before enabling research TX on the real XS8 Service, review its effective startup command, socket ownership, monitor health, receiver state, and physical recovery plan. Keep the research flag absent from normal startup, and remove it again after the attended session. The current implementation is not deployed by this document.
+
+## Attended MUTE experiment preparation: NO TX
+
+The first named profile is **MUTE**, whose characterized transaction is exactly logical `0x17 → 0xD8 → 0x07`, using the working volume controller's existing entry/exit path. No arbitrary byte, source-selection candidate, volume START, or seek command is admitted. This phase implements preparation and passive diagnostics only: `context run` always refuses TX with `RECOVERY_EVIDENCE_MISSING`. Ordinary production MUTE retains its existing behavior; preparation does not execute it or create a new route around the raw `0x17` prohibition.
+
+| REPL command | Implemented behavior |
+|---|---|
+| `context prepare MUTE` | Ask for the exact phrase `PREPARE MUTE NO TX`; reserve the service under a private token and immediately record one passive window using the configured observation duration. |
+| `context status` | Report the preparation state and independent context, panel and normal-control evidence fields. It sends no XS8 frame and does not renew inactivity. |
+| `context observe [N]` | Record another passive window under the token; no frame decoding semantics are invented. |
+| `context run` | Refuse transmission, even with production operator/research startup flags enabled. |
+| `context cancel` / `context exit` | Cancel passive preparation. No `0x07` is sent because this preparation never entered hardware context. |
+
+The service owns preparation across short-lived sockets. It requires IDLE, no `stop_owed`, no possibly open context, no CD fault/RELEASE obligation, no active research/query, and healthy monitor/receiver-observation integrity. A preparation token permits only its heartbeat, passive capture, blocked RUN and cancellation; it is absent from service logs, STATUS and console history. Explicit confirmation is an attended-use assertion, not authentication; existing Unix-socket permissions remain required.
+
+While reserved, normal STATUS reports `state=RESEARCH_PREPARATION`, so the existing Gateway readiness check disables active controls. STATUS and passive record reads remain responsive. Conflicting CEC volume PRESS, MUTE, CD, source, QUERY_STATUS and unrelated research mutations receive `EXCLUSIVE_PREPARATION`. Volume RELEASE remains available to preserve existing STOP handling. A 2-second inactivity lease and **10-second absolute lifetime** bound the reservation; the REPL renews inactivity about every 500 ms while reading passive observations. Renewals cannot extend the absolute deadline. No background heartbeat keeps an abandoned console reserved indefinitely.
+
+Cancellation, Ctrl+C, quit/EOF, missing heartbeat, absolute expiry, clock/monitor failure, receiver-integrity loss, capture overflow and service shutdown release preparation without any cleanup TX. Passive frames—including malformed frames—retain both decoder byte conventions, timestamps and gap/error diagnostics through the existing research record format. `context_entered=0` and `tx_attempted=0` describe this experiment's lack of transmission; they do not measure the receiver's pre-existing context or prove an unlocked front panel. All recovery-check fields remain `NOT_OBSERVED`; releasing a software reservation is never reported as successful physical recovery.
+
+Illustrative preparation only:
+
+```text
+xs8> context prepare MUTE
+Type PREPARE MUTE NO TX to confirm attended preparation: PREPARE MUTE NO TX
+OK RESEARCH_CONTEXT_PREPARED token=<private> profile=MUTE mode=PREPARATION_ONLY ... context_entered=0 recovery_ready=0
+OK RESEARCH_OBSERVE id=... mode=CONTEXT_PREPARATION_PASSIVE tx_attempted=0
+OK RESEARCH_DONE ...
+xs8> context run
+ERR RESEARCH_CONTEXT reason=RECOVERY_EVIDENCE_MISSING profile=MUTE ... context_entered=0
+xs8> context cancel
+OK RESEARCH_CONTEXT_CANCELLED context_entered=0 tx_attempted=0
+```
+
+### Smallest missing observation and exact attended-test prerequisites
+
+Normal MUTE entry/exit is already characterized, but the archive lacks a single recorded trial tying that transaction to all three independent postconditions below. Status response alone cannot supply them: the documented front-panel lock still allowed `0x13` replies. Before reviewing any transmitting research profile, archive **one attended use of the existing production MUTE transaction** with raw/decoded bus evidence and these checks:
+
+| Independent check | Required evidence | Insufficient evidence |
+|---|---|---|
+| Logical context returned to ROOT | After the transaction, one explicit existing `QUERY_STATUS` returns the expected two observations for the physically known source/MONITOR state. | `0x07` TX_OK/MATCH or silence after `0x17`. |
+| Front-panel operation / lock | An attended, non-motor front-panel source selection visibly works; record the display/state and any passive broadcast. | A ROOT status reply, which also worked while locked. |
+| Normal receiver control | An existing, validated ROOT source operation visibly works after the front-panel check—for example CD `0x84` from a different known source, without a tuner-preset side effect. | A command name, GPIO TX_OK or waveform MATCH without physical observation. |
+
+Prerequisites for that separate hardware observation:
+
+1. The receiver and changer are attended, volume is at a safe level, no volume or CD hold is active, and front-panel controls and an independent physical recovery procedure are reachable. Record source, MONITOR, MUTE and front-panel responsiveness before the trial. The historical standby/wake lock recovery is state-bound evidence, not an automatic service recovery action.
+2. Existing service operator authorization is established independently; STATUS is IDLE, monitor healthy, no STOP/context/CD RELEASE obligation and receiver-observation integrity healthy. Preparation cannot bypass BOOT_INHIBIT. Arrange that CEC/Web operators issue no concurrent commands during the one trial.
+3. Cancel/expire the NO-TX preparation reservation first. Its RUN remains blocked. Use only the already implemented production MUTE path for this separate observation, exactly once; do not inject raw `0x17`, add unknown bytes, toggle MUTE twice automatically or retry an ambiguous result.
+4. Start an existing passive observation window before the MUTE transaction and archive intended TX, observed frames, both byte conventions, timestamps, gaps/timing diagnostics and operator observations. Extend evidence collection with additional passive windows as needed for the physical checks; do not substitute a scan.
+5. Record the three postconditions separately. If any fails or traffic/timing is uncertain, stop testing, retain the evidence and recover physically using the attended procedure. An ambiguous trial does not authorize the new transmitting profile.
+6. Review the archived result and failure handling before implementing/enabling one default-off transmitting MUTE profile. VIDEO 1 / VIDEO 2 remain outside the allowlist; their TX bytes and recovery behavior require separate evidence.
+
+The implemented socket requests are `RESEARCH_CONTEXT_PREPARE MUTE CONFIRM_NO_TX`, `RESEARCH_CONTEXT_STATUS`, `RESEARCH_CONTEXT_OBSERVE TOKEN N`, `RESEARCH_CONTEXT_HEARTBEAT TOKEN`, `RESEARCH_CONTEXT_RUN TOKEN` (always blocked), and `RESEARCH_CONTEXT_CANCEL TOKEN`. No byte-bearing context SEND is supported. Fake-backend tests check zero experiment TX, exclusivity with interleaved STATUS/CEC clients, existing STOP/CD RELEASE obligations, expiry, stale tokens, diagnostic failures and shutdown. They do not establish the missing physical postconditions or claim tested recovery after a new experiment TX failure.
+
+## Proposed context session: disabled pending recovery validation
+
+This broader entered-context API is a **design proposal**, not an available transmitting REPL or socket API. The preparation-only subset above does not enable it. Entry remains disabled because safe automatic recovery after an arbitrary context byte has not been established. `CONTEXT_ENTRY_FORBIDDEN` remains enforced for `RESEARCH_SEND` and `RESEARCH_CHAIN`; neither existing startup authorization nor research TX flags waive it. [Current service](../xs8_service.cpp)
+
+### Verified lifecycle and missing evidence
+
+- **Reported hardware behavior:** from the tested ROOT baseline, logical `0x17` changed `0x84` from CD selection to tuner CH8 and made `0x13` silent. Logical `0x07` restored ROOT interpretation and status responses. This supplies normal entry/exit evidence for the tested states. It supplies no positive entry acknowledgment, additional handshake, or universal mode query. [Controlled probes](../research/notes/kenwood-xs-reverse-engineering-reviewed.md#L26-L53), [exit/status observation](../research/notes/kenwood-xs-reverse-engineering-v18.md#L553-L562)
+- **Working software mechanism:** `VolumeControl` marks context possibly open before sending `0x17` through the normal BUSY-checked, waveform-verified transmitter. It sends its known volume or MUTE command, then closes context with `0x07`; a volume START first creates an obligation to send `0x09`. This is more than a raw `send 0x17`, but it still does not prove receiver execution. [Entry](../volume_control.cpp#L160-L195), [MUTE](../volume_control.cpp#L239-L261), [cleanup](../volume_control.cpp#L116-L157)
+- **Recovery gap:** `0x07` did not release the recorded front-panel lock. `0x15` released that lock in ROOT but started preset scan after `0x17`. `0x09` is the known entered-context volume STOP, and ROOT `0x72` is validated only for four CD transport operations. No universal combination is established for an unknown entered-context byte. The implemented startup `0x17 → 0x09 → 0x07` path is explicitly experimental, not archived proof of recovery in arbitrary states. [Lock distinction](../research/notes/kenwood-xs-reverse-engineering-reviewed.md#L195-L206), [context-sensitive `0x15`](../research/notes/kenwood-xs-reverse-engineering-v18.md#L539-L562), [experimental recovery](../volume_control.cpp#L76-L113)
+- **VIDEO source gap:** TV1/TV2 have physically validated passive/status source IDs, but those RX labels do not establish their logical TX commands or a safe exit profile after an unknown candidate. Earlier TX names and numerical patterns cannot fill that gap. [Source-selection evidence](source-selection.md), [RX validation](../research/notes/xs8-readback-2026-10-11.md)
+
+These distinctions block enabling a general `context send 0xNN`. A narrower implementation could proceed only with a reviewed per-command allowlist whose normal termination and recovery behavior have been demonstrated. A token, timer, or fake transmitter can enforce software cleanup attempts; none supplies the missing hardware recovery evidence.
+
+### Proposed local API and ownership
+
+| Future REPL command | Proposed socket request | Intended behavior |
+|---|---|---|
+| `context enter` | `RESEARCH_CONTEXT_ENTER WINDOW_MS` | Establish a checkpoint, perform the reviewed entry transaction, and return an independent opaque session token plus electrical evidence. |
+| `context send 0xNN` | `RESEARCH_CONTEXT_SEND TOKEN 0xNN WINDOW_MS` | Send exactly one allowlisted logical byte within that session and observe its bus traffic. No chaining, scanning or automatic retry. |
+| `context exit` | `RESEARCH_CONTEXT_EXIT TOKEN` | Execute only the validated recovery profile and retain unresolved obligations on uncertainty. |
+| `context status` | `RESEARCH_CONTEXT_STATUS` | Read session state, deadlines and recovery obligations without TX or exposing the token. |
+| Internal REPL heartbeat | `RESEARCH_CONTEXT_HEARTBEAT TOKEN` | Detect disappearance while using short-lived sockets; never extend the absolute session lifetime. |
+
+The XS8 Service would own one context session on its existing control thread. Socket close alone would not erase the session. Possession of the secret token would authorize context SEND, heartbeat and EXIT over separate local connections; old tokens would never revive a completed session. Normal STATUS would remain responsive. Entry would require the existing operator authorization, a separate default-off context authorization, IDLE, no volume STOP obligation, no possibly open context, no CD release obligation or CD hold, no active research chain/query, a healthy monitor, and healthy receiver-observation integrity. Cached source/MONITOR observations would not count as proof of ROOT.
+
+During entry, the session would mark its own `context_may_be_open` obligation **before** the entry frame. It would use the existing service transmitter and the same conservative ordering as the working controller, without invoking volume START or toggling MUTE to force entry. Ordinary STATUS would aggregate the volume and research context obligations; it would never clear the existing volume `stop_owed` flag. CD, volume, MUTE, source selection, ROOT queries and unrelated research TX would receive prompt busy responses until cleanup resolved the session. Reserved context/control bytes, known motor commands, power commands and commands without a reviewed termination profile would be rejected by context SEND.
+
+### Proposed lifetime and recovery
+
+Proposed initial bounds are a **10-second absolute lifetime** from before entry TX and **2 seconds of owner inactivity**, with an internal heartbeat about every 500 ms. These are design values, not deployed settings. Observation polling may renew inactivity but cannot extend the absolute lifetime. A short-lived socket, REPL failure or ambiguous SEND reply would not remove the service's cleanup obligation.
+
+The proposed owner-thread states are `CLOSED → ENTERING_UNCERTAIN → ACTIVE_ASSUMED → EXIT_PENDING → ROOT_OBSERVATION_PENDING → CLOSED`, with `FAULT_LATCHED` on unresolved cleanup. The state names describe software obligations; `ACTIVE_ASSUMED` must not claim receiver acknowledgment. Exit, expiry, lost heartbeat, monitor/capture failure, Ctrl+C/quit cleanup, failed TX and orderly shutdown would converge on the same validated recovery profile. Root restoration could be supported by a bounded `0x13` observation after `0x07`, with raw responses retained, but successful status readback would still not prove that all latched operations ended.
+
+No generic `0x09`, `0x15`, `0x72`, power cycle or STOP substitution is authorized by this proposal. Each admitted byte needs its own evidence-based profile; unknown bytes would remain rejected. Cleanup attempts and retries would be bounded and evidence-bearing. Failed/missing/mismatched cleanup or an ambiguous ROOT probe would keep context possibly open, mark receiver integrity uncertain and block further active commands until operator recovery. Process crash, SIGKILL, power loss, failed GPIO or a permanently busy bus can defeat even a validated cleanup attempt.
+
+### Observation, tests and enablement plan
+
+The future implementation would reuse the monitor checkpoint and bounded research history before **every** entry, SEND and cleanup TX, including observations arriving before TX returns. It would preserve both `waveform_lsb` and `legacy_msb_short1`, monotonic timestamps, complete/incomplete frames, decoder reasons, event gaps and history overflow. Frames would be labeled by their temporal relationship to the local TX window; neither origin nor receiver acknowledgment would be invented. Missing responses after `0x17` would be recorded as missing evidence, not confirmation of entry.
+
+Before enabling entry:
+
+1. Archive attended, controlled normal entry/exit trials with a known physical recovery procedure, no active volume/CD hold, raw BUSY/DATA capture, both byte conventions and independent receiver observations. Validate an entry witness in a known non-motor transaction and `0x07` plus ROOT status readback; do not infer entry from RX silence alone. The existing MUTE lifecycle is evidence for that known transaction, not for arbitrary subsequent bytes.
+2. Establish normal exit and interrupted/failed-operation recovery for each narrowly selected non-motor candidate. Keep VIDEO 1 / VIDEO 2 TX candidates unapproved until their state-dependent effects and required termination are known. No byte-range scan is proposed.
+3. Implement deterministic fake-backend tests for token ownership across clients, entry/exit ordering, absolute expiry, missing heartbeat, stale tokens, every TX/waveform failure, recovery limits, monitor gaps, receiver-integrity loss, shutdown, and interleaved STATUS/CEC busy replies. Verify all raw `0x17` routes remain forbidden and that no test introduces a volume START as an entry probe.
+4. Run existing service, CEC, Gateway and REPL regressions, then review the exact physical validation procedure and startup gate. Fake tests validate state handling, not the protocol assumptions in steps 1–2.
+
+No transmitting context-session implementation or successful physical entry/exit tests were added. The preparation subset above has no transmitter interface; existing controls retain their hardware behavior outside an explicitly reserved preparation window.

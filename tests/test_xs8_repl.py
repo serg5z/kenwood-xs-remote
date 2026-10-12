@@ -26,6 +26,23 @@ class Handler(socketserver.StreamRequestHandler):
                 return  # Fake a peer closing before its reply.
             if command == "STATUS":
                 reply = "OK state=IDLE stop_owed=0 monitor=HEALTHY"
+            elif command == "RESEARCH_CONTEXT_PREPARE MUTE CONFIRM_NO_TX":
+                self.server.context_active = True
+                reply = ("OK RESEARCH_CONTEXT_PREPARED token=99 profile=MUTE "
+                         "mode=PREPARATION_ONLY context_entered=0 recovery_ready=0")
+            elif command == "RESEARCH_CONTEXT_STATUS":
+                reply = ("OK RESEARCH_CONTEXT_STATUS state=" +
+                         ("PREPARED" if self.server.context_active else "NONE") +
+                         " context_entered=0 panel_check=NOT_OBSERVED")
+            elif command.startswith("RESEARCH_CONTEXT_OBSERVE 99 "):
+                reply = "OK RESEARCH_OBSERVE id=1 tx_attempted=0"
+            elif command == "RESEARCH_CONTEXT_HEARTBEAT 99":
+                reply = "OK RESEARCH_CONTEXT_LEASE_RENEWED context_entered=0"
+            elif command == "RESEARCH_CONTEXT_RUN 99":
+                reply = "ERR RESEARCH_CONTEXT reason=RECOVERY_EVIDENCE_MISSING"
+            elif command == "RESEARCH_CONTEXT_CANCEL 99":
+                self.server.context_active = False
+                reply = "OK RESEARCH_CONTEXT_CANCELLED context_entered=0 tx_attempted=0"
             elif command == "QUERY_STATUS":
                 reply = "OK QUERY_STATUS source_inferred=CD"
             elif command.startswith("RESEARCH_SEND "):
@@ -85,6 +102,7 @@ class ReplTests(unittest.TestCase):
         self.server.busy_next_read = False
         self.server.tx_wait_once = False
         self.server.drop_next_tx_read = False
+        self.server.context_active = False
         self.thread = threading.Thread(target=self.server.serve_forever,
                                        daemon=True)
         self.thread.start()
@@ -107,6 +125,40 @@ class ReplTests(unittest.TestCase):
         self.assertIn("RESEARCH_READ 1 1", self.server.commands)
         self.assertTrue(any("waveform_lsb=0x9C" in x for x in self.output))
         self.assertEqual(len(self.console.history), 1)
+
+    def test_context_preparation_records_only_passive_rx_and_run_is_blocked(self):
+        self.console.confirm = lambda _: "PREPARE MUTE NO TX"
+        self.console.command("context prepare MUTE")
+        self.console.command("context run")
+        self.console.command("context status")
+        self.assertIn("RESEARCH_CONTEXT_OBSERVE 99 1500", self.server.commands)
+        self.assertEqual(self.server.commands.count("RESEARCH_CONTEXT_RUN 99"), 1)
+        self.assertTrue(any("RECOVERY_EVIDENCE_MISSING" in entry for entry in self.output))
+        self.assertTrue(any("waveform_lsb=0x9C" in entry for entry in self.output))
+        self.assertFalse(any(command.startswith(("RESEARCH_SEND", "RESEARCH_CHAIN"))
+                             or command in ("MUTE", "QUERY_STATUS")
+                             for command in self.server.commands))
+        self.assertFalse(any("token=99" in entry or "CONTEXT_OBSERVE 99" in entry
+                             for entry in self.output + self.console.history))
+        self.console.command("quit")
+        self.assertIn("RESEARCH_CONTEXT_CANCEL 99", self.server.commands)
+
+    def test_context_requires_explicit_confirmation_and_one_named_profile(self):
+        self.console.confirm = lambda _: "no"
+        self.console.command("context prepare MUTE")
+        for command in ("context prepare PHONO", "context send 0xD8", "context enter"):
+            with self.assertRaises(ValueError):
+                self.console.command(command)
+        self.assertEqual(self.server.commands, [])
+
+    def test_context_interrupt_releases_preparation_without_generic_cancel_or_tx(self):
+        self.console.confirm = lambda _: "PREPARE MUTE NO TX"
+        self.console.pause = lambda _: (_ for _ in ()).throw(KeyboardInterrupt)
+        self.console.command("context prepare MUTE")
+        self.assertIn("RESEARCH_CONTEXT_CANCEL 99", self.server.commands)
+        self.assertNotIn("RESEARCH_CANCEL 1", self.server.commands)
+        self.assertIsNone(self.console.context_token)
+        self.assertTrue(any("no XS8 TX was attempted" in entry for entry in self.output))
 
     def test_window_and_other_client_between_polls(self):
         self.console.command("set observe 750")

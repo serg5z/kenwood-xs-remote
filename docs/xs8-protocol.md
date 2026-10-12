@@ -37,6 +37,25 @@ On 2026-10-11, operator-reported physical `QUERY_STATUS` trials checked all six 
 
 The same TX value can have different observed effects by context. For example, `x15` released an observed control-lock state in ROOT but started tuner preset scan after `x17`; `x75` produced a lock effect in the ROOT+CD sweep but entered direct frequency mode after `x17`. These are observations, not proof of formal command names or equivalence across states. [Cross-context observations](../research/notes/kenwood-xs-reverse-engineering-v18.md)
 
+### Research context lifecycle: evidence and enablement boundary
+
+The supported lifecycle is narrower than a general recovery primitive:
+
+| Stage | Evidence | Limit |
+|---|---|---|
+| Enter from the tested ROOT state | Logical `x17` changed subsequent `x84` interpretation and made `x13` silent. | No positive context-entry acknowledgment or additional handshake is documented. Silence cannot distinguish entry from a missing response. [Controlled probes](../research/notes/kenwood-xs-reverse-engineering-reviewed.md#L413-L425) |
+| Return from the tested entered states | Logical `x07` restored ROOT interpretation and status responses; the targeted sweep's final `x13` returned legacy RX `1D` and `18`. | These are reported bench observations, not a universal guarantee after every possible context command. [Targeted exit](../research/notes/kenwood-xs-reverse-engineering-v18.md#L553-L562) |
+| End a known volume hold | `x09` before `x07`; the working volume controller retains STOP and context obligations across failed TX. | This is a volume-specific termination sequence. [Current state machine](../volume_control.cpp#L116-L195) |
+| Recover an arbitrary latched operation | No general sequence established. `x07` did not release the observed ROOT front-panel lock; `x15` did, but `x15` starts preset scan after `x17`. | Context exit, volume STOP, CD RELEASE and lock release cannot be substituted for one another. [Lock recovery observations](../research/notes/kenwood-xs-reverse-engineering-reviewed.md#L195-L206) |
+
+The production entry mechanism comprises a clean service state, BUSY-free checks, a normal logical `x17` frame, observed waveform verification, and conservative `context_may_be_open` tracking before TX. It has no receiver acknowledgment step. Volume and MUTE then execute their known commands and cleanup; the existence of these working transactions does not validate an arbitrary-byte research session. [Entry and MUTE state handling](../volume_control.cpp#L160-L195), [MUTE cleanup](../volume_control.cpp#L239-L261), [BUSY checking](../xs8_gpio.c#L143-L162), [service TX evidence](../xs8_service.cpp#L54-L93)
+
+Research context entry remains **disabled**. The archive establishes normal entry/exit for tested states, but not an automatic safe recovery profile for unknown VIDEO 1 / VIDEO 2 candidates, a positive general context witness, or recovery after an interrupted arbitrary command. The existing `x17 → x09 → x07` startup recovery is explicitly experimental in the source and is not a substitute for that missing evidence. [Experimental startup recovery](../volume_control.cpp#L76-L113)
+
+An [attended, non-transmitting MUTE preparation](xs8-research-repl.md#attended-mute-experiment-preparation-no-tx) now reserves the service and records passive bus observations for the characterized `x17 → xD8 → x07` profile. RUN refuses TX. The smallest enablement prerequisite is one archived use of the existing production MUTE transaction demonstrating three distinct postconditions: restored ROOT interpretation, working front-panel controls, and working normal receiver control. A status reply alone is insufficient because the documented control lock still allowed `x13` responses. Preparation cancellation/expiry sends no cleanup command and establishes no physical recovery claim.
+
+The [proposed research session design](xs8-research-repl.md#proposed-context-session-disabled-pending-recovery-validation) requires a reviewed command allowlist and command-specific recovery evidence before any entry gate is enabled. `TX_OK` and waveform `MATCH` establish electrical transmission evidence; ROOT status response fields establish associated observations. None proves that all receiver/changer activity has terminated.
+
 ## Working control sequences
 
 These are **logical TX bytes in exact order**. Each byte is a separate XS8 frame; the current firmware waits for BUSY to be free before each frame. The volume and mute actions were reported from hardware tests, and the sequences are implemented by the working bridge. No archived end-to-end CEC/serial/XS capture independently verifies every complete bridge transaction. [Observed controls](../research/notes/kenwood-xs-reverse-engineering-v18.md), [bridge implementation](../xs8-bridge/xs8-bridge.ino)

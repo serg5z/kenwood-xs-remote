@@ -10,6 +10,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <charconv>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,7 @@
 #include <cctype>
 #include <optional>
 #include <string>
+#include <sstream>
 #include <vector>
 #include <fcntl.h>
 #include <poll.h>
@@ -177,6 +179,20 @@ bool parse_research_cancel(const std::string& line, uint64_t& id)
     return true;
 }
 
+bool parse_context_observe(const std::string& line, uint64_t& token,
+                            long& window)
+{
+    std::istringstream input(line);
+    std::string operation, token_text, window_text, extra;
+    if (!(input >> operation >> token_text >> window_text) || (input >> extra) ||
+        operation != "RESEARCH_CONTEXT_OBSERVE") return false;
+    const auto parsed = std::from_chars(token_text.data(),
+        token_text.data() + token_text.size(), token);
+    return parsed.ec == std::errc{} &&
+        parsed.ptr == token_text.data() + token_text.size() && token &&
+        parse_number(window_text.c_str(), window) && window >= 1 && window <= 5000;
+}
+
 int open_socket(const char *path)
 {
     if (std::strlen(path) >= sizeof(sockaddr_un::sun_path)) {
@@ -286,12 +302,24 @@ int main(int argc, char **argv)
     };
     std::optional<Xs8ResearchSession> research;
     std::optional<Xs8ResearchChain> chain;
+    Xs8ContextPreparation context_preparation;
+    uint64_t context_capture_id = 0;
     uint64_t next_research_id = 1;
     bool research_tx_uncertain = false;
     uint64_t query_cursor = 0;
     uint64_t state_cursor = xs8_monitor_checkpoint(monitor);
     while (!stopping) {
         xs8_monitor_poll(monitor, 0);
+        const int64_t preparation_now = xs8_gpio_now_ns();
+        const bool preparation_was_active = context_preparation.active();
+        context_preparation.tick(preparation_now > 0 ? preparation_now : 0);
+        if (!xs8_monitor_healthy(monitor)) context_preparation.monitor_failed();
+        if (preparation_was_active && !context_preparation.active()) {
+            if (research && research->id() == context_capture_id && research->active())
+                research->cancel();
+            std::fprintf(stderr, "XS8 CONTEXT_PREPARATION %s",
+                         context_preparation.status().c_str());
+        }
         core.tick(VolumeControl::Clock::now());
         if (research && research->active()) {
             xs8_monitor_record records[16];
@@ -300,6 +328,8 @@ int main(int argc, char **argv)
                 if (xs8_monitor_snapshot(monitor, research->cursor_ptr(),
                                          records, 16, &copied) < 0) {
                     research->overflow();
+                    if (research->id() == context_capture_id)
+                        context_preparation.diagnostics_failed();
                     break;
                 }
                 research->observe(records, copied);
@@ -377,6 +407,13 @@ int main(int argc, char **argv)
                 receiver.observe(state_records[i], query.has_value());
         } while (state_count == 16);
         if (!xs8_monitor_healthy(monitor)) receiver.monitor_failed();
+        if (context_preparation.active() &&
+            receiver.status_fields().find(" receiver_integrity=HEALTHY") ==
+                std::string::npos)
+            context_preparation.diagnostics_failed();
+        if (!context_preparation.active() && research &&
+            research->id() == context_capture_id && research->active())
+            research->cancel();
         if (query) {
             xs8_monitor_record records[8];
             size_t copied = 0;
@@ -476,9 +513,74 @@ int main(int argc, char **argv)
                 input.erase(0, newline + 1);
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 auto received = VolumeControl::Clock::now();
-                if (query && line != "STATUS" &&
+                if (query && line != "STATUS" && line != "RESEARCH_CONTEXT_STATUS" &&
                     line.compare(0, 15, "VOLUME_RELEASE ") != 0) {
                     if (!reply(client, "ERR QUERY_STATUS reason=SESSION_BUSY\n"))
+                        failed = true;
+                    continue;
+                }
+                if (line.compare(0, 17, "RESEARCH_CONTEXT_") == 0) {
+                    const int64_t context_now = xs8_gpio_now_ns();
+                    const uint64_t now_ns = context_now > 0 ? context_now : 0;
+                    std::string result;
+                    if (line.compare(0, 25, "RESEARCH_CONTEXT_PREPARE ") == 0) {
+                        std::istringstream arguments(line);
+                        std::string operation, profile, confirmation, extra;
+                        if (!(arguments >> operation >> profile >> confirmation) ||
+                            (arguments >> extra))
+                            result = "ERR RESEARCH_CONTEXT reason=INVALID_REQUEST\n";
+                        else if (core.state() != VolumeControl::State::IDLE ||
+                                 core.stop_owed() || core.context_may_be_open() ||
+                                 core.cd_fault() || core.cd_release_owed())
+                            result = "ERR RESEARCH_CONTEXT reason=UNRESOLVED_CONTROL_STATE\n";
+                        else if (!xs8_monitor_healthy(monitor) ||
+                                 receiver.status_fields().find(" receiver_integrity=HEALTHY") ==
+                                     std::string::npos)
+                            result = "ERR RESEARCH_CONTEXT reason=MONITOR_OR_RECEIVER_INTEGRITY\n";
+                        else if (query || (research && research->active()) ||
+                                 (chain && chain->active()) || research_tx_uncertain || stopping)
+                            result = "ERR RESEARCH_CONTEXT reason=SESSION_BUSY\n";
+                        else result = context_preparation.prepare(
+                            profile, confirmation == "CONFIRM_NO_TX", now_ns);
+                        if (result.compare(0, 2, "OK") == 0)
+                            std::fprintf(stderr, "XS8 CONTEXT_PREPARATION profile=MUTE "
+                                                 "operator_confirmed=1 mode=NO_TX\n");
+                    } else {
+                        uint64_t token = 0;
+                        long window = 0;
+                        if (parse_context_observe(line, token, window)) {
+                            result = context_preparation.authorize(token, now_ns);
+                            if (result.empty() && research && research->active())
+                                result = "ERR RESEARCH_CONTEXT reason=CAPTURE_BUSY\n";
+                            if (result.empty()) {
+                                const uint64_t deadline = std::min<uint64_t>(
+                                    now_ns + uint64_t(window) * 1000000ULL,
+                                    context_preparation.deadline_ns());
+                                research.emplace(next_research_id++,
+                                    xs8_monitor_checkpoint(monitor), now_ns,
+                                    deadline, false);
+                                context_capture_id = research->id();
+                                result = "OK RESEARCH_OBSERVE id=" +
+                                    std::to_string(context_capture_id) +
+                                    " mode=CONTEXT_PREPARATION_PASSIVE tx_attempted=0\n";
+                                std::fprintf(stderr, "XS8 CONTEXT_PREPARATION_OBSERVE "
+                                                     "id=%llu mode=NO_TX\n",
+                                    (unsigned long long)context_capture_id);
+                            }
+                        } else result = context_preparation.command(line, now_ns);
+                    }
+                    if (!context_preparation.active() && research &&
+                        research->id() == context_capture_id && research->active())
+                        research->cancel();
+                    if (!reply(client, result)) failed = true;
+                    continue;
+                }
+                if (context_preparation.active() && line != "STATUS" &&
+                    line.compare(0, 14, "RESEARCH_READ ") != 0 &&
+                    line.compare(0, 17, "RESEARCH_TX_READ ") != 0 &&
+                    line != "VOLUME_RELEASE UP" && line != "VOLUME_RELEASE DOWN") {
+                    if (!reply(client,
+                        "ERR RESEARCH_CONTEXT reason=EXCLUSIVE_PREPARATION\n"))
                         failed = true;
                     continue;
                 }
@@ -745,8 +847,11 @@ int main(int argc, char **argv)
                         continue;
                     }
                 }
-                if (!reply(client, core.command(line, received, received,
-                                                client_id))) {
+                std::string result = core.command(line, received, received, client_id);
+                if (line == "STATUS" && context_preparation.active() &&
+                    result.compare(0, 14, "OK state=IDLE ") == 0)
+                    result.replace(3, 10, "state=RESEARCH_PREPARATION");
+                if (!reply(client, result)) {
                     failed = true;
                     break;
                 }
@@ -757,6 +862,9 @@ int main(int argc, char **argv)
         } else if (size < 0 && (errno == EAGAIN || errno == EINTR)) continue;
         close_client(selected);
     }
+    context_preparation.shutdown();
+    if (research && research->id() == context_capture_id && research->active())
+        research->cancel();
     while (!clients.empty()) close_client(0);
     bool cleaned = core.shutdown(VolumeControl::Clock::now());
     if (core.stop_owed() ||

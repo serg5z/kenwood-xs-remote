@@ -2,6 +2,79 @@
 
 #include <cassert>
 #include <iostream>
+#include <stdexcept>
+
+static void test_context_preparation_never_enters_context()
+{
+    constexpr uint64_t second = 1000000000ULL;
+    uint64_t next_token = 42;
+    Xs8ContextPreparation context([&] { return next_token++; });
+    assert(context.prepare("PHONO", true, 1).find("PROFILE_NOT_ALLOWLISTED") !=
+           std::string::npos);
+    assert(context.prepare("MUTE", false, 1).find("CONFIRMATION_REQUIRED") !=
+           std::string::npos);
+    assert(!context.active());
+    const auto prepared = context.prepare("MUTE", true, 1);
+    assert(prepared.find("token=42") != std::string::npos);
+    assert(prepared.find("context_entered=0 recovery_ready=0") != std::string::npos);
+    assert(context.status().find("token=") == std::string::npos);
+    assert(context.prepare("MUTE", true, 2).find("SESSION_BUSY") != std::string::npos);
+    for (const auto *line : {"RESEARCH_CONTEXT_RUN -42", "RESEARCH_CONTEXT_RUN 42 extra",
+                             "RESEARCH_CONTEXT_ENTER 42", "RESEARCH_CONTEXT_SEND 42"})
+        assert(context.command(line, 2).find("INVALID_REQUEST") != std::string::npos);
+    assert(context.command("RESEARCH_CONTEXT_RUN 41", 3).find("NOT_OWNER") !=
+           std::string::npos);
+    assert(context.command("RESEARCH_CONTEXT_RUN 42", 4).find("RECOVERY_EVIDENCE_MISSING") !=
+           std::string::npos);
+    assert(context.status().find("panel_check=NOT_OBSERVED") != std::string::npos);
+    assert(context.command("RESEARCH_CONTEXT_HEARTBEAT 42", second).find(
+           "OK RESEARCH_CONTEXT_LEASE_RENEWED") == 0);
+    assert(context.command("RESEARCH_CONTEXT_CANCEL 41", second + 1).find("NOT_OWNER") !=
+           std::string::npos);
+    assert(context.active());
+    assert(context.command("RESEARCH_CONTEXT_CANCEL 42", second + 2).find(
+           "context_entered=0 tx_attempted=0") != std::string::npos);
+    assert(!context.active());
+    assert(context.prepare("MUTE", true, second + 3).find("token=43") != std::string::npos);
+    assert(context.authorize(42, second + 4).find("NOT_OWNER") != std::string::npos);
+    context.shutdown();
+    assert(!context.active() && context.status().find("reason=SHUTDOWN") != std::string::npos);
+
+    Xs8ContextPreparation absolute([] { return 1; });
+    absolute.prepare("MUTE", true, 1);
+    for (uint64_t half_second = 1; half_second < 20; ++half_second)
+        assert(absolute.authorize(1, 1 + half_second * second / 2).empty());
+    absolute.tick(1 + Xs8ContextPreparation::kLifetimeNs);
+    assert(!absolute.active());
+    assert(absolute.status().find("reason=ABSOLUTE_TTL") != std::string::npos);
+
+    Xs8ContextPreparation inactive([] { return 2; });
+    inactive.prepare("MUTE", true, 1);
+    inactive.tick(Xs8ContextPreparation::kInactivityNs);
+    assert(inactive.active());
+    inactive.tick(1 + Xs8ContextPreparation::kInactivityNs);
+    assert(inactive.status().find("reason=INACTIVITY") != std::string::npos);
+    assert(inactive.command("RESEARCH_CONTEXT_RUN 2", 2 * second + 2).find("NO_SESSION") !=
+           std::string::npos);
+
+    Xs8ContextPreparation failure([] { return 3; });
+    failure.prepare("MUTE", true, 10);
+    failure.tick(9);
+    assert(failure.status().find("reason=CLOCK_REGRESSION") != std::string::npos);
+    failure.prepare("MUTE", true, 20); // Reused token fails closed.
+    assert(!failure.active());
+    Xs8ContextPreparation monitor([] { return 4; });
+    monitor.prepare("MUTE", true, 1);
+    monitor.monitor_failed();
+    assert(monitor.status().find("reason=MONITOR_FAILED") != std::string::npos);
+    Xs8ContextPreparation integrity([] { return 5; });
+    integrity.prepare("MUTE", true, 1);
+    integrity.diagnostics_failed();
+    assert(integrity.status().find("reason=DIAGNOSTIC_INTEGRITY") != std::string::npos);
+    Xs8ContextPreparation no_token([]() -> uint64_t { throw std::runtime_error("entropy"); });
+    assert(no_token.prepare("MUTE", true, 1).find("TOKEN_UNAVAILABLE") != std::string::npos);
+    assert(!no_token.active());
+}
 
 static xs8_monitor_record frame(uint64_t serial, uint64_t start,
                                 uint8_t byte, bool valid = true)
@@ -21,6 +94,7 @@ static xs8_monitor_record frame(uint64_t serial, uint64_t start,
 
 int main()
 {
+    test_context_preparation_never_enters_context();
     std::vector<uint8_t> parsed;
     long gap_ms = 0, window_ms = 0;
     assert(xs8_parse_research_chain(

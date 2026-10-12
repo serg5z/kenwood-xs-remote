@@ -3,9 +3,129 @@
 #include <cstdio>
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cctype>
 #include <cstdlib>
+#include <random>
 #include <sstream>
+
+Xs8ContextPreparation::Xs8ContextPreparation(TokenSource token_source)
+    : token_source_(token_source ? std::move(token_source) : TokenSource([] {
+          std::random_device random;
+          return (uint64_t(random()) << 32) | uint64_t(random());
+      })) {}
+
+std::string Xs8ContextPreparation::prepare(const std::string& profile,
+                                           bool confirmed, uint64_t now_ns)
+{
+    tick(now_ns);
+    if (profile != "MUTE") return "ERR RESEARCH_CONTEXT reason=PROFILE_NOT_ALLOWLISTED\n";
+    if (!confirmed) return "ERR RESEARCH_CONTEXT reason=CONFIRMATION_REQUIRED\n";
+    if (active()) return "ERR RESEARCH_CONTEXT reason=SESSION_BUSY\n";
+    if (!now_ns) return "ERR RESEARCH_CONTEXT reason=CLOCK_FAILED\n";
+    uint64_t token = 0;
+    try {
+        for (unsigned int attempt = 0; attempt < 8; ++attempt) {
+            token = token_source_();
+            if (token && token != last_token_) break;
+        }
+    } catch (...) { token = 0; }
+    if (!token || token == last_token_)
+        return "ERR RESEARCH_CONTEXT reason=TOKEN_UNAVAILABLE\n";
+    token_ = last_token_ = token;
+    deadline_ns_ = now_ns + kLifetimeNs;
+    last_activity_ns_ = now_ns;
+    state_ = "PREPARED";
+    reason_ = "NONE";
+    return "OK RESEARCH_CONTEXT_PREPARED token=" + std::to_string(token_) +
+        " profile=MUTE mode=PREPARATION_ONLY proposed=0x17,0xD8,0x07"
+        " deadline_ns=" + std::to_string(deadline_ns_) +
+        " context_entered=0 recovery_ready=0\n";
+}
+
+std::string Xs8ContextPreparation::authorize(uint64_t token, uint64_t now_ns)
+{
+    tick(now_ns);
+    if (!active()) return "ERR RESEARCH_CONTEXT reason=NO_SESSION\n";
+    if (!token || token != token_)
+        return "ERR RESEARCH_CONTEXT reason=NOT_OWNER\n";
+    last_activity_ns_ = now_ns;
+    return {};
+}
+
+std::string Xs8ContextPreparation::command(const std::string& line,
+                                           uint64_t now_ns)
+{
+    tick(now_ns);
+    if (line == "RESEARCH_CONTEXT_STATUS") return status();
+    std::istringstream input(line);
+    std::string operation, token_text, extra;
+    uint64_t token = 0;
+    if (!(input >> operation >> token_text) || (input >> extra))
+        return "ERR RESEARCH_CONTEXT reason=INVALID_REQUEST\n";
+    if (operation != "RESEARCH_CONTEXT_HEARTBEAT" &&
+        operation != "RESEARCH_CONTEXT_CANCEL" &&
+        operation != "RESEARCH_CONTEXT_RUN")
+        return "ERR RESEARCH_CONTEXT reason=INVALID_REQUEST\n";
+    const auto parsed = std::from_chars(token_text.data(),
+        token_text.data() + token_text.size(), token);
+    if (parsed.ec != std::errc{} ||
+        parsed.ptr != token_text.data() + token_text.size() || !token)
+        return "ERR RESEARCH_CONTEXT reason=INVALID_REQUEST\n";
+    const auto denied = authorize(token, now_ns);
+    if (!denied.empty()) return denied;
+    if (operation == "RESEARCH_CONTEXT_RUN")
+        return "ERR RESEARCH_CONTEXT reason=RECOVERY_EVIDENCE_MISSING"
+               " profile=MUTE context_check=UNVERIFIED panel_check=UNVERIFIED"
+               " control_check=UNVERIFIED context_entered=0\n";
+    if (operation == "RESEARCH_CONTEXT_CANCEL") {
+        finish("CANCELLED", "OWNER_CANCEL");
+        return "OK RESEARCH_CONTEXT_CANCELLED context_entered=0 tx_attempted=0\n";
+    }
+    return "OK RESEARCH_CONTEXT_LEASE_RENEWED context_entered=0\n";
+}
+
+std::string Xs8ContextPreparation::status() const
+{
+    return "OK RESEARCH_CONTEXT_STATUS state=" + state_ + " reason=" + reason_ +
+        " profile=MUTE mode=PREPARATION_ONLY deadline_ns=" +
+        std::to_string(deadline_ns_) +
+        " context_entered=0 tx_attempted=0 recovery_ready=0"
+        " context_check=NOT_OBSERVED panel_check=NOT_OBSERVED"
+        " control_check=NOT_OBSERVED\n";
+}
+
+void Xs8ContextPreparation::finish(const char *state, const char *reason)
+{
+    state_ = state;
+    reason_ = reason;
+    token_ = 0;
+}
+
+void Xs8ContextPreparation::tick(uint64_t now_ns)
+{
+    if (!active()) return;
+    if (!now_ns) finish("FAILED", "CLOCK_FAILED");
+    else if (now_ns < last_activity_ns_) finish("FAILED", "CLOCK_REGRESSION");
+    else if (now_ns >= deadline_ns_) finish("EXPIRED", "ABSOLUTE_TTL");
+    else if (now_ns - last_activity_ns_ >= kInactivityNs)
+        finish("EXPIRED", "INACTIVITY");
+}
+
+void Xs8ContextPreparation::monitor_failed()
+{
+    if (active()) finish("FAILED", "MONITOR_FAILED");
+}
+
+void Xs8ContextPreparation::diagnostics_failed()
+{
+    if (active()) finish("FAILED", "DIAGNOSTIC_INTEGRITY");
+}
+
+void Xs8ContextPreparation::shutdown()
+{
+    if (active()) finish("CANCELLED", "SHUTDOWN");
+}
 
 bool xs8_parse_research_chain(const std::string& line,
                               std::vector<uint8_t>& bytes,

@@ -50,6 +50,7 @@ public:
     bool shutdown(Time now);
     VolumeControl::State state() const { return volume_.state(); }
     bool stop_owed() const { return volume_.stop_owed(); }
+    bool context_may_be_open() const { return volume_.context_may_be_open(); }
     bool cd_release_owed() const { return cd_release_owed_; }
     bool cd_fault() const { return cd_fault_; }
     void set_receiver_status(const std::string& fields) { receiver_status_ = fields; }

@@ -13,6 +13,33 @@ bool xs8_parse_research_chain(const std::string& line,
                               std::vector<uint8_t>& bytes,
                               long& gap_ms, long& window_ms);
 
+// Attended experiment preparation only. This class has no transmitter and
+// cannot enter XS8 context. Its reservation and passive capture are bounded.
+class Xs8ContextPreparation {
+public:
+    using TokenSource = std::function<uint64_t()>;
+    static constexpr uint64_t kLifetimeNs = 10000000000ULL;
+    static constexpr uint64_t kInactivityNs = 2000000000ULL;
+    explicit Xs8ContextPreparation(TokenSource token_source = {});
+    std::string prepare(const std::string& profile, bool confirmed,
+                        uint64_t now_ns);
+    std::string command(const std::string& line, uint64_t now_ns);
+    std::string authorize(uint64_t token, uint64_t now_ns);
+    std::string status() const;
+    void tick(uint64_t now_ns);
+    void monitor_failed();
+    void diagnostics_failed();
+    void shutdown();
+    bool active() const { return state_ == "PREPARED"; }
+    uint64_t deadline_ns() const { return deadline_ns_; }
+private:
+    void finish(const char *state, const char *reason);
+    TokenSource token_source_;
+    uint64_t token_ = 0, last_token_ = 0;
+    uint64_t deadline_ns_ = 0, last_activity_ns_ = 0;
+    std::string state_ = "NONE", reason_ = "NONE";
+};
+
 // Bounded, passive record of one research window. GPIO and polling stay in
 // xs8_service.cpp; this class never transmits or attributes an RX origin.
 class Xs8ResearchSession {
