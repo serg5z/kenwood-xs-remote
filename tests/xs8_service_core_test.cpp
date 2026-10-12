@@ -562,10 +562,13 @@ static void test_cd_hold_watchdog_disconnect_and_shutdown()
     timeout.tick(at(510));
     assert(timeout_tx.sent == (std::vector<uint8_t>{0xFC, 0x72}));
     assert(!timeout.cd_fault() && !timeout.cd_release_owed());
-    assert(timeout.command("CD_PRESS TRACK_NEXT", at(511), at(511)) ==
-           "ERR CD_LEASE_EXPIRED\n");
+    assert(timeout.command("STATUS", at(510), at(510)).find("cd_lease_expired=1") != std::string::npos);
     timeout.tick(at(600));
     assert(timeout_tx.sent.size() == 2);
+    assert(timeout.command("CD_TRACK_NEXT", at(601), at(601)).find(
+           "OK CD_TRACK_TX") == 0);
+    assert(timeout.command("STATUS", at(601), at(601)).find("cd_lease_expired=0") != std::string::npos);
+    assert(timeout_tx.sent == (std::vector<uint8_t>{0xFC, 0x72, 0xFC, 0x72}));
 
     FakeTx disconnect_tx;
     Xs8ServiceCore disconnect(disconnect_tx, Ms(2000), true);
@@ -647,12 +650,28 @@ static void test_cd_lease_renewal_stale_token_and_recovery()
     assert(!expired.cd_fault() && !expired.cd_release_owed());
     assert(expired.command("CD_HEARTBEAT " + expired_token,
                            at(2011), at(2011)) == "ERR CD_NOT_ACTIVE\n");
-    assert(expired.command("CD_PRESS TRACK_NEXT", at(2011), at(2011)) ==
-           "ERR CD_LEASE_EXPIRED\n");
+    assert(expired.command("CD_RELEASE " + expired_token,
+                           at(2011), at(2011)) == "ERR CD_NOT_ACTIVE\n");
+    assert(expired.command("STATUS", at(2011), at(2011)).find("cd_last_result=LEASE_EXPIRED") != std::string::npos);
+    expired_tx.healthy = false;
+    assert(expired.command("CD_PRESS TRACK_NEXT", at(2012), at(2012)) ==
+           "ERR MONITOR_FAILED\n");
+    assert(expired.command("STATUS", at(2012), at(2012)).find("cd_lease_expired=1") != std::string::npos);
+    assert(expired_tx.sent.size() == 2);
+    expired_tx.healthy = true;
     expired.disconnected(at(2020));
     expired.connected();
-    assert(expired.command("CD_PRESS TRACK_NEXT", at(2030), at(2030)) ==
-           "ERR CD_LEASE_EXPIRED\n");
+    const auto fresh_token = hold_token(expired.command(
+        "CD_PRESS TRACK_NEXT", at(2030), at(2030)));
+    assert(fresh_token != expired_token);
+    assert(expired.command("STATUS", at(2030), at(2030)).find("cd_lease_expired=0") != std::string::npos);
+    assert(expired.command("CD_HEARTBEAT " + expired_token,
+                           at(2031), at(2031)) == "ERR CD_NOT_OWNER\n");
+    assert(expired.command("CD_RELEASE " + expired_token,
+                           at(2031), at(2031)) == "ERR CD_NOT_OWNER\n");
+    assert(expired_tx.sent == (std::vector<uint8_t>{0xFC, 0x72, 0xFC}));
+    assert(expired.command("CD_RELEASE " + fresh_token,
+                           at(2032), at(2032)).find("OK CD_RELEASE_TX") == 0);
 
     FakeTx uncertain_tx;
     Xs8ServiceCore uncertain(uncertain_tx, Ms(2000), true, {},

@@ -107,7 +107,18 @@ class ServiceSocketTest(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(self.transmitted(), ["0x6A", "0x72"])
         self.assertEqual(self.request("CD_HEARTBEAT " + token), "ERR CD_NOT_ACTIVE")
-        self.assertEqual(self.request("CD_PRESS TRACK_NEXT"), "ERR CD_LEASE_EXPIRED")
+        status = self.request("STATUS")
+        for field in ("state=IDLE", "cd_state=IDLE", "cd_release_owed=0",
+                      "cd_last_result=LEASE_EXPIRED", "receiver_integrity=HEALTHY"):
+            self.assertIn(field, status)
+        self.assertEqual(self.request("CD_RELEASE " + token), "ERR CD_NOT_ACTIVE")
+        fresh = self.press("TRACK_NEXT")
+        self.assertNotEqual(token, fresh)
+        self.assertIn("cd_lease_expired=0", self.request("STATUS"))
+        self.assertEqual(self.request("CD_HEARTBEAT " + token), "ERR CD_NOT_OWNER")
+        self.assertEqual(self.request("CD_RELEASE " + token), "ERR CD_NOT_OWNER")
+        self.assertEqual(self.transmitted(), ["0x6A", "0x72", "0xFC"])
+        self.assertTrue(self.request("CD_RELEASE " + fresh).startswith("OK CD_RELEASE_TX"))
         self.assertEqual(self.request("MUTE"), "OK MUTE_TX")
 
     def test_orderly_shutdown_releases_detached_hold(self):

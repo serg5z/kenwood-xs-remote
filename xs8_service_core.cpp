@@ -139,7 +139,6 @@ std::string Xs8ServiceCore::cd_preflight() const
 {
     if (cd_shutdown_requested_) return "ERR SHUTDOWN\n";
     if (cd_fault_ || cd_release_owed_) return "ERR CD_FAULT_LATCHED\n";
-    if (cd_lease_expired_) return "ERR CD_LEASE_EXPIRED\n";
     if (volume_.state() != VolumeControl::State::IDLE ||
         volume_.stop_owed() || volume_.context_may_be_open())
         return std::string("ERR ") + state_name(volume_.state()) + "\n";
@@ -155,6 +154,9 @@ std::string Xs8ServiceCore::cd_press(uint8_t press_byte, const char *action,
     // Generate independently before KEY DOWN. A prior owner's token must not
     // reveal the next token now that requests can use different connections.
     if (!new_cd_token(cd_last_token_, token)) return "ERR CD_TOKEN_UNAVAILABLE\n";
+    // Expiry records the previous lease, not an unresolved RELEASE. Preflight
+    // still rejects faults/obligations; only an accepted new operation clears it.
+    cd_lease_expired_ = false;
     cd_active_ = true;
     cd_release_owed_ = true;
     cd_action_ = action;
@@ -225,6 +227,7 @@ std::string Xs8ServiceCore::cd_track(uint8_t press_byte, const char *action)
 {
     const std::string denied = cd_preflight();
     if (!denied.empty()) return denied;
+    cd_lease_expired_ = false;
     cd_active_ = true;
     cd_action_ = action;
     cd_release_owed_ = true; // Set before PRESS: failure may still reach the bus.
@@ -297,10 +300,6 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
     if (cd_active_) return "ERR CD_TRACK_BUSY\n";
     if (cd_fault_ && line != "VOLUME_RELEASE UP" &&
         line != "VOLUME_RELEASE DOWN") return "ERR CD_FAULT_LATCHED\n";
-    if (cd_lease_expired_ &&
-        (line.compare(0, 9, "CD_PRESS ") == 0 ||
-         line == "CD_TRACK_NEXT" || line == "CD_TRACK_PREVIOUS"))
-        return "ERR CD_LEASE_EXPIRED\n";
     if (!tx_.monitor_healthy()) return "ERR MONITOR_FAILED\n";
     if (line == "CD_PRESS TRACK_NEXT")
         return cd_press(0xFC, "TRACK_NEXT", now);
