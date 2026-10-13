@@ -1029,6 +1029,54 @@ class CdTrackGatewayTest(GatewayTest):
         self.assertNotIn("xs8cd", timing)
         self.assertNotIn("xs8status", timing)
 
+    def test_zero_interval_removes_cooldown_but_keeps_every_other_check(self):
+        self.enable_cd()
+        self.server.RequestHandlerClass.cd_track_interval_ms = 0
+        token, cookie = self.session()
+        state = self.server.__dict__.setdefault(
+            "cd_track", {"lock": threading.Lock(), "completed": float("-inf")})
+        with mock.patch.object(xs8_gateway, "send_cd_track", return_value={
+                "cd_result": "TX_VERIFIED", "receiver_execution": "UNVERIFIED"}) as dispatch, \
+                self.eligible() as status:
+            self.assertEqual(self.track(token, cookie, "PREVIOUS")[0], 200)
+            second = self.fresh_token(cookie)
+            code, _, headers = self.track(second, cookie, "PREVIOUS")
+            self.assertEqual(code, 200, "no TOO_FAST at zero cooldown")
+            timing = self.server_timing(headers)
+            self.assertIn("sincecd", timing)
+            self.assertLess(timing["sincecd"], 200)
+            self.assertEqual(self.track(second, cookie, "PREVIOUS")[0], 403, "token still single-use")
+            with state["lock"]:  # Serialization still applies.
+                code, body, _ = self.track(self.fresh_token(cookie), cookie, "PREVIOUS")
+                self.assertEqual((code, json.loads(body)["result"]), (409, "CD_BUSY"))
+            self.assertEqual(dispatch.call_count, 2)
+            # Every dispatched command still had its own fresh STATUS read.
+            posts_with_status = status.call_count
+        self.assertGreaterEqual(posts_with_status, 2)
+        _, cookie = self.session()
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS)
+        code, body, _ = self.request_full("GET", "/api/v1/capabilities", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        fake.close()
+        self.assertIs(json.loads(body)["operations"]["cd_transport"]["min_interval_ms"], 0)
+
+    def test_zero_interval_still_rejects_ineligible_status_and_bad_replies(self):
+        self.enable_cd()
+        self.server.RequestHandlerClass.cd_track_interval_ms = 0
+        for status, reply, code, result in (
+                (CD_HOLD_STATUS, CD_OK, 409, "CD_BUSY"),
+                (CD_FAULT_STATUS, CD_OK, 409, "CD_FAULT_LATCHED"),
+                (CD_IDLE_STATUS, CD_OK.replace(b"action=NEXT", b"action=PREVIOUS"), 502,
+                 "INVALID_REPLY"),
+                (CD_IDLE_STATUS, CD_UNCERTAIN, 502, "SERVICE_UNCERTAIN")):
+            with self.subTest(result=result):
+                token, cookie = self.session()
+                fake = RecordingService(self.socket_path, status=status, mute_reply=reply)
+                got, body, _ = self.track(token, cookie)
+                fake.close()
+                self.assertEqual((got, json.loads(body)["result"]), (code, result))
+                self.assertLessEqual(len(self.dispatched(fake)), 1, "never retried")
+
     def test_ineligible_status_never_dispatches(self):
         self.enable_cd()
         cases = {
@@ -1170,10 +1218,10 @@ class CdTrackGatewayTest(GatewayTest):
         self.assertEqual(args.cd_track_interval_ms, 250)
         base = ["--enable-cd-track", "--systemd-socket", "--nginx-uid", "33",
                 "--https-origin", "https://woodland-pi.local", "--cd-track-interval-ms"]
-        for value in ("200", "1000"):
+        for value in ("0", "200", "1000"):
             self.assertEqual(xs8_gateway.parse_args(base + [value]).cd_track_interval_ms,
                              int(value))
-        for value in ("199", "1001", "0", "-250", "x"):
+        for value in ("1", "50", "199", "1001", "-250", "x"):
             with self.subTest(interval=value):
                 with contextlib.redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit):

@@ -15,7 +15,8 @@ let enabledCdActions = [];
 let controlBusy = false;
 let lastSourceAttempt = 0;
 // Spacing from one completed CD request to the next, as configured by the
-// Gateway. Without a valid value, keep the conservative Phase A 1 s.
+// Gateway; 0 is the experimental no-cooldown setting, not a missing value.
+// Without a valid value, keep the conservative Phase A 1 s.
 let cdIntervalMs = 1000;
 let lastCdCompleted = -Infinity;
 // Diagnostics only: the last CD tap's timeline and taps dropped by the guards.
@@ -126,8 +127,8 @@ function applyRefresh(statusData, sessionData, capabilitiesData) {
     !!status && status.cd_state === 'IDLE' && status.cd_release_owed === '0' &&
     !!cd && cd.enabled === true && Array.isArray(cd.available_actions);
   enabledCdActions = cdReady ? cd.available_actions : [];
-  cdIntervalMs = cd && Number.isInteger(cd.min_interval_ms) &&
-    cd.min_interval_ms >= 200 && cd.min_interval_ms <= 1000 ? cd.min_interval_ms : 1000;
+  cdIntervalMs = cd && Number.isInteger(cd.min_interval_ms) && (cd.min_interval_ms === 0 ||
+    (cd.min_interval_ms >= 200 && cd.min_interval_ms <= 1000)) ? cd.min_interval_ms : 1000;
   const query = capabilitiesData && capabilitiesData.operations &&
     capabilitiesData.operations.receiver_query;
   queryReady = !!csrfToken && sessionData.receiver_query_available === true &&

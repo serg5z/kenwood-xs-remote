@@ -83,6 +83,15 @@ async function fastRefreshWaitsForInterval() {
   assert.equal(env.posts, 2);
 }
 
+async function zeroIntervalShowsNoWait() {
+  const env = load({ postMs: 400, statusMs: 30, sessionMs: 30, capabilitiesMs: 30, intervalMs: 0 });
+  await settle();
+  await env.cd['cd-next'].click();
+  assert.match(timing(env), /token 90 \(30\/30\/30\) · wait 0 · ready \+490 ms/);
+  await env.cd['cd-next'].click();
+  assert.equal(env.posts, 2, 'ready as soon as the fresh token arrives');
+}
+
 async function inFlightTapsAreCounted() {
   const env = load({ postMs: 400, statusMs: 90, sessionMs: 95, capabilitiesMs: 100, intervalMs: 250 });
   await settle();
@@ -104,6 +113,7 @@ async function inFlightTapsAreCounted() {
 async function main() {
   await slowRefreshDominates();
   await fastRefreshWaitsForInterval();
+  await zeroIntervalShowsNoWait();
   await inFlightTapsAreCounted();
   process.stdout.write('Web CD timing diagnostics offline tests passed\n');
 }

@@ -7,7 +7,7 @@ const vm = require('node:vm');
 const OK = { ok: true, data: { result: 'SERVICE_TX_OK', cd_result: 'TX_VERIFIED',
   receiver_execution: 'UNVERIFIED' } };
 
-function setup({ postMs = 331, refreshMs = 100 } = {}) {
+function setup({ postMs = 331, refreshMs = 100, intervalMs = 250 } = {}) {
   const elements = new Map();
   const button = (cdAction) => ({ dataset: { cdAction }, disabled: true,
     addEventListener(_event, handler) { this.click = handler; } });
@@ -60,7 +60,7 @@ function setup({ postMs = 331, refreshMs = 100 } = {}) {
       if (url === '/api/v1/capabilities') {
         env.now += refreshMs;
         return respond(true, { operations: { cd_transport: { enabled: true,
-          available_actions: ['NEXT', 'PREVIOUS'], min_interval_ms: 250 } } });
+          available_actions: ['NEXT', 'PREVIOUS'], min_interval_ms: intervalMs } } });
       }
       if (url === '/api/v1/cd/track') {
         env.posts.push({ at: env.now, token: options.headers['X-CSRF-Token'],
@@ -212,6 +212,39 @@ async function failedSecondAlsoAbsorbsBurst() {
   assert.equal(env.posts.length, 2, 'no retry and no extra command after a failed second');
 }
 
+async function zeroCooldownSendsRightAfterFreshToken() {
+  // At 0 the token refresh (3 x 100 ms here) is the only wait before the second PREV.
+  const env = setup({ refreshMs: 100, intervalMs: 0 });
+  await env.settle();
+  const release = env.hold();
+  await env.tap();
+  await env.advance(150);
+  await env.tap();
+  assert.equal(env.posts.length, 1, 'never overlaps the first command');
+  const releaseSecond = env.hold();
+  await release();
+  const completed = env.posts[0].at + 150 + 331;
+  assert.deepEqual(actions(env), ['PREVIOUS', 'PREVIOUS']);
+  assert.equal(env.posts[1].at - completed, 300, 'only the token refresh separates them');
+  assert.deepEqual(env.posts.map((post) => post.token), ['token-1', 'token-2']);
+  await env.tap(); // The gesture's third-tap rule still applies.
+  assert.match(env.text(), /SECOND PREV SENT · EXTRA TAP IGNORED/);
+  await releaseSecond();
+  await env.advance(5000);
+  assert.equal(env.posts.length, 2);
+  // Cancellation rules are unchanged at 0.
+  const failed = setup({ refreshMs: 10, intervalMs: 0 });
+  await failed.settle();
+  failed.replies.push({ ok: false, data: { result: 'TIMEOUT', physical_check_required: true } });
+  const releaseFailed = failed.hold();
+  await failed.tap();
+  await failed.tap();
+  await releaseFailed();
+  await failed.advance(5000);
+  assert.equal(failed.posts.length, 1, 'no second PREV after a timed-out first at 0');
+  assert.match(failed.text(), /SECOND PREV CANCELLED/);
+}
+
 async function slowRefreshDispatchesRightAfterToken() {
   const env = setup({ refreshMs: 100 }); // Pi-like: refresh (300 ms) exceeds cooldown.
   await env.settle();
@@ -326,6 +359,7 @@ async function main() {
   await rapidDoublePrevSendsTwoWithFreshTokenAfterCooldown();
   await burstAfterSecondCompletesAddsNothing();
   await failedSecondAlsoAbsorbsBurst();
+  await zeroCooldownSendsRightAfterFreshToken();
   await slowRefreshDispatchesRightAfterToken();
   await laterTapIsASeparateAction();
   await nextIsNeverQueued();

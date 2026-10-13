@@ -113,7 +113,7 @@ async function serverTooFastIsReportedAndTokenRotates() {
 }
 
 async function invalidIntervalFallsBackToOneSecond() {
-  for (const value of [undefined, 100, 199, 1001, 5000, '250', 250.5, null]) {
+  for (const value of [undefined, -1, 1, 100, 199, 1001, 5000, '250', '0', 250.5, null]) {
     const env = load(value);
     await settle();
     await env.cd['cd-next'].click();
@@ -134,6 +134,22 @@ async function invalidIntervalFallsBackToOneSecond() {
     await env.cd['cd-next'].click();
     assert.equal(env.posts.length, 2, `interval ${value} is honored`);
   }
+  // 0 is the experimental zero cooldown, not a missing value: no 1000 ms fallback.
+  const zero = load(0);
+  await settle();
+  await zero.cd['cd-next'].click();
+  await zero.cd['cd-next'].click(); // Same instant the first completed and refreshed.
+  assert.equal(zero.posts.length, 2, 'interval 0 adds no client cooldown');
+  assert.notEqual(zero.posts[0].token, zero.posts[1].token, 'still a fresh token each time');
+  // Overlap is still impossible: a tap while a request is in flight is dropped.
+  zero.pending = deferred();
+  const inFlight = zero.cd['cd-next'].click();
+  await settle();
+  await zero.cd['cd-next'].click();
+  zero.pending.resolve();
+  await inFlight;
+  zero.pending = null;
+  assert.equal(zero.posts.length, 3, 'no overlapping request at interval 0');
 }
 
 async function main() {

@@ -43,6 +43,9 @@ CD_WAVEFORMS = ("MATCH", "MISMATCH", "INVALID", "MISSING", "NOT_OBSERVED")
 # returning to the Phase A 1 s value.
 CD_TRACK_INTERVAL_MS = 250
 CD_TRACK_INTERVAL_RANGE_MS = (200, 1000)
+# Experimental: 0 removes the cooldown. Serialization, STATUS, CSRF and reply
+# checks still apply, and each XS8 pair still completes before the next starts.
+CD_TRACK_INTERVAL_OFF = 0
 
 
 class ServiceError(Exception):
@@ -582,7 +585,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.send_json(409, {"result": "CD_BUSY", "receiver_execution": "UNVERIFIED"})
                 return
             self.held_cd_lock = state["lock"]
-            if (time.monotonic() - state["completed"]) * 1000 < self.cd_track_interval_ms:
+            if (self.cd_track_interval_ms != CD_TRACK_INTERVAL_OFF and
+                    (time.monotonic() - state["completed"]) * 1000 < self.cd_track_interval_ms):
                 session["csrf"] = secrets.token_urlsafe(32)
                 self.send_json(429, {"result": "TOO_FAST",
                                      "min_interval_ms": self.cd_track_interval_ms,
@@ -727,7 +731,8 @@ def parse_args(argv=None):
                         help="experimental minimum ms from one completed CD track "
                              f"command to the next (default {CD_TRACK_INTERVAL_MS}, "
                              f"range {CD_TRACK_INTERVAL_RANGE_MS[0]}-"
-                             f"{CD_TRACK_INTERVAL_RANGE_MS[1]})")
+                             f"{CD_TRACK_INTERVAL_RANGE_MS[1]}, or "
+                             f"{CD_TRACK_INTERVAL_OFF} for experimental zero cooldown)")
     parser.add_argument("--https-origin", help="required exact HTTPS Origin for active controls")
     parser.add_argument("--systemd-socket", action="store_true",
                         help="serve read-only HTTP using the systemd Unix listener")
@@ -740,8 +745,10 @@ def parse_args(argv=None):
         low, high = CD_TRACK_INTERVAL_RANGE_MS
         if not args.enable_cd_track:
             parser.error("--cd-track-interval-ms requires --enable-cd-track")
-        if not low <= args.cd_track_interval_ms <= high:
-            parser.error(f"--cd-track-interval-ms must be {low}-{high}")
+        if (args.cd_track_interval_ms != CD_TRACK_INTERVAL_OFF and
+                not low <= args.cd_track_interval_ms <= high):
+            parser.error(f"--cd-track-interval-ms must be {CD_TRACK_INTERVAL_OFF} "
+                         f"or {low}-{high}")
     else:
         args.cd_track_interval_ms = CD_TRACK_INTERVAL_MS
     if args.enable_offline_mute and (args.enable_mute or args.enable_source or

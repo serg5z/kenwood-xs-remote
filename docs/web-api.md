@@ -97,7 +97,7 @@ The CD transport section shows only PREV and NEXT; PLAY/PAUSE and STOP were remo
 **Double-PREV gesture.** A natural double tap is shorter than one command (about 331 ms of XS8 time; Web readiness was measured at 634 ms). So the browser accepts **one** explicit second PREV tap made within **800 ms** of the first PREV tap while that first operation is still running, cooling down or refreshing its token. During that time PREV stays clickable rather than `disabled`, so the tap reaches the page. The button gets a pending outline and the status line reads `PREV ×2 · SECOND PREV PENDING`. The browser sends the pending PREV once, through the normal request path, and only when all of these hold:
 
 - the first PREV returned 200 `SERVICE_TX_OK`;
-- at least `min_interval_ms` (250) has passed since it completed;
+- at least `min_interval_ms` (default 250; immediately at 0) has passed since it completed;
 - a refresh delivered a fresh CSRF token;
 - STATUS and capabilities still allow PREVIOUS;
 - the observed source has not changed since the first tap.
@@ -115,7 +115,7 @@ The pending tap exists only in page memory, so nothing replays after a reload or
 
 ### CD track spacing (experimental)
 
-`--cd-track-interval-ms` sets the spacing from one **completed** CD track dispatch to the next accepted one. It requires `--enable-cd-track`, accepts **200–1000** and defaults to **250**. The Gateway reports it as `min_interval_ms`, and the browser uses the same value. The Gateway prints it in the startup mode, for example `CD TRACK 250 ms`. Use `1000` to restore the Phase A spacing.
+`--cd-track-interval-ms` sets the spacing from one **completed** CD track dispatch to the next accepted one. It requires `--enable-cd-track`, accepts **200–1000** or **0**, and defaults to **250**. The Gateway reports it as `min_interval_ms`, and the browser uses the same value. The Gateway prints it in the startup mode, for example `CD TRACK 250 ms`. Use `1000` to restore the Phase A spacing.
 
 The value is an experimental setting for attended testing. It is not an established safe minimum.
 
@@ -123,6 +123,16 @@ The value is an experimental setting for attended testing. It is not an establis
 - **Evidence:** one research chain recorded as trial `id=34`: `EC → 72 → EC → 72` at a requested 100 ms gap (about 104–109 ms measured across that session, not per trial). The second, separate press moved to the preceding track. This is operator testimony from a single trial, without archived captures. It does not show that shorter gaps fail or that 100 ms is always enough.
 - **Margins:** the 100 ms PRESS → RELEASE gap inside one pair says nothing about spacing between separate pairs. The default keeps 2.5× the only observed working RELEASE → PRESS gap, and the lower bound keeps 2×. On the Web path, the real spacing also includes the browser's token refresh, the Gateway's fresh STATUS read and service preflight, so it is always longer than the setting.
 - **Unknown:** how long after a restart the changer still treats PREVIOUS as "move back". If two taps at 250 ms behave like two restarts, the cause is that changer threshold or slow UI round trips, not spacing that is too short. Record it and do not lower the bound.
+- **Zero cooldown (`0`, experimental):** a two-way setting for attended diagnosis of the double-PREV gap. The Gateway reports `min_interval_ms: 0`, and the browser treats 0 as a real value, not as missing (missing or invalid values still fall back to 1000 ms). Neither the Gateway nor the browser adds any wait after a command completes.
+  Everything else still applies:
+  - one CD request at a time across the Gateway (409 `CD_BUSY`);
+  - a fresh STATUS read before every command;
+  - CSRF checks and token rotation;
+  - strict reply parsing, with no retries;
+  - the double-PREV gesture and its cancellation rules;
+  - `sincecd` timing.
+
+  Zero cooldown does **not** mean zero delay between XS8 frames. The next PRESS still waits for the previous HTTP response, a token refresh, the Gateway's STATUS read, the service's socket loop, its preflight checks and the bus-free check. Only the artificial interval is removed. It is not an evidence-based safe minimum and is not a recommended default.
 
 ### Rollout and rollback
 
