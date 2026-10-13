@@ -73,7 +73,7 @@ Before dispatch the Gateway reads a fresh STATUS. It requires `state=IDLE`, a he
 
 | HTTP | `result` | Meaning | `physical_check_required` |
 |---|---|---|---|
-| 200 | `SERVICE_TX_OK` | Exact `OK CD_TRACK_TX` with both frames `TX_OK`/`MATCH` and `cd_result=TX_VERIFIED`. Includes `action`, all four evidence fields, `cd_result` and `receiver_execution=UNVERIFIED`. **Not** proof of a track change. | — |
+| 200 | `SERVICE_TX_OK` | Exact `OK CD_TRACK_TX` with both frames `TX_OK`/`MATCH` and `cd_result=TX_VERIFIED`. Includes `action`, all four evidence fields, `cd_result` and `receiver_execution=UNVERIFIED`. **Not** proof of a track change. Also carries `csrf_token`: the session's next single-use token (see below). | — |
 | 409 | `NOT_ELIGIBLE` | STATUS failed an eligibility check. Nothing dispatched. | — |
 | 409 | `CD_BUSY` | Another Web CD request is in progress, or STATUS shows a CD pair or explicit hold active (for example from the REPL). Nothing dispatched. | — |
 | 429 | `TOO_FAST` | Less than `min_interval_ms` since the previous dispatch completed. Nothing dispatched. | — |
@@ -98,9 +98,9 @@ The CD transport section shows only PREV and NEXT; PLAY/PAUSE and STOP were remo
 
 - the first PREV returned 200 `SERVICE_TX_OK`;
 - at least `min_interval_ms` (default 250; immediately at 0) has passed since it completed;
-- a refresh delivered a fresh CSRF token;
-- STATUS and capabilities still allow PREVIOUS;
-- the observed source has not changed since the first tap.
+- a fresh CSRF token is available: normally the one returned in the first PREV's 200 response, otherwise one from a refresh;
+- no refresh that arrived first showed lost eligibility (STATUS or capabilities) or a lost connection;
+- no CD fault is known and the last observed source has not changed since the first tap.
 
 The Gateway still runs all of its own checks (authorization, CSRF, a fresh STATUS read, its interval and the global lock) on that request.
 
@@ -110,6 +110,12 @@ The pending tap is **cancelled, never retried**, if any of these happens:
 - STATUS, eligibility, connection or the observed source changes;
 - another control is used;
 - the page is hidden or unloaded.
+
+**Second-PREV token and latency.** The Gateway rotates the CSRF token before every dispatch, so the token the first PREV used is already invalid. A successful CD response (200 `SERVICE_TX_OK` with `cd_result=TX_VERIFIED`) returns the rotated, still single-use successor as `csrf_token`. The browser keeps it only for the pending second PREV and uses it once. The second POST therefore no longer waits for the three-request display refresh (status, session, capabilities). It waits only for the first response and `min_interval_ms`. That refresh still runs for the display; it is superseded if the second PREV starts first, and a late result cannot overwrite a newer token or re-enable controls after an uncertain result. Without a returned token (an older Gateway), the browser waits for the refresh as before. The Gateway still reads STATUS before every transmission and still enforces the lock and the interval.
+
+Security: the returned token is the same value `GET /api/v1/session` would give the same authenticated, same-origin session. It goes only in a `Cache-Control: no-store` JSON body after the Origin, identity, cookie and CSRF checks, and is never returned on errors or refusals. It is never written to `Server-Timing` or the journal line. The server handles one request at a time, so checking and rotating the token cannot interleave with another request, and the previous token is rejected (403) on replay.
+
+Limitation: with the fast path, a source change or a new fault after the first PREV can stop the second only if a refresh shows it before dispatch. At `min_interval_ms: 0` the second normally goes out before any refresh, so only the Gateway's STATUS checks apply (IDLE, monitor, no STOP or context, CD idle with no owed release, no fault). The Gateway does not check the selected source. STATUS does include the receiver's last *passively observed* source (`receiver_source`, with its timestamp, evidence and `receiver_integrity`). But it changes only when the monitor decodes a receiver source broadcast before the Gateway reads STATUS. A change may not yet be broadcast or decoded within about 100 ms, may never be observed, or may leave the value `UNKNOWN` or stale. So it cannot reliably show that the input is still CD, and the CD preflight deliberately does not use it. This is not new to the double-PREV path: a single PREV or NEXT tap is accepted whatever the observed source, because CD eligibility has never depended on it. A PREV sent after the source changed is therefore a possible unwanted changer command. Its effect with a non-CD input selected has not been characterized; it is expected to act on the changer as in ROOT, but that is not established. Avoid switching the receiver source while a double-PREV gesture is in progress.
 
 The pending tap exists only in page memory, so nothing replays after a reload or reconnect. A third or later tap during the gesture never adds a command; the status line shows `EXTRA TAP IGNORED`. After the second PREV finishes, whether it succeeded or failed, the gesture ends only after **800 ms with no further tap**. PREV stays clickable and NEXT stays disabled until then, and the second PREV's result stays visible. A continuing burst therefore never starts a third command. Without a second tap, a tap more than 800 ms after the first is a separate action. NEXT is never queued, and there is no automatic double-press, hold-to-repeat or SEEK. The CD timing row adds `prev queued · extra · cancelled` counts once a gesture has been used.
 

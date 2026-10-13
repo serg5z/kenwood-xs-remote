@@ -7,7 +7,8 @@ const vm = require('node:vm');
 const OK = { ok: true, data: { result: 'SERVICE_TX_OK', cd_result: 'TX_VERIFIED',
   receiver_execution: 'UNVERIFIED' } };
 
-function setup({ postMs = 331, refreshMs = 100, intervalMs = 250 } = {}) {
+// postToken: model a Gateway that returns the rotated token in a CD 200 body.
+function setup({ postMs = 331, refreshMs = 100, intervalMs = 250, postToken = false } = {}) {
   const elements = new Map();
   const button = (cdAction) => ({ dataset: { cdAction }, disabled: true,
     addEventListener(_event, handler) { this.click = handler; } });
@@ -16,7 +17,10 @@ function setup({ postMs = 331, refreshMs = 100, intervalMs = 250 } = {}) {
     cd, elements, now: 10000, timers: [], nextTimer: 1, posts: [], sessionFetches: [],
     replies: [], gate: null, connected: true, cdState: 'IDLE', source: 'CD',
     docListeners: {}, winListeners: {}, hidden: false,
+    // Fake Gateway CSRF: one current token, rotated by every CSRF-valid POST.
+    rotations: 0, rejected: [], sessionGate: null, fetches: [],
   };
+  env.currentToken = () => `token-${env.rotations + 1}`;
   const respond = (ok, data) => ({ ok, json: async () => data, headers: { get: () => null } });
   const context = {
     AbortController,
@@ -41,6 +45,7 @@ function setup({ postMs = 331, refreshMs = 100, intervalMs = 250 } = {}) {
     },
     async fetch(url, options) {
       if (url === '/api/v1/status') {
+        env.fetches.push({ url, at: env.now });
         env.now += refreshMs;
         if (!env.connected) return respond(false, { gateway: 'online', xs8_service: 'unavailable' });
         return respond(true, { gateway: 'online', xs8_service: 'connected',
@@ -51,9 +56,14 @@ function setup({ postMs = 331, refreshMs = 100, intervalMs = 250 } = {}) {
             monitor: { value: 'OFF', freshness: 'FRESH' } } });
       }
       if (url === '/api/v1/session') {
+        env.fetches.push({ url, at: env.now });
+        // The token is read when the request reaches the Gateway; a slow
+        // response can therefore carry a token that is stale by arrival.
+        const token = env.currentToken();
+        const gate = env.sessionGate;
+        env.sessionGate = null;
+        if (gate) await gate.promise;
         env.now += refreshMs;
-        // The Gateway rotates the one-use token after every control POST.
-        const token = `token-${env.posts.length + 1}`;
         env.sessionFetches.push({ at: env.now, token });
         return respond(true, { csrf_token: token, cd_track_available: true });
       }
@@ -63,13 +73,20 @@ function setup({ postMs = 331, refreshMs = 100, intervalMs = 250 } = {}) {
           available_actions: ['NEXT', 'PREVIOUS'], min_interval_ms: intervalMs } } });
       }
       if (url === '/api/v1/cd/track') {
-        env.posts.push({ at: env.now, token: options.headers['X-CSRF-Token'],
-          action: JSON.parse(options.body).action });
+        const token = options.headers['X-CSRF-Token'];
+        if (token !== env.currentToken()) {
+          env.rejected.push(token); // Replay or stale token: 403, nothing sent.
+          return respond(false, { error: 'Invalid CSRF token' });
+        }
+        env.rotations += 1;
+        env.posts.push({ at: env.now, token, action: JSON.parse(options.body).action });
         if (env.gate) await env.gate.promise;
         env.now += postMs;
         const reply = env.replies.shift() || OK;
         if (reply === 'throw') throw new Error('network');
-        return respond(reply.ok, reply.data);
+        const data = { ...reply.data };
+        if (postToken && reply.ok) data.csrf_token = env.currentToken();
+        return respond(reply.ok, data);
       }
       throw new Error(`unexpected request ${url}`);
     },
@@ -354,6 +371,158 @@ async function secondFailureIsNotRetried() {
   }
 }
 
+// ---- Gateway returns the rotated token in the CD 200 body ----
+
+async function fastPathSkipsTheRefresh() {
+  const env = setup({ postToken: true, refreshMs: 100, intervalMs: 0 });
+  await env.settle();
+  const release = env.hold();
+  await env.tap();
+  await env.advance(150);
+  await env.tap();
+  const releaseSecond = env.hold();
+  await release();
+  const completed = env.posts[0].at + 150 + 331;
+  assert.deepEqual(actions(env), ['PREVIOUS', 'PREVIOUS']);
+  assert.equal(env.posts[1].at, completed, 'second POST right after the first response');
+  assert.equal(env.fetches.filter((f) => f.at >= completed && f.at <= env.posts[1].at &&
+    f.url === '/api/v1/session').length, 0, 'no session GET on the critical path');
+  assert.deepEqual(env.posts.map((post) => post.token), ['token-1', 'token-2'],
+    'two distinct single-use tokens');
+  await env.tap();
+  await env.tap();
+  await releaseSecond();
+  await env.advance(5000);
+  assert.equal(env.posts.length, 2, 'at most two commands per gesture');
+  assert.deepEqual(env.rejected, [], 'no stale or replayed token was ever sent');
+}
+
+async function fastPathStillHonorsCooldown() {
+  // Default 250 ms: a slow refresh (stalled GET /session) no longer decides; the
+  // cooldown does, and the second PREV goes out while that refresh is pending.
+  const env = setup({ postToken: true, refreshMs: 10 });
+  await env.settle();
+  const release = env.hold();
+  await env.tap();
+  await env.advance(150);
+  await env.tap();
+  let releaseStalled;
+  env.sessionGate = { promise: new Promise((done) => { releaseStalled = done; }) };
+  await release();
+  const completed = env.posts[0].at + 150 + 331;
+  await env.advance(completed + 249 - env.now);
+  assert.equal(env.posts.length, 1, 'cooldown still enforced');
+  await env.advance(1);
+  assert.equal(env.posts.length, 2, 'sent while the display refresh is still pending');
+  assert.equal(env.posts[1].at - completed, 250);
+  assert.equal(env.posts[1].token, 'token-2');
+  releaseStalled();
+  await env.settle();
+  await env.advance(5000);
+  assert.deepEqual(env.rejected, []);
+  assert.equal(env.posts.length, 2);
+}
+
+async function staleRefreshCannotOverwriteNewerToken() {
+  const env = setup({ postToken: true, refreshMs: 10 });
+  await env.settle();
+  const release = env.hold();
+  await env.tap();
+  await env.tap();
+  let releaseStale;
+  env.sessionGate = { promise: new Promise((done) => { releaseStale = done; }) };
+  await release(); // First completes; its display refresh stalls on GET /session.
+  await env.advance(250); // Cooldown: the second PREV goes out with the POST token.
+  assert.deepEqual(actions(env), ['PREVIOUS', 'PREVIOUS']);
+  // The stalled GET now answers with token-2, already used and rotated away.
+  releaseStale();
+  await env.settle();
+  await env.advance(1000); // Let the gesture close.
+  await env.tap('cd-next');
+  assert.deepEqual(actions(env), ['PREVIOUS', 'PREVIOUS', 'NEXT']);
+  assert.equal(env.posts[2].token, 'token-3', 'the newer token survived the stale refresh');
+  assert.deepEqual(env.rejected, []);
+}
+
+async function uncertainSecondIsNotReenabledByStaleRefresh() {
+  const env = setup({ postToken: true, refreshMs: 10 });
+  await env.settle();
+  env.replies.push(OK, { ok: false, data: { result: 'SERVICE_UNCERTAIN',
+    physical_check_required: true } });
+  const release = env.hold();
+  await env.tap();
+  await env.tap();
+  let releaseStale;
+  env.sessionGate = { promise: new Promise((done) => { releaseStale = done; }) };
+  await release();
+  env.cdState = 'FAULT_LATCHED'; // The service latched a fault on the uncertain pair.
+  await env.advance(250);
+  assert.equal(env.posts.length, 2);
+  releaseStale(); // Started while STATUS still read IDLE.
+  await env.settle();
+  await env.advance(5000);
+  assert.equal(env.cd['cd-previous'].disabled, true, 'not re-enabled by the stale refresh');
+  assert.equal(env.cd['cd-next'].disabled, true);
+  assert.equal(env.text(), 'CD FAULT LATCHED · STOP AND INSPECT CHANGER');
+  assert.equal(env.posts.length, 2, 'no retry');
+}
+
+async function fastPathCancellations() {
+  for (const [name, reply] of [
+    ['409', { ok: false, data: { result: 'NOT_ELIGIBLE' } }],
+    ['429', { ok: false, data: { result: 'TOO_FAST' } }],
+    ['502', { ok: false, data: { result: 'SERVICE_UNCERTAIN', physical_check_required: true } }],
+    ['504', { ok: false, data: { result: 'TIMEOUT', physical_check_required: true } }],
+    ['network', 'throw'],
+    ['200 without TX_VERIFIED', { ok: true, data: { result: 'SERVICE_TX_OK',
+      cd_result: 'PRESS_UNCERTAIN' } }]]) {
+    for (const intervalMs of [0, 250]) {
+      const env = setup({ postToken: true, refreshMs: 10, intervalMs });
+      await env.settle();
+      env.replies.push(reply);
+      const release = env.hold();
+      await env.tap();
+      await env.tap();
+      await release();
+      await env.advance(5000);
+      assert.equal(env.posts.length, 1, `${name} at ${intervalMs}: second PREV cancelled`);
+      assert.match(env.text(), /SECOND PREV CANCELLED/, name);
+    }
+  }
+  // With a cooldown, a refresh that lands first still cancels on what it shows.
+  for (const [name, change] of [['source change', (env) => { env.source = 'TUNER'; }],
+    ['changer busy', (env) => { env.cdState = 'HOLDING'; }],
+    ['connection lost', (env) => { env.connected = false; }]]) {
+    const env = setup({ postToken: true, refreshMs: 10 });
+    await env.settle();
+    const release = env.hold();
+    await env.tap();
+    await env.tap();
+    change(env);
+    await release();
+    await env.advance(5000);
+    assert.equal(env.posts.length, 1, `${name}: cancelled before dispatch`);
+    assert.match(env.text(), /SECOND PREV CANCELLED/, name);
+  }
+}
+
+async function noRetryAfterUncertainSecondWithToken() {
+  for (const reply of [{ ok: false, data: { result: 'SERVICE_UNCERTAIN',
+    physical_check_required: true } }, { ok: false, data: { result: 'TIMEOUT',
+    physical_check_required: true } }, 'throw']) {
+    const env = setup({ postToken: true, refreshMs: 10, intervalMs: 0 });
+    await env.settle();
+    env.replies.push(OK, reply);
+    const release = env.hold();
+    await env.tap();
+    await env.tap();
+    await release();
+    await env.advance(10000);
+    assert.deepEqual(actions(env), ['PREVIOUS', 'PREVIOUS']);
+    assert.deepEqual(env.rejected, []);
+  }
+}
+
 async function main() {
   await singlePrevQueuesNothing();
   await rapidDoublePrevSendsTwoWithFreshTokenAfterCooldown();
@@ -365,6 +534,12 @@ async function main() {
   await nextIsNeverQueued();
   await cancellations();
   await secondFailureIsNotRetried();
+  await fastPathSkipsTheRefresh();
+  await fastPathStillHonorsCooldown();
+  await staleRefreshCannotOverwriteNewerToken();
+  await uncertainSecondIsNotReenabledByStaleRefresh();
+  await fastPathCancellations();
+  await noRetryAfterUncertainSecondWithToken();
   process.stdout.write('Web CD double-PREV gesture offline tests passed\n');
 }
 

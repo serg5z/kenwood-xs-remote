@@ -665,6 +665,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if is_cd:
             payload["action"] = action
             payload.update(reply)
+            # The token rotated before dispatch, so the one just used is already
+            # invalid. Returning its single-use successor (only on a verified
+            # pair, only in this same-origin, no-store body) lets the browser send
+            # an explicit second PREV without three refresh round trips. It
+            # grants nothing GET /api/v1/session would not.
+            payload["csrf_token"] = session["csrf"]
         elif is_query:
             payload["result"] = reply
         elif is_mute:

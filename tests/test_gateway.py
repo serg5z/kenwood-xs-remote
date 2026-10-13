@@ -1077,6 +1077,73 @@ class CdTrackGatewayTest(GatewayTest):
                 self.assertEqual((got, json.loads(body)["result"]), (code, result))
                 self.assertLessEqual(len(self.dispatched(fake)), 1, "never retried")
 
+    def test_success_returns_rotated_single_use_token(self):
+        self.enable_cd()
+        self.server.RequestHandlerClass.cd_track_interval_ms = 0
+        logged = []
+        self.server.RequestHandlerClass.log_message = (
+            lambda handler, fmt, *args: logged.append(fmt % args))
+        token, cookie = self.session()
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                mute_reply=CD_OK.replace(b"NEXT", b"PREVIOUS"))
+        try:
+            code, body, headers = self.track(token, cookie, "PREVIOUS")
+            self.assertEqual(code, 200)
+            returned = json.loads(body)["csrf_token"]
+            self.assertNotEqual(returned, token)
+            self.assertEqual(returned, self.fresh_token(cookie), "same as the session token")
+            self.assertNotIn(returned, json.dumps(dict(headers)))
+            self.assertEqual(self.track(token, cookie, "PREVIOUS")[0], 403, "old token replay")
+            code, body, _ = self.track(returned, cookie, "PREVIOUS")
+            self.assertEqual(code, 200, "returned token authorizes exactly one more POST")
+            third = json.loads(body)["csrf_token"]
+            self.assertEqual(self.track(returned, cookie, "PREVIOUS")[0], 403)
+            self.assertNotIn(third, (token, returned))
+        finally:
+            fake.close()
+        self.assertEqual(self.dispatched(fake), [b"CD_TRACK_PREVIOUS\n"] * 2)
+        # Every CD request still read STATUS before its dispatch.
+        commands = [c for c in fake.commands if c in (b"STATUS\n", b"CD_TRACK_PREVIOUS\n")]
+        for index, command in enumerate(commands):
+            if command == b"CD_TRACK_PREVIOUS\n":
+                self.assertEqual(commands[index - 1], b"STATUS\n")
+        log = "\n".join(logged)
+        for value in (token, returned, third):
+            self.assertNotIn(value, log, "tokens never reach the journal")
+
+    def test_failures_never_return_a_token(self):
+        self.enable_cd()
+        self.server.RequestHandlerClass.cd_track_interval_ms = 0
+        cases = [(CD_HOLD_STATUS, CD_OK), (CD_FAULT_STATUS, CD_OK),
+                 (CD_IDLE_STATUS, CD_UNCERTAIN), (CD_IDLE_STATUS, b"ERR CD_TRACK_BUSY\n"),
+                 (CD_IDLE_STATUS, CD_OK.replace(b"action=NEXT", b"action=PREVIOUS")),
+                 (CD_IDLE_STATUS, b"ERR CD_FAULT_LATCHED\n")]
+        for status, reply in cases:
+            with self.subTest(reply=reply, status=status[:20]):
+                token, cookie = self.session()
+                fake = RecordingService(self.socket_path, status=status, mute_reply=reply)
+                code, body, _ = self.track(token, cookie)
+                fake.close()
+                self.assertNotEqual(code, 200)
+                self.assertNotIn("csrf_token", json.loads(body))
+        token, cookie = self.session()
+        with mock.patch.object(xs8_gateway, "send_cd_track", side_effect=xs8_gateway.MuteServiceError(
+                "TIMEOUT", "no reply")), self.eligible():
+            code, body, _ = self.track(token, cookie)
+        self.assertEqual(code, 504)
+        self.assertNotIn("csrf_token", json.loads(body))
+        state = self.server.__dict__["cd_track"]
+        with state["lock"]:
+            code, body, _ = self.track(self.fresh_token(cookie), cookie)
+        self.assertEqual(code, 409)
+        self.assertNotIn("csrf_token", json.loads(body))
+        self.server.RequestHandlerClass.cd_track_interval_ms = 1000
+        with mock.patch.object(xs8_gateway, "send_cd_track", return_value={
+                "cd_result": "TX_VERIFIED", "receiver_execution": "UNVERIFIED"}), self.eligible():
+            code, body, _ = self.track(self.fresh_token(cookie), cookie)
+        self.assertEqual((code, json.loads(body)["result"]), (429, "TOO_FAST"))
+        self.assertNotIn("csrf_token", json.loads(body))
+
     def test_ineligible_status_never_dispatches(self):
         self.enable_cd()
         cases = {

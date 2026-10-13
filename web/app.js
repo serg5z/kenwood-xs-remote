@@ -28,7 +28,7 @@ const prevCounts = { queued: 0, extra: 0, cancelled: 0 };
 // to complete, cool down and refresh its token. A later tap is a separate action.
 const PREV_DOUBLE_TAP_WINDOW_MS = 800;
 // { firstTap, lastTap, source, phase: 'first' | 'done' | 'second' | 'closing',
-//   pending, extra, timer, renderTimer }
+//   pending, extra, timer, renderTimer, token, awaitingRefresh }
 let prevGesture = null;
 let prevNote = null;
 let controlResult = null;
@@ -135,7 +135,7 @@ function applyRefresh(statusData, sessionData, capabilitiesData) {
     !!query && query.enabled === true;
   renderStatus(statusData);
   if (prevGesture && prevGesture.pending && prevGesture.phase === 'done') {
-    const reason = prevBlocked(statusData);
+    const reason = prevBlocked(statusData, true);
     if (reason) cancelPrev(reason);
   }
   updateControls();
@@ -251,16 +251,20 @@ function recordCdRefresh(steps, total) {
   }
 }
 
-async function sendControl(url, body, success, failure, pendingPrev = false) {
+// options.token: a single-use token returned by the previous CD POST.
+// options.onSettled(ok, data): runs after the response, before the display refresh.
+async function sendControl(url, body, success, failure, options = {}) {
+  const { pendingPrev = false, token: tokenOverride = null, onSettled = null } = options;
   if (!pendingPrev && prevGesture && prevGesture.pending) cancelPrev('OTHER CONTROL');
   let succeeded = false;
+  let responseData = null;
   controlBusy = true;
   ++refreshVersion;
   if (refreshController) {
     refreshController.abort();
     refreshController = null;
   }
-  const token = csrfToken;
+  const token = tokenOverride || csrfToken;
   csrfToken = null; muteReady = false; sourceReady = false; queryReady = false;
   cdReady = false;
   updateControls();
@@ -277,6 +281,7 @@ async function sendControl(url, body, success, failure, pendingPrev = false) {
       cdTiming.server = serverTiming(response.timing);
     }
     succeeded = response.ok;
+    responseData = response.data;
     controlResult = response.ok ? success : failure(response.data);
   } catch (_) {
     controlResult = url.endsWith('/mute') ? 'MUTE RESULT UNKNOWN · CHECK RECEIVER'
@@ -291,6 +296,9 @@ async function sendControl(url, body, success, failure, pendingPrev = false) {
     }
     controlBusy = false;
     updateControls();
+    // A pending second PREV may dispatch here; its request then supersedes this
+    // refresh, which only updates the display and the next token otherwise.
+    if (onSettled) onSettled(succeeded, responseData);
     await refresh();
   }
   return succeeded;
@@ -333,12 +341,17 @@ function observedSource() {
   return lastReceiver && lastReceiver.source && lastReceiver.source.value || 'UNKNOWN';
 }
 
-// Why the pending PREV must not be sent now, or null if it may be.
-function prevBlocked(statusData) {
+// Why the pending PREV must not be sent now, or null if it may be. A refresh
+// always checks eligibility. Before dispatch with the token returned by the
+// verified first PREV, the refresh need not have arrived: the Gateway reads
+// STATUS again before transmitting, and any refresh that does arrive first and
+// shows a problem has already cancelled the tap.
+function prevBlocked(statusData, refreshed = false) {
   if (statusData !== undefined &&
       !(statusData && statusData.xs8_service === 'connected')) return 'CONNECTION LOST';
   if (cdFault) return 'CD FAULT';
-  if (!csrfToken || !serviceReady || !cdReady || !enabledCdActions.includes('PREVIOUS')) {
+  if ((refreshed || !prevGesture.token) && (!csrfToken || !serviceReady || !cdReady ||
+      !enabledCdActions.includes('PREVIOUS'))) {
     return 'NOT ELIGIBLE';
   }
   if (observedSource() !== prevGesture.source) return 'SOURCE CHANGED';
@@ -392,7 +405,8 @@ function cancelPrev(reason) {
 // waits for the cooldown or drops it. It is never retried.
 function tryPendingPrev() {
   const gesture = prevGesture;
-  if (!gesture || !gesture.pending || gesture.phase !== 'done' || controlBusy) return;
+  if (!gesture || !gesture.pending || gesture.phase !== 'done' || controlBusy ||
+      gesture.awaitingRefresh) return;
   const reason = prevBlocked();
   if (reason) { cancelPrev(reason); return; }
   const wait = lastCdCompleted + cdIntervalMs - Date.now();
@@ -405,7 +419,9 @@ function tryPendingPrev() {
   gesture.phase = 'second';
   gesture.pending = false;
   prevNote = null;
-  dispatchCd('PREVIOUS', true).finally(() => {
+  const token = gesture.token;
+  gesture.token = null; // Single use, even client-side.
+  dispatchCd('PREVIOUS', { pendingPrev: true, token }).finally(() => {
     if (prevGesture !== gesture) return;
     // Success or failure, never a retry: absorb the rest of the burst.
     gesture.phase = 'closing';
@@ -441,14 +457,14 @@ function onPrevGestureTap() {
   renderCdTiming();
 }
 
-async function dispatchCd(action, pendingPrev = false) {
+async function dispatchCd(action, options = {}) {
   cdTiming = { click: Date.now(), postMs: null, server: {}, refresh: null,
     awaitingRefresh: false, enabledAt: null, readyAt: null, renderMs: null };
   renderCdTiming();
   const label = action === 'NEXT' ? 'NEXT' : 'PREV';
   return sendControl('/api/v1/cd/track', JSON.stringify({ action }),
     `${label} TX VERIFIED · TRACK CHANGE UNVERIFIED`,
-    (data) => cdFailure(label, data), pendingPrev);
+    (data) => cdFailure(label, data), options);
 }
 
 async function firstPrev() {
@@ -458,14 +474,22 @@ async function firstPrev() {
   prevGesture = gesture;
   prevNote = null;
   renderPrevGestureAt(gesture, now + PREV_DOUBLE_TAP_WINDOW_MS);
-  const ok = await dispatchCd('PREVIOUS');
-  if (prevGesture !== gesture) return;
-  if (!ok) {
-    // Failure, refusal, timeout or uncertainty: never follow it with another PREV.
-    cancelPrev('FIRST PREV NOT CONFIRMED');
-    return;
-  }
-  gesture.phase = 'done';
+  await dispatchCd('PREVIOUS', { onSettled: (ok, data) => {
+    if (prevGesture !== gesture) return;
+    if (!ok || !data || data.result !== 'SERVICE_TX_OK' || data.cd_result !== 'TX_VERIFIED') {
+      // Failure, refusal, timeout or uncertainty: never follow it with another PREV.
+      cancelPrev('FIRST PREV NOT CONFIRMED');
+      return;
+    }
+    gesture.phase = 'done';
+    gesture.token = typeof data.csrf_token === 'string' && data.csrf_token
+      ? data.csrf_token : null;
+    // Without a returned token (older Gateway), wait for the refresh as before.
+    gesture.awaitingRefresh = !gesture.token;
+    if (gesture.pending) tryPendingPrev();
+  } });
+  if (prevGesture !== gesture || gesture.phase !== 'done') return;
+  gesture.awaitingRefresh = false;
   if (gesture.pending) tryPendingPrev();
   else updateControls();
 }
