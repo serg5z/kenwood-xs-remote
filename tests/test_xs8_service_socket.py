@@ -166,6 +166,39 @@ class ServiceSocketTest(unittest.TestCase):
         for field in ("cd_state=IDLE", "cd_action=STOP", "cd_last_result=TX_VERIFIED"):
             self.assertIn(field, status)
 
+    def test_listener_accepts_bursts_beside_a_persistent_client(self):
+        """Normal load: one long-lived owner plus bursts of short-lived requests
+        connecting back to back. None may be refused before the service accepts."""
+        with self.connect() as persistent:
+            self.assertTrue(self.command(persistent, "STATUS").startswith("OK state="))
+            for _ in range(5):
+                burst = [self.connect() for _ in range(6)]  # No round trip between.
+                try:
+                    for client in burst:
+                        self.assertTrue(self.command(client, "STATUS").startswith("OK state="))
+                finally:
+                    for client in burst:
+                        client.close()
+            for _ in range(40):
+                self.assertTrue(self.request("STATUS").startswith("OK state="))
+            self.assertTrue(self.command(persistent, "STATUS").startswith("OK state="))
+
+    def test_client_limit_is_unchanged(self):
+        clients = []
+        try:
+            for _ in range(8):  # kMaxClients
+                clients.append(self.connect())
+                self.assertTrue(self.command(clients[-1], "STATUS").startswith("OK state="))
+            with self.connect() as extra:
+                extra.settimeout(1)
+                self.assertEqual(extra.recv(64), b"ERR BUSY\n")
+                self.assertEqual(extra.recv(64), b"")
+            self.assertTrue(self.command(clients[0], "STATUS").startswith("OK state="))
+        finally:
+            for client in clients:
+                client.close()
+        self.assertEqual(self.transmitted(), [])
+
     def test_volume_owner_disconnect_still_stops_with_other_clients(self):
         with self.connect() as cec:
             self.assertEqual(self.command(cec, "VOLUME_PRESS DOWN"),

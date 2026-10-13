@@ -33,6 +33,10 @@ namespace {
 constexpr unsigned int kFrameObservationMs = 300;
 constexpr size_t kMaxLine = 128;
 constexpr size_t kMaxClients = 8;
+// Pending connections the kernel queues until the poll loop accepts them (one
+// per iteration). A backlog of 1 refused back-to-back connects; this does not
+// change kMaxClients, which still answers ERR BUSY beyond 8 accepted clients.
+constexpr int kListenBacklog = 16;
 constexpr long kMaxResearchWindowMs = 5000;
 volatile std::sig_atomic_t stopping = 0;
 
@@ -220,7 +224,7 @@ int open_socket(const char *path)
     int bound = bind(fd, reinterpret_cast<sockaddr*>(&address),
                      sizeof(address));
     umask(old_mask);
-    if (bound < 0 || listen(fd, 1) < 0 || !set_nonblocking(fd)) {
+    if (bound < 0 || listen(fd, kListenBacklog) < 0 || !set_nonblocking(fd)) {
         int error = errno;
         if (bound == 0) unlink(path);
         close(fd);
