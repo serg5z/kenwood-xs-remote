@@ -69,6 +69,7 @@ const char* VolumeControl::stop_reason_name(StopReason reason)
     case StopReason::TX_ERROR: return "TX_ERROR";
     case StopReason::STARTUP_RECOVERY: return "STARTUP_RECOVERY";
     case StopReason::RESEARCH_EXIT: return "RESEARCH_EXIT";
+    case StopReason::STEP: return "STEP";
     case StopReason::NONE: return "NONE";
     }
     return "UNKNOWN";
@@ -261,6 +262,19 @@ bool VolumeControl::mute(Time now)
     }
     if (!finish(now, StopReason::NONE)) return false;
     return true;
+}
+
+VolumeControl::StepResult VolumeControl::step(Direction direction, Time now)
+{
+    if (state_ != State::IDLE || stop_owed_ || context_may_be_open_ ||
+        cancelled()) return StepResult::REFUSED;
+    if (!start(direction, now, now))
+        // start() already ran finish(); a failed frame or cleanup latched FAULT.
+        return state_ == State::FAULT_LATCHED ? StepResult::UNCERTAIN
+                                              : StepResult::CANCELLED;
+    // STOP immediately: its own transmission time is the movement duration.
+    return finish(now, StopReason::STEP) ? StepResult::VERIFIED
+                                         : StepResult::UNCERTAIN;
 }
 
 bool VolumeControl::research_context_enter(Time now)

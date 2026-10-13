@@ -1166,6 +1166,159 @@ static void test_cd_hold_max_hold()
     assert(fail_tx.sent == (Bytes{0x7A, 0x72, 0x72}));
 }
 
+static void test_volume_step()
+{
+    using Bytes = std::vector<uint8_t>;
+    const std::string idle_fields = " state=IDLE stop_owed=0 context_may_be_open=0"
+                                    " receiver_execution=UNVERIFIED\n";
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+    core.connected(1);
+    core.connected(2);
+    assert(core.command("VOLUME_STEP UP", at(10), at(10), 2) ==
+           "OK VOLUME_STEP_TX direction=UP" + idle_fields);
+    assert(core.command("VOLUME_STEP DOWN", at(20), at(20), 2) ==
+           "OK VOLUME_STEP_TX direction=DOWN" + idle_fields);
+    assert(tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x07, 0x17, 0xE9, 0x09, 0x07}));
+    assert(status_has(core, 21, " state=IDLE stop_owed=0 context_may_be_open=0 "));
+    assert(status_has(core, 21, " last_stop_waveform=MATCH "));
+    for (const char *line : {"VOLUME_STEP", "VOLUME_STEP up", "VOLUME_STEP UP ",
+                             "VOLUME_STEP LEFT"})
+        assert(core.command(line, at(22), at(22), 2) == "ERR UNKNOWN_COMMAND\n");
+    assert(core.command("VOLUME_STEP UP", at(22), at(22), 9) == "ERR NO_CLIENT\n");
+    // Disconnecting the stepping client owes nothing.
+    core.disconnected(at(23), 2);
+    assert(tx.sent.size() == 8);
+
+    // A CEC hold is neither interrupted nor taken over.
+    core.connected(2);
+    assert(core.command("VOLUME_PRESS UP", at(30), at(30), 1) == "OK VOLUME_PRESS_TX\n");
+    assert(core.command("VOLUME_STEP UP", at(40), at(40), 2) == "ERR VOLUME_BUSY\n");
+    assert(core.command("VOLUME_STEP DOWN", at(40), at(40), 2) == "ERR VOLUME_BUSY\n");
+    core.disconnected(at(41), 2);
+    assert(core.state() == VolumeControl::State::HOLDING_UP);
+    assert(core.command("VOLUME_PRESS UP", at(50), at(50), 1) == "OK VOLUME_PRESS_TX\n");
+    assert(tx.sent.size() == 10);
+    core.disconnected(at(60), 1);
+    assert(tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x07, 0x17, 0xE9, 0x09, 0x07,
+                             0x17, 0xF9, 0x09, 0x07}));
+
+    // Re-arm is preserved: after a CEC watchdog stop a step works, and the
+    // CEC press stays blocked until its release, as before.
+    core.connected(1);
+    core.connected(2);
+    assert(core.command("VOLUME_PRESS DOWN", at(100), at(100), 1) == "OK VOLUME_PRESS_TX\n");
+    core.tick(at(1300));
+    assert(core.state() == VolumeControl::State::IDLE);
+    assert(core.command("VOLUME_STEP DOWN", at(1310), at(1310), 2).rfind(
+           "OK VOLUME_STEP_TX", 0) == 0);
+    assert(core.command("VOLUME_PRESS DOWN", at(1320), at(1320), 1) == "ERR IDLE\n");
+    assert(core.command("VOLUME_RELEASE DOWN", at(1330), at(1330), 1) ==
+           "OK VOLUME_RELEASE_TX\n");
+    assert(core.command("VOLUME_PRESS DOWN", at(1340), at(1340), 1) == "OK VOLUME_PRESS_TX\n");
+    assert(core.command("VOLUME_RELEASE DOWN", at(1350), at(1350), 1) ==
+           "OK VOLUME_RELEASE_TX\n");
+    // Successful steps never leave a re-arm block behind.
+    assert(core.command("VOLUME_STEP UP", at(1360), at(1360), 2).rfind(
+           "OK VOLUME_STEP_TX", 0) == 0);
+    assert(core.command("VOLUME_PRESS UP", at(1370), at(1370), 1) == "OK VOLUME_PRESS_TX\n");
+    assert(core.command("VOLUME_RELEASE UP", at(1380), at(1380), 1) ==
+           "OK VOLUME_RELEASE_TX\n");
+    assert(core.command("MUTE", at(1390), at(1390), 1) == "OK MUTE_TX\n");
+
+    // Refusals transmit nothing.
+    FakeTx boot_tx;
+    Xs8ServiceCore boot(boot_tx, Ms(2000), false, {}, [] { return at(0); });
+    boot.connected();
+    assert(boot.command("VOLUME_STEP UP", at(1), at(1)) == "ERR BOOT_INHIBIT\n");
+    assert(boot_tx.sent.empty());
+
+    FakeTx cd_tx;
+    Xs8ServiceCore cd(cd_tx, Ms(2000), true, {}, [] { return at(0); });
+    cd.connected();
+    const auto token = hold_token(cd.command("CD_PRESS SEEK_FORWARD", at(1), at(1)));
+    assert(cd.command("VOLUME_STEP UP", at(2), at(2)) == "ERR CD_TRACK_BUSY\n");
+    cd_tx.fail_release = true;
+    assert(cd.command("CD_RELEASE " + token, at(3), at(3)).rfind(
+           "ERR CD_RELEASE_UNCERTAIN", 0) == 0);
+    assert(cd.command("VOLUME_STEP UP", at(4), at(4)) == "ERR CD_FAULT_LATCHED\n");
+    assert(cd_tx.sent == (Bytes{0x7A, 0x72}));
+
+    FakeTx context_tx;
+    Xs8ServiceCore context(context_tx, Ms(2000), true, {}, [] { return at(0); });
+    context.connected(1);
+    context.set_research_context_enabled(true);
+    assert(context.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED", at(1), at(1), 1)
+           .rfind("OK CONTEXT_SESSION_ENTERED", 0) == 0);
+    assert(context.command("VOLUME_STEP UP", at(2), at(2), 1) ==
+           "ERR RESEARCH_CONTEXT_ACTIVE\n");
+    assert(context_tx.sent == (Bytes{0x17}));
+
+    FakeTx monitor_tx;
+    Xs8ServiceCore monitor(monitor_tx, Ms(2000), true, {}, [] { return at(0); });
+    monitor.connected();
+    monitor_tx.healthy = false;
+    assert(monitor.command("VOLUME_STEP DOWN", at(1), at(1)) == "ERR MONITOR_FAILED\n");
+    assert(monitor_tx.sent.empty());
+
+    bool signalled = true;
+    FakeTx stop_tx;
+    Xs8ServiceCore stopping(stop_tx, Ms(2000), true, [&] { return signalled; },
+                            [] { return at(0); });
+    stopping.connected();
+    assert(stopping.command("VOLUME_STEP UP", at(1), at(1)) == "ERR SHUTDOWN\n");
+    assert(stop_tx.sent.empty());
+    signalled = false;
+    assert(stopping.command("VOLUME_STEP UP", at(2), at(2)).rfind(
+           "OK VOLUME_STEP_TX", 0) == 0);
+    assert(stopping.shutdown(at(3)));
+    assert(stop_tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x07}));
+
+    // Uncertain STOP: FAULT latched, obligations kept and reported, every
+    // later transmission refused, and one more cleanup only at shutdown.
+    FakeTx stop_fail_tx;
+    Xs8ServiceCore stop_fail(stop_fail_tx, Ms(2000), true, {}, [] { return at(0); });
+    stop_fail.connected();
+    stop_fail_tx.stop_matches = {false, false, false};
+    assert(stop_fail.command("VOLUME_STEP UP", at(1), at(1)) ==
+           "ERR VOLUME_STEP_UNCERTAIN direction=UP state=FAULT_LATCHED stop_owed=1"
+           " context_may_be_open=1 receiver_execution=UNVERIFIED\n");
+    assert(stop_fail_tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x09, 0x09}));
+    for (const char *line : {"VOLUME_STEP UP", "VOLUME_STEP DOWN",
+                             "VOLUME_PRESS UP", "MUTE"})
+        assert(stop_fail.command(line, at(2), at(2)).rfind("ERR ", 0) == 0);
+    assert(stop_fail.command("CD_PRESS TRACK_NEXT", at(2), at(2)) == "ERR FAULT_LATCHED\n");
+    assert(stop_fail.command("SELECT_SOURCE CD", at(2), at(2)) == "ERR FAULT_LATCHED\n");
+    assert(stop_fail_tx.sent.size() == 5);
+    assert(!stop_fail.shutdown(at(3)));
+    assert(stop_fail_tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x09, 0x09, 0x09, 0x07}));
+
+    // Uncertain CONTEXT exit.
+    FakeTx root_fail_tx;
+    Xs8ServiceCore root_fail(root_fail_tx, Ms(2000), true, {}, [] { return at(0); });
+    root_fail.connected();
+    root_fail_tx.fail_root = true;
+    assert(root_fail.command("VOLUME_STEP DOWN", at(1), at(1)) ==
+           "ERR VOLUME_STEP_UNCERTAIN direction=DOWN state=FAULT_LATCHED stop_owed=0"
+           " context_may_be_open=1 receiver_execution=UNVERIFIED\n");
+    assert(root_fail_tx.sent == (Bytes{0x17, 0xE9, 0x09, 0x07, 0x07, 0x07}));
+    assert(root_fail.command("VOLUME_STEP DOWN", at(2), at(2)) == "ERR FAULT_LATCHED\n");
+    assert(status_has(root_fail, 2, " state=FAULT_LATCHED stop_owed=0 context_may_be_open=1 "));
+    assert(root_fail_tx.sent.size() == 6);
+
+    // Uncertain entry frame: exit still attempted, FAULT latched, no retry.
+    FakeTx start_fail_tx;
+    Xs8ServiceCore start_fail(start_fail_tx, Ms(2000), true, {}, [] { return at(0); });
+    start_fail.connected();
+    start_fail_tx.fail_next = true;
+    assert(start_fail.command("VOLUME_STEP UP", at(1), at(1)) ==
+           "ERR VOLUME_STEP_UNCERTAIN direction=UP state=FAULT_LATCHED stop_owed=0"
+           " context_may_be_open=0 receiver_execution=UNVERIFIED\n");
+    assert(start_fail_tx.sent == (Bytes{0x17, 0x07}));
+    assert(start_fail.command("VOLUME_STEP UP", at(2), at(2)) == "ERR FAULT_LATCHED\n");
+    assert(start_fail_tx.sent == (Bytes{0x17, 0x07}));
+}
+
 int main()
 {
     test_startup_and_parsing();
@@ -1188,6 +1341,7 @@ int main()
     test_cd_hold_uncertain_and_volume_exclusion();
     test_cd_hold_interleaved_clients_and_volume_owner();
     test_cd_hold_max_hold();
+    test_volume_step();
     test_context_gates_and_authorization();
     test_context_send_exit_and_token_ownership();
     test_context_excludes_every_other_transmission();

@@ -373,6 +373,10 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
             volume_owner_set_ = false;
         return sent ? "OK MUTE_TX\n" : "ERR MUTE_UNCERTAIN\n";
     }
+    if (line == "VOLUME_STEP UP")
+        return volume_step(VolumeControl::Direction::UP, now);
+    if (line == "VOLUME_STEP DOWN")
+        return volume_step(VolumeControl::Direction::DOWN, now);
     const bool press = line == "VOLUME_PRESS UP" ||
                        line == "VOLUME_PRESS DOWN";
     const bool release = line == "VOLUME_RELEASE UP" ||
@@ -401,6 +405,39 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
     }
     return volume_.release(direction, now) ? "OK VOLUME_RELEASE_TX\n"
                                            : "ERR VOLUME_STOP_UNCERTAIN\n";
+}
+
+std::string Xs8ServiceCore::volume_step(VolumeControl::Direction direction,
+                                        Time now)
+{
+    using State = VolumeControl::State;
+    const State before = volume_.state();
+    // Never interrupt or take over an existing (CEC) hold.
+    if (before == State::HOLDING_UP || before == State::HOLDING_DOWN)
+        return "ERR VOLUME_BUSY\n";
+    if (before != State::IDLE)
+        return std::string("ERR ") + state_name(before) + "\n";
+    if (volume_.stop_owed() || volume_.context_may_be_open())
+        return "ERR UNRESOLVED_STATE\n";
+    const char *name = direction == VolumeControl::Direction::UP ? "UP" : "DOWN";
+    const auto result = volume_.step(direction, now);
+    if (result == VolumeControl::StepResult::REFUSED) return "ERR SHUTDOWN\n";
+    const char *outcome =
+        result == VolumeControl::StepResult::VERIFIED ? "TX_VERIFIED" :
+        result == VolumeControl::StepResult::CANCELLED ? "CANCELLED" : "UNCERTAIN";
+    std::fprintf(stderr, "XS8 VOLUME_STEP direction=%s result=%s state=%s "
+                         "stop_owed=%d context_may_be_open=%d "
+                         "receiver_execution=UNVERIFIED\n", name, outcome,
+        state_name(volume_.state()), volume_.stop_owed() ? 1 : 0,
+        volume_.context_may_be_open() ? 1 : 0);
+    return std::string(
+        result == VolumeControl::StepResult::VERIFIED ? "OK VOLUME_STEP_TX" :
+        result == VolumeControl::StepResult::CANCELLED ? "ERR VOLUME_STEP_CANCELLED" :
+        "ERR VOLUME_STEP_UNCERTAIN") +
+        " direction=" + name + " state=" + state_name(volume_.state()) +
+        " stop_owed=" + (volume_.stop_owed() ? "1" : "0") +
+        " context_may_be_open=" + (volume_.context_may_be_open() ? "1" : "0") +
+        " receiver_execution=UNVERIFIED\n";
 }
 
 std::string Xs8ServiceCore::begin_query_status(Time now)

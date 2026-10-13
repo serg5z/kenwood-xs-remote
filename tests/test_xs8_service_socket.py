@@ -129,6 +129,27 @@ class ServiceSocketTest(unittest.TestCase):
         self.assertEqual(self.process.wait(timeout=3), 0)
         self.assertEqual(self.transmitted(), ["0xEC", "0x72"])
 
+    def test_volume_step_short_lived_client_and_cec_hold(self):
+        idle = " state=IDLE stop_owed=0 context_may_be_open=0 receiver_execution=UNVERIFIED"
+        self.assertEqual(self.request("VOLUME_STEP UP"),
+                         "OK VOLUME_STEP_TX direction=UP" + idle)
+        self.assertEqual(self.transmitted(), ["0x17", "0xF9", "0x09", "0x07"])
+        with self.connect() as cec:
+            self.assertEqual(self.command(cec, "VOLUME_PRESS DOWN"), "OK VOLUME_PRESS_TX")
+            self.assertEqual(self.request("VOLUME_STEP DOWN"), "ERR VOLUME_BUSY")
+            self.assertIn("state=HOLDING_DOWN", self.request("STATUS"))
+            self.assertEqual(self.command(cec, "VOLUME_PRESS DOWN"), "OK VOLUME_PRESS_TX")
+            self.assertEqual(self.command(cec, "VOLUME_RELEASE DOWN"), "OK VOLUME_RELEASE_TX")
+        token = self.press("SEEK_FORWARD")
+        self.assertEqual(self.request("VOLUME_STEP DOWN"), "ERR CD_TRACK_BUSY")
+        self.assertTrue(self.request("CD_RELEASE " + token).startswith("OK CD_RELEASE_TX"))
+        self.assertEqual(self.request("VOLUME_STEP DOWN"),
+                         "OK VOLUME_STEP_TX direction=DOWN" + idle)
+        self.assertEqual(self.transmitted(), [
+            "0x17", "0xF9", "0x09", "0x07", "0x17", "0xE9", "0x09", "0x07",
+            "0x7A", "0x72", "0x17", "0xE9", "0x09", "0x07"])
+        self.assertIn("XS8 STOP reason=STEP result=TX_OK", self.log_path.read_text())
+
     def test_volume_owner_disconnect_still_stops_with_other_clients(self):
         with self.connect() as cec:
             self.assertEqual(self.command(cec, "VOLUME_PRESS DOWN"),

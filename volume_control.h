@@ -24,6 +24,7 @@ public:
         RESEARCH_CONTEXT
     };
     enum class Direction { UP, DOWN };
+    enum class StepResult { REFUSED, VERIFIED, CANCELLED, UNCERTAIN };
 
     VolumeControl(VolumeTransmitter& tx, Ms inactivity, Ms max_hold,
                   std::function<bool()> stopping = {},
@@ -35,6 +36,10 @@ public:
     bool release(Direction direction, Time now);
     bool disconnect(Direction direction, Time now);
     bool mute(Time now);
+    // One bounded movement from IDLE: 0x17 -> 0xF9/0xE9 -> 0x09 -> 0x07 with
+    // no added hold. Never retried as a whole; start() and finish() keep the
+    // STOP/exit obligations and fault latching. Re-arm state is untouched.
+    StepResult step(Direction direction, Time now);
     // Attended research: 0x17 entry, single bytes inside it, and the 0x07 exit
     // through the same cleanup path as volume and MUTE. context_may_be_open
     // stays set from before entry until a verified exit.
@@ -54,7 +59,7 @@ public:
 private:
     enum class StopReason {
         CEC_RELEASE, CLIENT_DISCONNECT, INACTIVITY, MAX_HOLD, DIRECTION_CHANGE,
-        SHUTDOWN, CANCELLED, TX_ERROR, STARTUP_RECOVERY, RESEARCH_EXIT, NONE
+        SHUTDOWN, CANCELLED, TX_ERROR, STARTUP_RECOVERY, RESEARCH_EXIT, STEP, NONE
     };
     bool start(Direction direction, Time received, Time now);
     bool finish(Time now, StopReason reason);

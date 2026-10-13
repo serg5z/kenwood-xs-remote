@@ -152,7 +152,7 @@ The following paths return HTTP 501 and do not access the XS8 service:
 
 | Endpoint | Proposed request | Safety condition before implementation |
 | --- | --- | --- |
-| `POST /api/v1/volume/step` | `{ "direction": "UP" }` or `DOWN` | Implement a bounded, atomic step in the single-owner XS8 service. STOP obligation and failure handling must remain server-side; browser release events cannot be the sole stop mechanism. |
+| `POST /api/v1/volume/step` | `{ "direction": "UP" }` or `DOWN` | The service-side [`VOLUME_STEP`](volume-step-api.md) exists (phase 1, offline-tested only). The Gateway endpoint still needs attended step calibration first. STOP obligation and failure handling stay server-side; browser release events cannot be the sole stop mechanism. |
 | `POST /api/v1/cd/transport` | None; superseded by `/api/v1/cd/track` | PLAY/PAUSE and STOP have no service API and no validated Web profile; ROOT `0x9C` is a STOP/CANCEL, not a KEY UP. Held SEEK (Phase B) needs a separately reviewed server-side token and heartbeat design. |
 
 No new XS8 byte values are assigned by this API design. Future iOS clients can use the same versioned JSON endpoints and show capabilities before presenting enabled controls.

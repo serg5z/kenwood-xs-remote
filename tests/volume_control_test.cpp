@@ -240,6 +240,151 @@ static void test_startup_recovery_and_interruption() {
     CHECK(!ctl5.stop_owed());
 }
 
+static void test_step() {
+    using Step = VolumeControl::StepResult;
+    using Bytes = std::vector<uint8_t>;
+    for (const auto& trial : {std::pair<Direction, uint8_t>{Direction::UP, 0xF9},
+                              {Direction::DOWN, 0xE9}}) {
+        FakeTx tx;
+        VolumeControl ctl(tx, Ms(1200), Ms(2000), {}, [] { return fake_now; });
+        CHECK(ctl.startup(false, true));
+        tx.on_send = [&](uint8_t byte) {
+            State expected = byte == 0x17 ? State::ENTERING
+                           : byte == trial.second ? State::START_UNCERTAIN
+                           : byte == 0x09 ? State::STOP_PENDING
+                                          : State::EXIT_PENDING;
+            CHECK(ctl.state() == expected);
+            // The obligations are recorded before each frame may reach the bus.
+            CHECK(ctl.context_may_be_open());
+            CHECK(ctl.stop_owed() == (byte == trial.second || byte == 0x09));
+        };
+        CHECK(ctl.step(trial.first, at(10)) == Step::VERIFIED);
+        CHECK(tx.sent == (Bytes{0x17, trial.second, 0x09, 0x07}));
+        CHECK(ctl.state() == State::IDLE && !ctl.stop_owed() &&
+              !ctl.context_may_be_open() && !ctl.rearm_blocked());
+        tx.on_send = {};
+        // Ordinary CEC press/release after a step is unchanged.
+        CHECK(ctl.press(trial.first, at(20), at(20)));
+        CHECK(ctl.release(trial.first, at(30)));
+        CHECK(tx.sent.size() == 8 && !ctl.rearm_blocked());
+    }
+
+    // Refusals transmit nothing and leave the existing state alone.
+    FakeTx boot_tx;
+    VolumeControl boot(boot_tx, Ms(1200), Ms(2000), {}, [] { return fake_now; });
+    CHECK(boot.step(Direction::UP, at(1)) == Step::REFUSED);
+    CHECK(boot.state() == State::BOOT_INHIBIT && boot_tx.sent.empty());
+
+    FakeTx hold_tx;
+    VolumeControl hold(hold_tx, Ms(1200), Ms(2000), {}, [] { return fake_now; });
+    CHECK(hold.startup(false, true));
+    CHECK(hold.press(Direction::DOWN, at(1), at(1)));
+    CHECK(hold.step(Direction::DOWN, at(2)) == Step::REFUSED);
+    CHECK(hold.step(Direction::UP, at(2)) == Step::REFUSED);
+    CHECK(hold.state() == State::HOLDING_DOWN && hold.stop_owed());
+    CHECK(hold_tx.sent == (Bytes{0x17, 0xE9}));
+    CHECK(hold.press(Direction::DOWN, at(3), at(3)));
+    CHECK(hold.release(Direction::DOWN, at(4)));
+    CHECK(hold_tx.sent == (Bytes{0x17, 0xE9, 0x09, 0x07}));
+
+    FakeTx context_tx;
+    VolumeControl context(context_tx, Ms(1200), Ms(2000), {},
+                          [] { return fake_now; });
+    CHECK(context.startup(false, true));
+    CHECK(context.research_context_enter(at(1)));
+    CHECK(context.step(Direction::UP, at(2)) == Step::REFUSED);
+    CHECK(context_tx.sent == (Bytes{0x17}));
+
+    bool stopping = true;
+    FakeTx stop_tx;
+    VolumeControl stopped(stop_tx, Ms(1200), Ms(2000), [&] { return stopping; },
+                          [] { return fake_now; });
+    CHECK(stopped.startup(false, true));
+    CHECK(stopped.step(Direction::UP, at(1)) == Step::REFUSED);
+    CHECK(stop_tx.sent.empty());
+
+    // Re-arm after a watchdog stop: a step neither sets nor clears it.
+    FakeTx rearm_tx;
+    VolumeControl rearm(rearm_tx, Ms(1200), Ms(2000), {}, [] { return fake_now; });
+    CHECK(rearm.startup(false, true));
+    CHECK(rearm.press(Direction::UP, at(10), at(10)));
+    rearm.tick(at(1210));
+    CHECK(rearm.rearm_blocked());
+    CHECK(rearm.step(Direction::UP, at(1300)) == Step::VERIFIED);
+    CHECK(rearm.rearm_blocked());
+    CHECK(!rearm.press(Direction::UP, at(1400), at(1400)));
+    CHECK(rearm.release(Direction::UP, at(1410)));
+    CHECK(rearm.press(Direction::UP, at(1420), at(1420)));
+
+    // Failure at every frame: cleanup through finish(), FAULT latched, and
+    // never a second 0x17 or start frame.
+    struct Failure { std::deque<bool> outcomes; Bytes sent; bool stop_owed, open; };
+    const Failure failures[] = {
+        {{false}, {0x17, 0x07}, false, false},                      // entry
+        {{true, false}, {0x17, 0xF9, 0x09, 0x07}, false, false},    // start
+        {{true, true, false}, {0x17, 0xF9, 0x09, 0x09, 0x07}, false, false},
+        {{true, true, false, false, false}, {0x17, 0xF9, 0x09, 0x09, 0x09},
+         true, true},                                               // STOP
+        {{true, true, true, false}, {0x17, 0xF9, 0x09, 0x07, 0x07}, false, false},
+        {{true, true, true, false, false, false},
+         {0x17, 0xF9, 0x09, 0x07, 0x07, 0x07}, false, true},        // exit
+    };
+    for (const auto& failure : failures) {
+        FakeTx tx;
+        VolumeControl ctl(tx, Ms(1200), Ms(2000), {}, [] { return fake_now; });
+        CHECK(ctl.startup(false, true));
+        tx.outcomes = failure.outcomes;
+        CHECK(ctl.step(Direction::UP, at(10)) == Step::UNCERTAIN);
+        CHECK(tx.sent == failure.sent);
+        CHECK(ctl.state() == State::FAULT_LATCHED);
+        CHECK(ctl.stop_owed() == failure.stop_owed);
+        CHECK(ctl.context_may_be_open() == failure.open);
+        CHECK(!ctl.rearm_blocked());
+        tx.outcomes.clear();
+        CHECK(ctl.step(Direction::UP, at(20)) == Step::REFUSED);
+        CHECK(!ctl.press(Direction::UP, at(21), at(21)));
+        CHECK(!ctl.mute(at(22)));
+        CHECK(tx.sent == failure.sent);
+        // Shutdown still owes the unresolved cleanup, in order, and the fault
+        // stays latched.
+        const bool owed = failure.stop_owed || failure.open;
+        CHECK(!ctl.shutdown(at(30)));
+        Bytes expected = failure.sent;
+        if (failure.stop_owed) expected.push_back(0x09);
+        if (owed) expected.push_back(0x07);
+        CHECK(tx.sent == expected);
+        CHECK(ctl.state() == State::FAULT_LATCHED);
+        CHECK(!ctl.stop_owed() && !ctl.context_may_be_open());
+    }
+
+    // Shutdown requested during each frame: the cleanup path still runs.
+    const std::pair<uint8_t, Bytes> interruptions[] = {
+        {0x17, {0x17, 0x07}},
+        {0xF9, {0x17, 0xF9, 0x09, 0x07}},
+        {0x09, {0x17, 0xF9, 0x09, 0x07}},
+        {0x07, {0x17, 0xF9, 0x09, 0x07}},
+    };
+    for (const auto& interruption : interruptions) {
+        bool signalled = false;
+        FakeTx tx;
+        VolumeControl ctl(tx, Ms(1200), Ms(2000), [&] { return signalled; },
+                          [] { return fake_now; });
+        CHECK(ctl.startup(false, true));
+        tx.on_send = [&](uint8_t byte) {
+            if (byte == interruption.first) signalled = true;
+        };
+        const Step result = ctl.step(Direction::UP, at(10));
+        // STOP and exit are never cancelled once the start frame is sent.
+        CHECK(result == (interruption.first == 0x17 || interruption.first == 0xF9
+                         ? Step::CANCELLED : Step::VERIFIED));
+        CHECK(tx.sent == interruption.second);
+        CHECK(ctl.state() == State::IDLE && !ctl.stop_owed() &&
+              !ctl.context_may_be_open());
+        CHECK(ctl.shutdown(at(20)));
+        CHECK(tx.sent == interruption.second);
+    }
+}
+
 int main() {
     test_boot_and_normal_paths();
     test_direction_change_and_shutdown();
@@ -248,5 +393,6 @@ int main() {
     test_watchdogs_and_stale_queue();
     test_mute_failure();
     test_startup_recovery_and_interruption();
+    test_step();
     std::cout << "volume state machine tests passed\n";
 }

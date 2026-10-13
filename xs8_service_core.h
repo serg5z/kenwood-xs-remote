@@ -70,6 +70,7 @@ private:
     std::string context_close(Time now, const char *reason, bool fault_after);
     void context_sync();
     std::string status() const;
+    std::string volume_step(VolumeControl::Direction direction, Time now);
     std::string cd_track(uint8_t press_byte, const char *action);
     std::string cd_press(uint8_t press_byte, const char *action, Time now);
     std::string cd_release(const char *reason);
