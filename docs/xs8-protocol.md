@@ -66,7 +66,16 @@ These are **logical TX bytes in exact order**. Each byte is a separate XS8 frame
 | Start volume down | `x17 → xE9` | Enter the context, then begin **continuous** volume decrease. |
 | Stop active volume and return to ROOT | `x09 → x07` | **Send STOP before context exit.** `x09` stops the continuous change; `x07` restores ROOT. Do not reverse or omit this order. |
 | Change volume direction | `x09 → x07 → x17 → xE9` or `x09 → x07 → x17 → xF9` | Finish the prior hold before starting the other direction. |
-| Mute toggle | `x17 → xD8 → x07` | Toggle MUTE in the observed context, then return to ROOT. If volume is active, first send `x09 → x07`. |
+| Mute toggle | `x17 → xD8 → x07` | Toggle MUTE in the observed context, then return to ROOT. If volume is active, first send `x09 → x07`. Physically confirmed as a **toggle** in both directions (mute, and unmute while muted) on 2026-10-12. |
+
+### Context source selection: VIDEO1 / VIDEO2 (validated 2026-10-12, not implemented)
+
+| Operation | Exact TX order | Evidence and limits |
+|---|---|---|
+| Select VIDEO1 / TV1 | `x17 → x78 → x07` | Physically observed (operator). ROOT `x13` afterwards reported `source_inferred=TV1`. |
+| Select VIDEO2 / TV2 | `x17 → x88 → x07` | Physically observed (operator). ROOT `x13` afterwards reported `source_inferred=TV2`. |
+
+Both were sent through the attended interactive CONTEXT session with human-paced gaps. Each exit `x07` was `TX_OK`/`MATCH` with one attempt. After each trial the front panel worked and ROOT `x84` selected CD, not tuner CH8. In ROOT, `x78`/`x88` are CD tracks 7/8, and ROOT `x78` with TUNER selected did not select VIDEO1, so **the `x17` entry is required**. `TX_OK`/`MATCH` and the inferred query labels are not the physical evidence; the operator's observation is. These are research results, **not production commands**. TV1/TV2 remain blocked in [source selection](source-selection.md). [Trial record](../research/notes/xs8-context-video-mute-2026-10-12.md)
 
 The firmware tracks an outstanding volume stop and retries STOP/ROOT transmission after BUSY failures. It uses a 1,200 ms heartbeat watchdog, but a permanently busy bus can prevent a STOP frame. A host should explicitly request stop on key release and shutdown; the watchdog is a fallback. [Failure handling](../xs8-bridge/xs8-bridge.ino)
 

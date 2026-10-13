@@ -197,6 +197,8 @@ If any check fails, stop, keep the logs and recover physically.
 
 These tests check software obligations, not receiver behavior.
 
+**Hardware validation (2026-10-12).** Attended runs exercised enter, a single `send`, explicit exit with one verified `0x07` and `context_may_be_open=0`, and `context verify`, with no fault. The runs physically established `0x78` → VIDEO1, `0x88` → VIDEO2 and `0xD8` → MUTE toggle in context ([trial record](../research/notes/xs8-context-video-mute-2026-10-12.md)). Lease expiry, disconnect, shutdown and failure exits were not exercised on hardware. One open anomaly: after an initial empty session (enter, then exit), the REPL printed `NOT_ACTIVE` while the service journal showed `reason=CLIENT_EXIT` with successful cleanup. The cause is **not established**. A heartbeat racing the exit is one unconfirmed explanation, from reading the code.
+
 ## Original context-session design notes
 
 The rest of this section is the design analysis that preceded the implemented mode. Its recovery and evidence cautions still apply. Its proposed API names differ from the implemented `CONTEXT_SESSION_*` requests, and the implemented mode intentionally has no candidate allowlist. `CONTEXT_ENTRY_FORBIDDEN` remains enforced for `RESEARCH_SEND` and `RESEARCH_CHAIN`. [Current service](../xs8_service.cpp)
