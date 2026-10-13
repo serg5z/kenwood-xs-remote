@@ -791,6 +791,237 @@ static void test_cd_hold_interleaved_clients_and_volume_owner()
            (std::vector<uint8_t>{0xFC, 0x72, 0x17, 0xF9, 0x09, 0x07}));
 }
 
+// ---- Attended research CONTEXT session ----
+
+static std::string context_token(const std::string& reply)
+{
+    const std::string field = " token=";
+    const auto start = reply.find(field);
+    assert(start != std::string::npos);
+    const auto first = start + field.size();
+    return reply.substr(first, reply.find(' ', first) - first);
+}
+
+static bool has(const std::string& text, const std::string& part)
+{
+    return text.find(part) != std::string::npos;
+}
+
+static std::string enter(Xs8ServiceCore& core, int ms, uint64_t client = 1)
+{
+    const std::string reply = core.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED",
+                                           at(ms), at(ms), client);
+    assert(reply.rfind("OK CONTEXT_SESSION_ENTERED token=", 0) == 0);
+    assert(has(reply, " byte=0x17 gpio_tx=TX_OK waveform=MATCH context_may_be_open=1"));
+    return context_token(reply);
+}
+
+static void test_context_gates_and_authorization()
+{
+    FakeTx tx;
+    Xs8ServiceCore inhibited(tx, Ms(2000), false, {}, [] { return at(0); });
+    inhibited.connected(1);
+    inhibited.set_research_context_enabled(true);
+    assert(inhibited.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED", at(1), at(1), 1) ==
+           "ERR CONTEXT_SESSION reason=BOOT_INHIBIT\n");
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+    core.connected(1);
+    assert(core.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED", at(1), at(1), 1) ==
+           "ERR CONTEXT_SESSION reason=DISABLED\n");
+    core.set_research_context_enabled(true);
+    for (const char *line : {"CONTEXT_SESSION_ENTER", "CONTEXT_SESSION_ENTER YES",
+                             "CONTEXT_SESSION_ENTER CONFIRM_ATTENDED EXTRA",
+                             "CONTEXT_SESSION_SEND 1 0x78", "CONTEXT_SESSION_BOGUS"})
+        assert(core.command(line, at(2), at(2), 1).rfind("ERR CONTEXT_SESSION reason=", 0) == 0);
+    assert(core.command("CONTEXT_SESSION_EXIT 1", at(2), at(2), 1) ==
+           "ERR CONTEXT_SESSION reason=NOT_ACTIVE\n");
+    assert(tx.sent.empty());
+    // An existing CD hold blocks entry; CD safety keeps priority.
+    assert(core.command("CD_PRESS TRACK_NEXT", at(3), at(3), 1).rfind("OK CD_PRESS_TX", 0) == 0);
+    assert(core.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED", at(4), at(4), 1) ==
+           "ERR CONTEXT_SESSION reason=CD_BUSY\n");
+    assert(tx.sent == (std::vector<uint8_t>{0xFC}));
+}
+
+static void test_context_send_exit_and_token_ownership()
+{
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+    core.connected(1);
+    core.connected(2);
+    core.set_research_context_enabled(true);
+    const std::string token = enter(core, 10);
+    const std::string status = core.command("STATUS", at(11), at(11), 2);
+    assert(has(status, "state=RESEARCH_CONTEXT ") && has(status, "context_may_be_open=1"));
+    assert(core.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED", at(12), at(12), 2) ==
+           "ERR CONTEXT_SESSION reason=BUSY\n");
+    // Token and owner connection are both required; neither alone suffices.
+    assert(core.command("CONTEXT_SESSION_SEND " + token + " 0x78", at(13), at(13), 2) ==
+           "ERR CONTEXT_SESSION reason=NOT_OWNER\n");
+    assert(core.command("CONTEXT_SESSION_SEND " + wrong_token(token) + " 0x78", at(14), at(14), 1) ==
+           "ERR CONTEXT_SESSION reason=NOT_OWNER\n");
+    assert(core.command("CONTEXT_SESSION_EXIT " + token, at(15), at(15), 2) ==
+           "ERR CONTEXT_SESSION reason=NOT_OWNER\n");
+    assert(tx.sent == (std::vector<uint8_t>{0x17}));
+    const std::string sent = core.command("CONTEXT_SESSION_SEND " + token + " 0x78", at(16), at(16), 1);
+    assert(sent == "OK CONTEXT_SESSION_SENT byte=0x78 gpio_tx=TX_OK waveform=MATCH "
+                   "context_may_be_open=1 receiver_execution=UNVERIFIED\n");
+    for (const char *line : {"0x17", "0x07", "0xE9", "0xF9", "0x7", "78", "0xZZ"}) {
+        const std::string reply = core.command(
+            "CONTEXT_SESSION_SEND " + token + " " + line, at(17), at(17), 1);
+        assert(reply.rfind("ERR CONTEXT_SESSION reason=", 0) == 0);
+    }
+    assert(tx.sent == (std::vector<uint8_t>{0x17, 0x78}));
+    const std::string exited = core.command("CONTEXT_SESSION_EXIT " + token, at(18), at(18), 1);
+    assert(exited.rfind("OK CONTEXT_SESSION_EXITED byte=0x07 root_attempts=1 "
+                        "root_gpio_tx=TX_OK root_waveform=MATCH context_may_be_open=0 "
+                        "state=IDLE root_verified=NOT_OBSERVED", 0) == 0);
+    assert(tx.sent == (std::vector<uint8_t>{0x17, 0x78, 0x07}));
+    assert(!core.context_may_be_open() && !core.research_context_open());
+    assert(core.command("CONTEXT_SESSION_SEND " + token + " 0x78", at(19), at(19), 1) ==
+           "ERR CONTEXT_SESSION reason=NOT_ACTIVE\n");
+    // A new session gets a new token; the old one never revives it.
+    const std::string second = enter(core, 20);
+    assert(second != token);
+    assert(core.command("CONTEXT_SESSION_EXIT " + token, at(21), at(21), 1) ==
+           "ERR CONTEXT_SESSION reason=NOT_OWNER\n");
+    assert(has(core.command("CONTEXT_SESSION_STATUS", at(22), at(22), 2), "open=1"));
+}
+
+static void test_context_excludes_every_other_transmission()
+{
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+    core.connected(1);
+    core.connected(2);
+    core.set_research_context_enabled(true);
+    enter(core, 10);
+    for (const char *line : {"MUTE", "VOLUME_PRESS UP", "SELECT_SOURCE CD",
+                             "CD_TRACK_NEXT", "CD_PRESS SEEK_FORWARD"})
+        assert(core.command(line, at(11), at(11), 2) == "ERR RESEARCH_CONTEXT_ACTIVE\n");
+    assert(core.begin_query_status(at(12)) == "ERR RESEARCH_CONTEXT\n");
+    assert(core.research_ready(at(12)) == "ERR RESEARCH reason=RESEARCH_CONTEXT\n");
+    assert(core.research_send(0x84, at(12)) == "ERR RESEARCH reason=RESEARCH_CONTEXT\n");
+    // RELEASE remains answerable and transmits nothing without a hold.
+    assert(core.command("VOLUME_RELEASE UP", at(13), at(13), 2) == "OK VOLUME_RELEASE_TX\n");
+    assert(tx.sent == (std::vector<uint8_t>{0x17}));
+}
+
+static void test_context_lease_lifetime_and_disconnect()
+{
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+    core.connected(1);
+    core.connected(2);
+    core.set_research_context_enabled(true);
+    const std::string token = enter(core, 0);
+    core.tick(at(2999));
+    assert(core.research_context_open());
+    assert(core.command("CONTEXT_SESSION_HEARTBEAT " + token, at(2999), at(2999), 1) ==
+           "OK CONTEXT_SESSION_LEASE_RENEWED\n");
+    core.tick(at(5998));
+    assert(core.research_context_open());
+    core.tick(at(5999));
+    assert(!core.research_context_open() && !core.context_may_be_open());
+    assert(tx.sent == (std::vector<uint8_t>{0x17, 0x07}));
+    assert(has(core.command("CONTEXT_SESSION_STATUS", at(6000), at(6000), 2),
+               "last=LEASE_EXPIRED_ROOT_TX_OK state=IDLE"));
+    assert(core.command("CONTEXT_SESSION_HEARTBEAT " + token, at(6001), at(6001), 1) ==
+           "ERR CONTEXT_SESSION reason=NOT_ACTIVE\n");
+
+    // Heartbeats cannot extend the absolute lifetime.
+    const std::string lived = enter(core, 10000);
+    for (int ms = 12000; ms < 310000; ms += 2000)
+        assert(core.command("CONTEXT_SESSION_HEARTBEAT " + lived, at(ms), at(ms), 1) ==
+               "OK CONTEXT_SESSION_LEASE_RENEWED\n");
+    core.tick(at(310000));
+    assert(!core.research_context_open());
+    assert(has(core.command("CONTEXT_SESSION_STATUS", at(310001), at(310001), 2),
+               "last=MAX_LIFETIME_ROOT_TX_OK"));
+
+    // Only the owner's disconnect exits, and no further client is needed.
+    enter(core, 320000);
+    core.disconnected(at(320001), 2);
+    assert(core.research_context_open());
+    core.disconnected(at(320002), 1);
+    assert(!core.research_context_open() && !core.context_may_be_open());
+    assert(tx.sent == (std::vector<uint8_t>{0x17, 0x07, 0x17, 0x07, 0x17, 0x07}));
+}
+
+static void test_context_uncertain_send_exits_and_latches()
+{
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+    core.connected(1);
+    core.set_research_context_enabled(true);
+    const std::string token = enter(core, 10);
+    tx.fail_next = true;
+    const std::string reply = core.command("CONTEXT_SESSION_SEND " + token + " 0x88",
+                                           at(11), at(11), 1);
+    assert(reply.rfind("ERR CONTEXT_SESSION_SEND_UNCERTAIN byte=0x88 gpio_tx=TX_OK "
+                       "waveform=MISSING root_attempts=1 root_gpio_tx=TX_OK "
+                       "root_waveform=MATCH context_may_be_open=0 state=FAULT_LATCHED", 0) == 0);
+    // Exit attempted once, candidate never retried, fault never silently cleared.
+    assert(tx.sent == (std::vector<uint8_t>{0x17, 0x88, 0x07}));
+    assert(core.state() == VolumeControl::State::FAULT_LATCHED);
+    assert(core.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED", at(12), at(12), 1) ==
+           "ERR CONTEXT_SESSION reason=FAULT_LATCHED\n");
+    assert(core.command("MUTE", at(13), at(13), 1) == "ERR MUTE_UNCERTAIN\n");
+    assert(tx.sent.size() == 3);
+}
+
+static void test_context_entry_busy_and_exit_failure()
+{
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+    core.connected(1);
+    core.set_research_context_enabled(true);
+    tx.fail_gpio_next = true; // BUSY or GPIO failure on the entry frame.
+    const std::string entered = core.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED",
+                                             at(10), at(10), 1);
+    assert(entered.rfind("ERR CONTEXT_SESSION_ENTER_UNCERTAIN byte=0x17 root_attempts=1 "
+                         "context_may_be_open=0 state=FAULT_LATCHED", 0) == 0);
+    assert(tx.sent == (std::vector<uint8_t>{0x17, 0x07}));
+    assert(!core.research_context_open());
+
+    FakeTx stuck;
+    Xs8ServiceCore other(stuck, Ms(2000), true, {}, [] { return at(0); });
+    other.connected(1);
+    other.set_research_context_enabled(true);
+    const std::string token = enter(other, 10);
+    stuck.fail_root = true;
+    const std::string exited = other.command("CONTEXT_SESSION_EXIT " + token, at(11), at(11), 1);
+    assert(exited.rfind("ERR CONTEXT_SESSION_EXIT_UNCERTAIN byte=0x07 root_attempts=3 "
+                        "root_gpio_tx=TX_OK root_waveform=MISSING context_may_be_open=1 "
+                        "state=FAULT_LATCHED", 0) == 0);
+    assert(stuck.sent == (std::vector<uint8_t>{0x17, 0x07, 0x07, 0x07}));
+    const std::string status = other.command("STATUS", at(12), at(12), 1);
+    assert(has(status, "state=FAULT_LATCHED") && has(status, "context_may_be_open=1"));
+}
+
+static void test_context_monitor_failure_and_shutdown()
+{
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+    core.connected(1);
+    core.set_research_context_enabled(true);
+    enter(core, 10);
+    tx.healthy = false;
+    core.tick(at(11));
+    assert(!core.research_context_open());
+    assert(core.state() == VolumeControl::State::FAULT_LATCHED);
+    assert(tx.sent.size() >= 2 && tx.sent[1] == 0x07);
+
+    FakeTx clean;
+    Xs8ServiceCore stopping(clean, Ms(2000), true, {}, [] { return at(0); });
+    stopping.connected(1);
+    stopping.set_research_context_enabled(true);
+    enter(stopping, 10);
+    assert(stopping.shutdown(at(11)));
+    assert(clean.sent == (std::vector<uint8_t>{0x17, 0x07}));
+    assert(!stopping.context_may_be_open());
+}
+
 int main()
 {
     test_startup_and_parsing();
@@ -812,5 +1043,12 @@ int main()
     test_cd_lease_renewal_stale_token_and_recovery();
     test_cd_hold_uncertain_and_volume_exclusion();
     test_cd_hold_interleaved_clients_and_volume_owner();
+    test_context_gates_and_authorization();
+    test_context_send_exit_and_token_ownership();
+    test_context_excludes_every_other_transmission();
+    test_context_lease_lifetime_and_disconnect();
+    test_context_uncertain_send_exits_and_latches();
+    test_context_entry_busy_and_exit_failure();
+    test_context_monitor_failure_and_shutdown();
     std::cout << "XS8 service core tests passed\n";
 }

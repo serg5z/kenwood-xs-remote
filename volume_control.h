@@ -20,7 +20,8 @@ public:
 
     enum class State {
         BOOT_INHIBIT, IDLE, ENTERING, START_UNCERTAIN,
-        HOLDING_UP, HOLDING_DOWN, STOP_PENDING, EXIT_PENDING, FAULT_LATCHED
+        HOLDING_UP, HOLDING_DOWN, STOP_PENDING, EXIT_PENDING, FAULT_LATCHED,
+        RESEARCH_CONTEXT
     };
     enum class Direction { UP, DOWN };
 
@@ -34,6 +35,14 @@ public:
     bool release(Direction direction, Time now);
     bool disconnect(Direction direction, Time now);
     bool mute(Time now);
+    // Attended research: 0x17 entry, single bytes inside it, and the 0x07 exit
+    // through the same cleanup path as volume and MUTE. context_may_be_open
+    // stays set from before entry until a verified exit.
+    bool research_context_enter(Time now);
+    bool research_context_send(uint8_t byte);
+    // Faults if the exit is unverified, or always when fault_after is set.
+    bool research_context_exit(Time now, bool fault_after);
+    unsigned int last_root_attempts() const { return last_root_attempts_; }
     void tick(Time now);
     bool shutdown(Time now);
 
@@ -45,7 +54,7 @@ public:
 private:
     enum class StopReason {
         CEC_RELEASE, CLIENT_DISCONNECT, INACTIVITY, MAX_HOLD, DIRECTION_CHANGE,
-        SHUTDOWN, CANCELLED, TX_ERROR, STARTUP_RECOVERY, NONE
+        SHUTDOWN, CANCELLED, TX_ERROR, STARTUP_RECOVERY, RESEARCH_EXIT, NONE
     };
     bool start(Direction direction, Time received, Time now);
     bool finish(Time now, StopReason reason);
@@ -70,6 +79,7 @@ private:
     Time last_volume_event_{};
     Time hold_started_{};
     Time stale_before_ = Time::min();
+    unsigned int last_root_attempts_ = 0;
 };
 
 #endif

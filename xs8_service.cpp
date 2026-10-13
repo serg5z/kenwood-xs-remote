@@ -53,7 +53,18 @@ public:
     }
     uint64_t last_start_ns() const { return last_start_ns_; }
     uint64_t last_end_ns() const { return last_end_ns_; }
+    struct Frame { ServiceTxEvidence evidence; uint64_t start_ns, end_ns; };
+    // Records every frame of one research CONTEXT command, including each 0x07
+    // cleanup attempt, so captures label all local TX windows.
+    void begin_record() { frames_.clear(); recording_ = true; }
+    std::vector<Frame> end_record() { recording_ = false; return std::move(frames_); }
     bool send(uint8_t byte) override {
+        const bool verified = send_frame(byte);
+        if (recording_) frames_.push_back({last_, last_start_ns_, last_end_ns_});
+        return verified;
+    }
+private:
+    bool send_frame(uint8_t byte) {
         last_ = {};
         last_end_time_ = {};
         last_.attempted = true;
@@ -94,10 +105,11 @@ public:
         return last_.gpio_completed &&
                last_.waveform == WaveformEvidence::MATCH;
     }
-private:
     xs8_gpio& bus_;
     xs8_monitor& monitor_;
     Xs8ReceiverState& receiver_;
+    std::vector<Frame> frames_;
+    bool recording_ = false;
     ServiceTxEvidence last_{};
     ServiceTxEvidence last_stop_{};
     uint64_t last_start_ns_ = 0;
@@ -225,6 +237,7 @@ int main(int argc, char **argv)
     bool authorized = false;
     bool research_tx_enabled = false;
     bool research_chain_enabled = false;
+    bool research_context_enabled = false;
     long hold_ms = 2000;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--allow-unrecovered-start") == 0)
@@ -233,6 +246,8 @@ int main(int argc, char **argv)
             research_tx_enabled = true;
         else if (std::strcmp(argv[i], "--enable-research-chain") == 0)
             research_chain_enabled = true;
+        else if (std::strcmp(argv[i], "--enable-research-context") == 0)
+            research_context_enabled = true;
         else if (std::strcmp(argv[i], "--socket") == 0 && i + 1 < argc)
             socket_path = argv[++i];
         else if (std::strcmp(argv[i], "--max-hold-ms") == 0 && i + 1 < argc) {
@@ -244,7 +259,7 @@ int main(int argc, char **argv)
         } else {
             std::fprintf(stderr, "Usage: %s [--socket PATH] "
                 "[--allow-unrecovered-start] [--enable-research-tx] "
-                "[--enable-research-chain] "
+                "[--enable-research-chain] [--enable-research-context] "
                 "[--max-hold-ms 100..3000]\n",
                 argv[0]);
             return 2;
@@ -276,11 +291,15 @@ int main(int argc, char **argv)
     GpioServiceTransmitter transmitter(bus, *monitor, receiver);
     Xs8ServiceCore core(transmitter, VolumeControl::Ms(hold_ms), authorized,
                         [] { return stopping != 0; });
+    // Interactive CONTEXT research needs both default-off research flags.
+    const bool context_research = research_tx_enabled && research_context_enabled;
+    core.set_research_context_enabled(context_research);
     std::fprintf(stderr, "XS8 service listening on %s; state=%s "
-                         "research_tx=%s research_chain=%s\n",
+                         "research_tx=%s research_chain=%s research_context=%s\n",
         socket_path, authorized ? "IDLE (operator authorized)" : "BOOT_INHIBIT",
         research_tx_enabled ? "ENABLED" : "DISABLED",
-        research_chain_enabled ? "ENABLED" : "DISABLED");
+        research_chain_enabled ? "ENABLED" : "DISABLED",
+        context_research ? "ENABLED" : "DISABLED");
     struct Client { int fd; uint64_t id; std::string input; };
     std::vector<Client> clients;
     uint64_t next_client_id = 1;
@@ -783,6 +802,85 @@ int main(int argc, char **argv)
                     if (!reply(client,
                                "ERR RESEARCH reason=INVALID_REQUEST\n"))
                         failed = true;
+                    continue;
+                }
+                if (line.compare(0, 16, "CONTEXT_SESSION_") == 0) {
+                    // Optional trailing observation window for ENTER/SEND/EXIT.
+                    long window = 1500;
+                    std::string request = line;
+                    const size_t space = line.rfind(' ');
+                    const bool transmits = line.compare(0, 21, "CONTEXT_SESSION_ENTER") == 0 ||
+                        line.compare(0, 20, "CONTEXT_SESSION_SEND") == 0 ||
+                        line.compare(0, 20, "CONTEXT_SESSION_EXIT") == 0;
+                    if (transmits && space != std::string::npos &&
+                        std::count(line.begin(), line.end(), ' ') ==
+                            (line.compare(0, 20, "CONTEXT_SESSION_SEND") == 0 ? 3 : 2)) {
+                        if (!parse_number(line.c_str() + space + 1, window) ||
+                            window < 1 || window > 5000) {
+                            if (!reply(client, "ERR CONTEXT_SESSION reason=INVALID_REQUEST\n"))
+                                failed = true;
+                            continue;
+                        }
+                        request = line.substr(0, space);
+                    }
+                    std::string denied;
+                    if (request.compare(0, 21, "CONTEXT_SESSION_ENTER") == 0) {
+                        if (stopping) denied = "ERR CONTEXT_SESSION reason=SHUTDOWN\n";
+                        else if (research_tx_uncertain)
+                            denied = "ERR CONTEXT_SESSION reason=TX_UNCERTAIN_LATCHED\n";
+                        else if (query || (research && research->active()) ||
+                                 (chain && chain->active()) || context_preparation.active())
+                            denied = "ERR CONTEXT_SESSION reason=SESSION_BUSY\n";
+                        else if (receiver.status_fields().find(" receiver_integrity=HEALTHY") ==
+                                 std::string::npos)
+                            denied = "ERR CONTEXT_SESSION reason=RECEIVER_INTEGRITY\n";
+                    } else if (request.compare(0, 20, "CONTEXT_SESSION_SEND") == 0 &&
+                               research && research->active()) {
+                        // Finish reading the previous capture first. EXIT is never held back.
+                        denied = "ERR CONTEXT_SESSION reason=CAPTURE_BUSY\n";
+                    }
+                    if (!denied.empty()) {
+                        if (!reply(client, denied)) failed = true;
+                        continue;
+                    }
+                    const uint64_t checkpoint = xs8_monitor_checkpoint(monitor);
+                    const int64_t before = xs8_gpio_now_ns();
+                    transmitter.begin_record();
+                    std::string result = core.command(request, received, received, client_id);
+                    const auto frames = transmitter.end_record();
+                    if (result.find("_UNCERTAIN ") != std::string::npos)
+                        research_tx_uncertain = true;
+                    if (!frames.empty() && result.back() == '\n') {
+                        result.pop_back();
+                        std::string detail = " capture_id=NONE";
+                        if (!(research && research->active()) && before > 0) {
+                            const uint64_t last_end = std::max<uint64_t>(
+                                frames.back().end_ns, (uint64_t)before);
+                            research.emplace(next_research_id++, checkpoint, (uint64_t)before,
+                                last_end + (uint64_t)window * 1000000ULL, false);
+                            for (const auto& frame : frames)
+                                if (frame.start_ns && frame.end_ns >= frame.start_ns)
+                                    research->add_tx_window(frame.start_ns, frame.end_ns);
+                            detail = " capture_id=" + std::to_string(research->id());
+                        }
+                        detail += " frames=";
+                        for (size_t i = 0; i < frames.size(); ++i) {
+                            const auto& e = frames[i].evidence;
+                            char item[96];
+                            std::snprintf(item, sizeof(item), "%s0x%02X:%s:%s:%llu:%llu",
+                                i ? "," : "", e.byte, e.gpio_completed ? "TX_OK" : "TX_FAIL",
+                                e.waveform == WaveformEvidence::MATCH ? "MATCH" :
+                                e.waveform == WaveformEvidence::MISMATCH ? "MISMATCH" :
+                                e.waveform == WaveformEvidence::INVALID ? "INVALID" :
+                                e.waveform == WaveformEvidence::MISSING ? "MISSING" :
+                                "NOT_OBSERVED",
+                                (unsigned long long)frames[i].start_ns,
+                                (unsigned long long)frames[i].end_ns);
+                            detail += item;
+                        }
+                        result += detail + "\n";
+                    }
+                    if (!reply(client, result)) failed = true;
                     continue;
                 }
                 if (line == "QUERY_STATUS") {

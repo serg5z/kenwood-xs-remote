@@ -54,7 +54,17 @@ public:
     bool cd_release_owed() const { return cd_release_owed_; }
     bool cd_fault() const { return cd_fault_; }
     void set_receiver_status(const std::string& fields) { receiver_status_ = fields; }
+    // Attended CONTEXT research (default off). The caller also enforces its
+    // startup flags and service-level capture/research exclusivity.
+    void set_research_context_enabled(bool enabled) { context_enabled_ = enabled; }
+    bool research_context_open() const { return context_open_; }
+    static constexpr VolumeControl::Ms kContextLease{3000};
+    static constexpr VolumeControl::Ms kContextMaxLifetime{300000};
 private:
+    std::string context_command(const std::string& line, Time now,
+                                uint64_t client_id);
+    std::string context_close(Time now, const char *reason, bool fault_after);
+    void context_sync();
     std::string status() const;
     std::string cd_track(uint8_t press_byte, const char *action);
     std::string cd_press(uint8_t press_byte, const char *action, Time now);
@@ -83,6 +93,15 @@ private:
     std::string cd_last_result_ = "NONE";
     ServiceTxEvidence cd_release_evidence_{};
     VolumeControl::Direction owner_direction_ = VolumeControl::Direction::DOWN;
+    bool context_enabled_ = false;
+    bool context_open_ = false;
+    uint64_t context_token_ = 0;
+    uint64_t context_last_token_ = 0;
+    uint64_t context_owner_ = 0;
+    Time context_started_{};
+    Time context_renewed_{};
+    unsigned int context_sends_ = 0;
+    std::string context_last_ = "NONE";
     std::string receiver_status_ =
         " receiver_source=UNKNOWN receiver_source_ns=0 receiver_source_evidence=NONE"
         " receiver_monitor=UNKNOWN receiver_monitor_ns=0 receiver_monitor_evidence=NONE"

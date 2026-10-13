@@ -68,6 +68,7 @@ const char* VolumeControl::stop_reason_name(StopReason reason)
     case StopReason::CANCELLED: return "CANCELLED";
     case StopReason::TX_ERROR: return "TX_ERROR";
     case StopReason::STARTUP_RECOVERY: return "STARTUP_RECOVERY";
+    case StopReason::RESEARCH_EXIT: return "RESEARCH_EXIT";
     case StopReason::NONE: return "NONE";
     }
     return "UNKNOWN";
@@ -138,6 +139,7 @@ bool VolumeControl::finish(Time now, StopReason reason)
     if (context_may_be_open_) {
         state_ = State::EXIT_PENDING;
         const bool root_ok = send_retry(0x07, any_failure, root_retries);
+        last_root_attempts_ = root_retries + 1;
         root_completed = now_();
         completed = root_completed;
         if (sent_stop)
@@ -259,6 +261,42 @@ bool VolumeControl::mute(Time now)
     }
     if (!finish(now, StopReason::NONE)) return false;
     return true;
+}
+
+bool VolumeControl::research_context_enter(Time now)
+{
+    if (state_ != State::IDLE || stop_owed_ || context_may_be_open_ ||
+        cancelled()) return false;
+    state_ = State::ENTERING;
+    context_may_be_open_ = true; // Before TX: the frame may reach the receiver.
+    last_root_attempts_ = 0;
+    if (!tx_.send(0x17)) {
+        finish(now, StopReason::TX_ERROR);
+        fault();
+        return false;
+    }
+    if (cancelled()) {
+        finish(now, StopReason::CANCELLED);
+        return false;
+    }
+    state_ = State::RESEARCH_CONTEXT;
+    return true;
+}
+
+bool VolumeControl::research_context_send(uint8_t byte)
+{
+    if (state_ != State::RESEARCH_CONTEXT) return false;
+    return tx_.send(byte);
+}
+
+bool VolumeControl::research_context_exit(Time now, bool fault_after)
+{
+    if (state_ != State::RESEARCH_CONTEXT && !context_may_be_open_) return false;
+    const bool was_fault = state_ == State::FAULT_LATCHED;
+    last_root_attempts_ = 0;
+    const bool exited = finish(now, StopReason::RESEARCH_EXIT);
+    if (fault_after || was_fault) fault();
+    return exited && !fault_after && !was_fault;
 }
 
 void VolumeControl::tick(Time now)

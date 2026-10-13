@@ -19,6 +19,7 @@ class ServiceSocketTest(unittest.TestCase):
             str(pathlib.Path(".build/xs8_service_socket_test").resolve()),
             "--socket", self.path, "--allow-unrecovered-start",
             "--enable-research-tx", "--enable-research-chain",
+            "--enable-research-context",
         ], stdout=subprocess.DEVNULL, stderr=self.log)
         deadline = time.monotonic() + 3
         while not pathlib.Path(self.path).exists():
@@ -218,6 +219,124 @@ class ServiceSocketTest(unittest.TestCase):
         self.assertTrue(self.request("CD_RELEASE " + token).startswith("OK CD_RELEASE_TX"))
         self.assertEqual(self.transmitted(), ["0x17", "0xE9", "0x09", "0x07", "0xFC", "0x72"])
 
+
+    # ---- Attended research CONTEXT session ----
+
+    def enter_context(self, owner):
+        reply = self.command(owner, "CONTEXT_SESSION_ENTER CONFIRM_ATTENDED 100")
+        self.assertTrue(reply.startswith("OK CONTEXT_SESSION_ENTERED token="), reply)
+        self.assertIn("byte=0x17 gpio_tx=TX_OK waveform=MATCH context_may_be_open=1", reply)
+        self.assertRegex(reply, r" capture_id=\d+ frames=0x17:TX_OK:MATCH:\d+:\d+$")
+        return re.search(r"token=(\d+)", reply).group(1), reply
+
+    def wait_capture(self, reply):
+        capture = re.search(r"capture_id=(\d+)", reply).group(1)
+        deadline = time.monotonic() + 2
+        while True:
+            done = self.request(f"RESEARCH_READ {capture} 0")
+            if done.startswith("OK RESEARCH_DONE"):
+                return done
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+
+    def wait_idle(self, seconds=1.0):
+        deadline = time.monotonic() + seconds
+        while not self.request("STATUS").startswith("OK state=IDLE "):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+
+    def test_context_session_owner_send_exit_and_exclusivity(self):
+        # Open the second connection only after the first is accepted: the
+        # service listens with backlog 1 (tracked separately).
+        with self.connect() as owner:
+            token, entered = self.enter_context(owner)
+            other = self.connect()
+            self.addCleanup(other.close)
+            self.wait_capture(entered)
+            status = self.request("STATUS")
+            self.assertIn("state=RESEARCH_CONTEXT ", status)
+            self.assertIn("context_may_be_open=1", status)
+            self.assertNotIn(token, self.request("CONTEXT_SESSION_STATUS"))
+            for command in ("MUTE", "VOLUME_PRESS UP", "SELECT_SOURCE CD",
+                            "CD_TRACK_NEXT", "CD_PRESS SEEK_FORWARD"):
+                self.assertEqual(self.command(other, command), "ERR RESEARCH_CONTEXT_ACTIVE")
+            self.assertEqual(self.command(other, "VOLUME_RELEASE UP"), "OK VOLUME_RELEASE_TX")
+            self.assertEqual(self.request("QUERY_STATUS"), "ERR RESEARCH_CONTEXT")
+            self.assertEqual(self.request("RESEARCH_SEND 0x84 100"),
+                             "ERR RESEARCH reason=RESEARCH_CONTEXT")
+            self.assertEqual(self.request("RESEARCH_SEND 0x17 100"),
+                             "ERR RESEARCH reason=CONTEXT_ENTRY_FORBIDDEN")
+            self.assertIn("UNRESOLVED_CONTROL_STATE", self.request(
+                "RESEARCH_CONTEXT_PREPARE MUTE CONFIRM_NO_TX"))
+            # The token is useless on any connection but the one that entered.
+            self.assertEqual(self.command(other, f"CONTEXT_SESSION_SEND {token} 0x78 100"),
+                             "ERR CONTEXT_SESSION reason=NOT_OWNER")
+            self.assertEqual(self.command(other, f"CONTEXT_SESSION_EXIT {token} 100"),
+                             "ERR CONTEXT_SESSION reason=NOT_OWNER")
+            self.assertEqual(self.command(owner, f"CONTEXT_SESSION_SEND {token} 0x17 100"),
+                             "ERR CONTEXT_SESSION reason=NESTED_ENTRY_FORBIDDEN")
+            sent = self.command(owner, f"CONTEXT_SESSION_SEND {token} 0x78 100")
+            self.assertRegex(sent, r"^OK CONTEXT_SESSION_SENT byte=0x78 gpio_tx=TX_OK "
+                                   r"waveform=MATCH context_may_be_open=1 "
+                                   r"receiver_execution=UNVERIFIED capture_id=\d+ "
+                                   r"frames=0x78:TX_OK:MATCH:\d+:\d+$")
+            self.assertIn("kind=OBSERVE", self.wait_capture(sent))
+            self.assertEqual(self.command(owner, f"CONTEXT_SESSION_HEARTBEAT {token}"),
+                             "OK CONTEXT_SESSION_LEASE_RENEWED")
+            exited = self.command(owner, f"CONTEXT_SESSION_EXIT {token} 100")
+            self.assertRegex(exited, r"^OK CONTEXT_SESSION_EXITED byte=0x07 root_attempts=1 "
+                                     r"root_gpio_tx=TX_OK root_waveform=MATCH "
+                                     r"context_may_be_open=0 state=IDLE "
+                                     r"root_verified=NOT_OBSERVED .*frames=0x07:TX_OK:MATCH")
+            self.wait_capture(exited)
+            self.assertEqual(self.command(owner, f"CONTEXT_SESSION_SEND {token} 0x78"),
+                             "ERR CONTEXT_SESSION reason=NOT_ACTIVE")
+        self.assertEqual(self.transmitted(), ["0x17", "0x78", "0x07"])
+        self.assertNotIn(token, self.log_path.read_text())
+        self.assertEqual(self.request("MUTE"), "OK MUTE_TX")
+
+    def test_context_owner_disconnect_exits_through_service(self):
+        with self.connect() as owner:
+            self.enter_context(owner)
+            self.assertIn("state=RESEARCH_CONTEXT ", self.request("STATUS"))
+        self.wait_idle()
+        self.assertIn("context_may_be_open=0", self.request("STATUS"))
+        self.assertEqual(self.transmitted(), ["0x17", "0x07"])
+        self.assertIn("reason=OWNER_DISCONNECTED", self.log_path.read_text())
+
+    def test_context_lease_expiry_exits_while_owner_stays_connected(self):
+        with self.connect() as owner:
+            token, _ = self.enter_context(owner)
+            self.wait_idle(seconds=4.0)
+            self.assertEqual(self.command(owner, f"CONTEXT_SESSION_HEARTBEAT {token}"),
+                             "ERR CONTEXT_SESSION reason=NOT_ACTIVE")
+        self.assertEqual(self.transmitted(), ["0x17", "0x07"])
+        self.assertIn("reason=LEASE_EXPIRED", self.log_path.read_text())
+        self.assertIn("last=LEASE_EXPIRED_ROOT_TX_OK", self.request("CONTEXT_SESSION_STATUS"))
+
+    def test_context_orderly_shutdown_exits(self):
+        with self.connect() as owner:
+            self.enter_context(owner)
+            self.process.terminate()
+            self.assertEqual(self.process.wait(timeout=3), 0)
+        self.assertEqual(self.transmitted(), ["0x17", "0x07"])
+
+    def test_context_requires_both_research_flags(self):
+        self.process.terminate()
+        self.process.wait(timeout=3)
+        pathlib.Path(self.path).unlink(missing_ok=True)
+        self.process = subprocess.Popen([
+            str(pathlib.Path(".build/xs8_service_socket_test").resolve()),
+            "--socket", self.path, "--allow-unrecovered-start", "--enable-research-context",
+        ], stdout=subprocess.DEVNULL, stderr=self.log)
+        deadline = time.monotonic() + 3
+        while not pathlib.Path(self.path).exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        self.assertEqual(self.request("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED"),
+                         "ERR CONTEXT_SESSION reason=DISABLED")
+        self.assertIn("research_context=DISABLED", self.log_path.read_text())
+        self.assertEqual(self.transmitted(), [])
 
 if __name__ == "__main__":
     unittest.main()
