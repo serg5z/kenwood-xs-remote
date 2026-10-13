@@ -18,6 +18,9 @@ let lastSourceAttempt = 0;
 // Gateway. Without a valid value, keep the conservative Phase A 1 s.
 let cdIntervalMs = 1000;
 let lastCdCompleted = -Infinity;
+// Diagnostics only: the last CD tap's timeline and taps dropped by the guards.
+let cdTiming = null;
+const cdDropped = { busy: 0, interval: 0, disabled: 0 };
 let controlResult = null;
 let refreshController = null;
 let refreshVersion = 0;
@@ -117,8 +120,36 @@ function applyRefresh(statusData, sessionData, capabilitiesData) {
 }
 
 async function fetchJson(url, options = {}) {
+  const started = Date.now();
   const response = await fetch(url, options);
-  return { ok: response.ok, data: await response.json() };
+  const data = await response.json();
+  const timing = response.headers && typeof response.headers.get === 'function'
+    ? response.headers.get('Server-Timing') : null;
+  return { ok: response.ok, data, ms: Date.now() - started, timing };
+}
+
+function serverTiming(header) {
+  const result = {};
+  for (const item of (header || '').split(',')) {
+    const match = /^\s*(\w+);dur=([\d.]+)\s*$/.exec(item);
+    if (match) result[match[1]] = Math.round(Number(match[2]));
+  }
+  return result;
+}
+
+function renderCdTiming() {
+  const t = cdTiming;
+  const dropped = `dropped busy ${cdDropped.busy} · interval ${cdDropped.interval}` +
+    ` · disabled ${cdDropped.disabled}`;
+  if (!t) { text('cd-timing', dropped); return; }
+  const parts = [`POST ${t.postMs ?? '…'} (xs8 ${t.server.xs8cd ?? '—'} · status ${t.server.xs8status ?? '—'})`];
+  if (t.refresh) {
+    parts.push(`token ${t.refresh.total} (${t.refresh.status ?? '—'}/${t.refresh.session ?? '—'}/${t.refresh.capabilities ?? '—'})`);
+    parts.push(t.enabledAt === null ? 'not re-enabled'
+      : `wait ${t.intervalWait} · ready +${t.readyAt - t.click} ms`);
+    if (t.renderMs !== null) parts.push(`render ${t.renderMs}`);
+  }
+  text('cd-timing', `${parts.join(' · ')} · ${dropped}`);
 }
 
 // One bounded refresh at a time. Apply its results together, so a delayed GET
@@ -132,11 +163,14 @@ async function refresh() {
   let statusData = null;
   let sessionData = null;
   let capabilitiesData = null;
+  const started = Date.now();
+  const steps = {};
   try {
     const status = await fetchJson('/api/v1/status', {
       cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
     });
     statusData = status.data;
+    steps.status = status.ms;
     if (status.ok && statusData.xs8_service === 'connected') {
       const s = statusData.status;
       if (s && s.state === 'IDLE' && s.monitor === 'HEALTHY' &&
@@ -144,6 +178,7 @@ async function refresh() {
         const session = await fetchJson('/api/v1/session', {
           cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
         });
+        steps.session = session.ms;
         if (session.ok && typeof session.data.csrf_token === 'string') {
           sessionData = session.data;
           if (session.data.source_available === true ||
@@ -153,6 +188,7 @@ async function refresh() {
               const capabilities = await fetchJson('/api/v1/capabilities', {
                 cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
               });
+              steps.capabilities = capabilities.ms;
               if (capabilities.ok) capabilitiesData = capabilities.data;
             } catch (_) {
               // MUTE eligibility remains independent of capabilities.
@@ -170,6 +206,23 @@ async function refresh() {
   if (version === refreshVersion && !controlBusy) {
     applyRefresh(controller.signal.aborted ? null : statusData,
       controller.signal.aborted ? null : sessionData, capabilitiesData);
+    if (cdTiming && cdTiming.awaitingRefresh) recordCdRefresh(steps, Date.now() - started);
+  }
+}
+
+// The first refresh after a CD request supplies the next token and re-enables PREV/NEXT.
+function recordCdRefresh(steps, total) {
+  const t = cdTiming;
+  t.awaitingRefresh = false;
+  t.refresh = { total, ...steps };
+  const enabled = cdButtons.some((button) => !button.disabled);
+  t.enabledAt = enabled ? Date.now() : null;
+  t.intervalWait = enabled ? Math.max(0, lastCdCompleted + cdIntervalMs - t.enabledAt) : null;
+  t.readyAt = enabled ? t.enabledAt + t.intervalWait : null;
+  t.renderMs = null;
+  renderCdTiming();
+  if (enabled && typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() => { t.renderMs = Date.now() - t.enabledAt; renderCdTiming(); });
   }
 }
 
@@ -192,6 +245,10 @@ async function sendControl(url, body, success, failure) {
       headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token },
       body,
     });
+    if (url.endsWith('/cd/track') && cdTiming) {
+      cdTiming.postMs = response.ms;
+      cdTiming.server = serverTiming(response.timing);
+    }
     controlResult = response.ok ? success : failure(response.data);
   } catch (_) {
     controlResult = url.endsWith('/mute') ? 'MUTE RESULT UNKNOWN · CHECK RECEIVER'
@@ -200,7 +257,10 @@ async function sendControl(url, body, success, failure) {
       : 'SOURCE RESULT UNKNOWN · CHECK RECEIVER';
   } finally {
     clearTimeout(timeout);
-    if (url.endsWith('/cd/track')) lastCdCompleted = Date.now();
+    if (url.endsWith('/cd/track')) {
+      lastCdCompleted = Date.now();
+      if (cdTiming) { cdTiming.completed = lastCdCompleted; cdTiming.awaitingRefresh = true; }
+    }
     controlBusy = false;
     updateControls();
     await refresh();
@@ -243,7 +303,16 @@ function cdFailure(label, data) {
 for (const button of cdButtons) {
   button.addEventListener('click', async () => {
     // Taps while a request or its token refresh is pending are dropped, never queued.
-    if (button.disabled || controlBusy || Date.now() - lastCdCompleted < cdIntervalMs) return;
+    const dropped = button.disabled ? 'disabled' : controlBusy ? 'busy'
+      : Date.now() - lastCdCompleted < cdIntervalMs ? 'interval' : null;
+    if (dropped) {
+      cdDropped[dropped] += 1;
+      renderCdTiming();
+      return;
+    }
+    cdTiming = { click: Date.now(), postMs: null, server: {}, refresh: null,
+      awaitingRefresh: false, enabledAt: null, readyAt: null, renderMs: null };
+    renderCdTiming();
     const label = button.dataset.cdAction === 'NEXT' ? 'NEXT' : 'PREV';
     await sendControl('/api/v1/cd/track', JSON.stringify({ action: button.dataset.cdAction }),
       `${label} TX VERIFIED · TRACK CHANGE UNVERIFIED`,

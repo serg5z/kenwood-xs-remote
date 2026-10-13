@@ -961,6 +961,74 @@ class CdTrackGatewayTest(GatewayTest):
         fake.close()
         self.assertEqual(json.loads(body)["operations"]["cd_transport"]["min_interval_ms"], 400)
 
+    @staticmethod
+    def server_timing(headers):
+        return {name: float(duration.split("=", 1)[1]) for name, duration in (
+            item.strip().split(";", 1) for item in headers["Server-Timing"].split(","))}
+
+    def test_server_timing_separates_status_xs8_and_interval(self):
+        self.enable_cd()
+        self.server.RequestHandlerClass.cd_track_interval_ms = 200
+        original = xs8_gateway.read_status
+
+        def slow_status(path, timeout=1.0):
+            time.sleep(0.02)
+            return original(path, timeout)
+
+        def slow_pair(path, action):
+            time.sleep(0.33)  # Code-derived EC/72 pair: two ~110-115 ms frames + 100 ms gap.
+            return {"cd_result": "TX_VERIFIED", "receiver_execution": "UNVERIFIED"}
+
+        logged = []
+        self.server.RequestHandlerClass.log_message = (
+            lambda handler, fmt, *args: logged.append(fmt % args))
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS)
+        self.addCleanup(fake.close)
+        token, cookie = self.session()
+        auth = {"X-Kenwood-Authenticated-User": "remote", "Cookie": cookie}
+        with mock.patch.object(xs8_gateway, "read_status", side_effect=slow_status) as status, \
+                mock.patch.object(xs8_gateway, "send_cd_track", side_effect=slow_pair):
+            code, _, headers = self.track(token, cookie, "PREVIOUS")
+            self.assertEqual(code, 200)
+            post = self.server_timing(headers)
+            self.assertNotIn("sincecd", post)
+            self.assertGreaterEqual(post["xs8status"], 20)
+            self.assertGreaterEqual(post["xs8cd"], 330)
+            self.assertGreaterEqual(post["total"], post["xs8status"] + post["xs8cd"])
+            # The browser's token refresh: three sequential GETs, each with a STATUS read.
+            refresh = {}
+            for path in ("/api/v1/status", "/api/v1/session", "/api/v1/capabilities"):
+                code, body, headers = self.request_full("GET", path, headers=auth)
+                self.assertEqual(code, 200)
+                refresh[path] = self.server_timing(headers)
+                self.assertGreaterEqual(refresh[path]["xs8status"], 20)
+            second = json.loads(self.request_full(
+                "GET", "/api/v1/session", headers=auth)[1])["csrf_token"]
+            time.sleep(0.2)  # A fast refresh finishes inside the interval; wait it out.
+            code, body, headers = self.track(second, cookie, "PREVIOUS")
+            self.assertEqual(code, 200)
+            self.assertGreaterEqual(self.server_timing(headers)["sincecd"], 200)
+            self.assertEqual(status.call_count, 1 + 3 + 1 + 1)
+        lines = [line for line in logged if line.startswith("CD_TRACK ")]
+        self.assertEqual(len(lines), 2)
+        self.assertRegex(lines[0], r"^CD_TRACK action=PREVIOUS code=200 result=SERVICE_TX_OK "
+                                   r"xs8status_ms=\d+\.\d xs8cd_ms=\d+\.\d$")
+        self.assertRegex(lines[1], r"sincecd_ms=\d+\.\d xs8status_ms=")
+
+    def test_server_timing_on_refusals_shows_interval_wait(self):
+        self.enable_cd()
+        token, cookie = self.session()
+        with mock.patch.object(xs8_gateway, "send_cd_track", return_value={
+                "cd_result": "TX_VERIFIED", "receiver_execution": "UNVERIFIED"}), \
+                self.eligible():
+            self.assertEqual(self.track(token, cookie)[0], 200)
+            code, _, headers = self.track(self.fresh_token(cookie), cookie)
+        self.assertEqual(code, 429)
+        timing = self.server_timing(headers)
+        self.assertLess(timing["sincecd"], 250)
+        self.assertNotIn("xs8cd", timing)
+        self.assertNotIn("xs8status", timing)
+
     def test_ineligible_status_never_dispatches(self):
         self.enable_cd()
         cases = {

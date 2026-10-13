@@ -362,9 +362,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def service_status(self):
         try:
-            return read_status(self.socket_path)
+            return self.read_service_status()
         except ServiceError:
             return None
+
+    def start_timing(self):
+        self.request_started = time.monotonic()
+        self.timings = []
+
+    def add_timing(self, name, started):
+        if getattr(self, "timings", None) is not None:
+            self.timings.append((name, (time.monotonic() - started) * 1000))
+
+    def read_service_status(self):
+        started = time.monotonic()
+        try:
+            return read_status(self.socket_path)
+        finally:
+            self.add_timing("xs8status", started)
 
     @staticmethod
     def status_allows_mute(status):
@@ -394,6 +409,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                              self.status_allows_cd_track(status))}
 
     def send_body(self, code, body, content_type, headers=None):
+        self.response_code = code
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -402,18 +418,26 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'")
         for key, value in (headers or {}).items():
             self.send_header(key, value)
+        if getattr(self, "timings", None) is not None:
+            # Diagnostics only: lets the browser separate Gateway/XS8 time from network.
+            entries = self.timings + [
+                ("total", (time.monotonic() - self.request_started) * 1000)]
+            self.send_header("Server-Timing", ", ".join(
+                f"{name};dur={duration:.1f}" for name, duration in entries))
         self.end_headers()
         self.wfile.write(body)
 
     def send_json(self, code, payload, headers=None):
+        self.response_result = payload.get("result")
         self.send_body(code, json.dumps(payload, separators=(",", ":")).encode(),
                        "application/json; charset=utf-8", headers)
 
     def do_GET(self):
+        self.start_timing()
         path = urlsplit(self.path).path
         if path == "/api/v1/status":
             try:
-                status = read_status(self.socket_path)
+                status = self.read_service_status()
             except ServiceError as exc:
                 self.send_json(503, {"gateway": "online", "xs8_service": "unavailable",
                                      "error": str(exc)})
@@ -466,19 +490,30 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "cd_track", {"lock": threading.Lock(), "completed": float("-inf")})
 
     def dispatch_cd_track(self, action):
+        started = time.monotonic()
         try:
             return send_cd_track(self.socket_path, action)
         finally:
             # Any dispatch outcome, including timeout, starts the interval.
             self.cd_track_state()["completed"] = time.monotonic()
+            self.add_timing("xs8cd", started)
 
     def do_POST(self):
+        self.start_timing()
         self.held_cd_lock = None
+        self.cd_action = None
         try:
             self.handle_post()
         finally:
             if self.held_cd_lock is not None:
                 self.held_cd_lock.release()
+            if self.cd_action is not None:
+                # One journal line per CD request for attended timing analysis.
+                self.log_message("CD_TRACK action=%s code=%s result=%s %s", self.cd_action,
+                                 getattr(self, "response_code", "-"),
+                                 getattr(self, "response_result", None) or "-",
+                                 " ".join(f"{name}_ms={duration:.1f}"
+                                          for name, duration in self.timings))
 
     def handle_post(self):
         path = urlsplit(self.path).path
@@ -537,7 +572,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not isinstance(action, str) or action not in CD_TRACK_ACTIONS:
                 self.send_json(400, {"error": "Expected one allowlisted CD action"})
                 return
+            self.cd_action = action
             state = self.cd_track_state()
+            if state["completed"] != float("-inf"):
+                # Not work time: how long since the previous CD dispatch completed.
+                self.timings.append(("sincecd", (time.monotonic() - state["completed"]) * 1000))
             if not state["lock"].acquire(blocking=False):
                 session["csrf"] = secrets.token_urlsafe(32)
                 self.send_json(409, {"result": "CD_BUSY", "receiver_execution": "UNVERIFIED"})
@@ -583,7 +622,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         session["csrf"] = secrets.token_urlsafe(32)
         if (is_source or is_query or is_cd or self.production_mute_enabled):
             try:
-                status = read_status(self.socket_path)
+                status = self.read_service_status()
             except ServiceError:
                 self.send_json(503, {"result": "UNAVAILABLE", "receiver_execution": "UNVERIFIED"})
                 return
