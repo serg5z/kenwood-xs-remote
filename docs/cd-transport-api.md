@@ -1,6 +1,6 @@
 # CD transport socket API, phase 2
 
-`xs8-service` remains the only XS8 GPIO owner. Commands use its **local Unix socket** and ROOT context. The [protocol evidence](xs8-protocol.md#cd-transport-press-and-release-in-root) is specific to the KR-V6070 and connected changer. This API adds no CD STOP command. The Web Remote exposes only the discrete `CD_TRACK_NEXT`/`CD_TRACK_PREVIOUS` requests behind a default-off Gateway gate ([Web API, Phase A](web-api.md#cd-track-nextprevious-phase-a)); explicit holds remain socket-only.
+`xs8-service` remains the only XS8 GPIO owner. Commands use its **local Unix socket** and ROOT context. The [protocol evidence](xs8-protocol.md#cd-transport-press-and-release-in-root) is specific to the KR-V6070 and connected changer. The Web Remote exposes only the discrete `CD_TRACK_NEXT`/`CD_TRACK_PREVIOUS` requests behind a default-off Gateway gate ([Web API, Phase A](web-api.md#cd-track-nextprevious-phase-a)). The single-frame PLAY, PLAY/PAUSE and STOP keys and explicit holds are socket-only.
 
 | Request line | Logical ROOT frame(s) | Meaning in the tested setup |
 |---|---|---|
@@ -12,6 +12,17 @@
 | `CD_PRESS SEEK_BACKWARD\n` | `0x6A` | Begin a held backward seek. |
 | `CD_HEARTBEAT <token>\n` | None | Renew the active hold's lease. |
 | `CD_RELEASE <token>\n` | `0x72` | End the active held operation. |
+| `CD_PLAY\n` | `0x41` | One PLAY key frame. |
+| `CD_PLAY_PAUSE\n` | `0xBC` | One PLAY/PAUSE toggle key frame. **Provisional mapping** (see below). |
+| `CD_STOP\n` | `0x9C` | One CD STOP/CANCEL key frame. |
+
+### Single-frame keys: PLAY, PLAY/PAUSE and STOP
+
+These send **one** ROOT frame and no KEY UP: no `0x72`, no `0x17` entry, no hold, lease or token. They use the same preflight as the other CD commands (local client, healthy monitor, receiver control `IDLE`, no volume STOP obligation, no open context, no CD hold, pair or fault, not shutting down, no uncertain research TX). A verified frame replies `OK CD_TRANSPORT_TX action=PLAY|PLAY_PAUSE|STOP gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED`. An unverified one replies `ERR CD_TRANSPORT_UNCERTAIN` with the same fields and is **never retried**. Because no release obligation exists, it does **not** latch a CD fault, like `SELECT_SOURCE`; `STATUS` shows `cd_action` and `cd_last_result=TX_VERIFIED|TX_UNCERTAIN`.
+
+Evidence differs by key:
+- **`0x41` PLAY** and **`0x9C` STOP**: physically observed on 2026-10-12 (PLAY lit the changer indicator; `0x41 → 0x9C` ended in STOP), in the reported CD-selected setup ([ROOT validation note](../research/notes/xs8-root-validation-2026-10-12.md)). The effect with another source selected is untested.
+- **`0xBC` PLAY/PAUSE**: a **historical** toggle mapping only. Its pause and resume RX reports conflict with older passive labels, and it has **not** been physically verified through this service. Treat `CD_PLAY_PAUSE` as provisional until an attended trial confirms it.
 
 The discrete commands complete both frame attempts before replying. After a verified PRESS, they request a **100 ms minimum gap from the recorded end of KEY DOWN TX to the beginning of KEY UP TX**. Waveform verification, BUSY-free checks, and scheduling can make the actual gap longer. If PRESS transmission or waveform verification is uncertain, RELEASE is attempted immediately. The explicit `CD_PRESS` commands send KEY DOWN **once** and hold while their lease is renewed. They do not use the 100 ms gap or repeat KEY DOWN. No `0x17` context entry or `0x9C` CD STOP is substituted.
 

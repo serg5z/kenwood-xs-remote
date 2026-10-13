@@ -150,6 +150,22 @@ class ServiceSocketTest(unittest.TestCase):
             "0x7A", "0x72", "0x17", "0xE9", "0x09", "0x07"])
         self.assertIn("XS8 STOP reason=STEP result=TX_OK", self.log_path.read_text())
 
+    def test_cd_transport_keys_single_frames_and_hold_exclusion(self):
+        for line, action in (("CD_PLAY", "PLAY"), ("CD_PLAY_PAUSE", "PLAY_PAUSE"),
+                             ("CD_STOP", "STOP")):
+            self.assertEqual(self.request(line), "OK CD_TRANSPORT_TX action=" + action +
+                             " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED")
+        self.assertEqual(self.transmitted(), ["0x41", "0xBC", "0x9C"])
+        token = self.press("SEEK_BACKWARD")
+        for line in ("CD_PLAY", "CD_PLAY_PAUSE", "CD_STOP"):
+            self.assertEqual(self.request(line), "ERR CD_TRACK_BUSY")
+        self.assertTrue(self.request("CD_RELEASE " + token).startswith("OK CD_RELEASE_TX"))
+        self.assertEqual(self.request("CD_STOP").split()[:2], ["OK", "CD_TRANSPORT_TX"])
+        self.assertEqual(self.transmitted(), ["0x41", "0xBC", "0x9C", "0x6A", "0x72", "0x9C"])
+        status = self.request("STATUS")
+        for field in ("cd_state=IDLE", "cd_action=STOP", "cd_last_result=TX_VERIFIED"):
+            self.assertIn(field, status)
+
     def test_volume_owner_disconnect_still_stops_with_other_clients(self):
         with self.connect() as cec:
             self.assertEqual(self.command(cec, "VOLUME_PRESS DOWN"),

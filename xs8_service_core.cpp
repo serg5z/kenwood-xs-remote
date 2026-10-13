@@ -297,6 +297,35 @@ std::string Xs8ServiceCore::cd_track(uint8_t press_byte, const char *action)
         " receiver_execution=UNVERIFIED\n";
 }
 
+std::string Xs8ServiceCore::cd_transport(uint8_t byte, const char *action)
+{
+    const std::string denied = cd_preflight();
+    if (!denied.empty()) return denied;
+    cd_lease_expired_ = false;
+    cd_action_ = action;
+    bool verified = false;
+    bool threw = false;
+    try { verified = tx_.send(byte); }
+    catch (...) { threw = true; }
+    const auto evidence = threw ? ServiceTxEvidence{} : tx_.last_evidence();
+    const bool confirmed = verified && evidence.attempted &&
+        evidence.byte == byte && evidence.gpio_completed &&
+        evidence.waveform == WaveformEvidence::MATCH;
+    // No release obligation exists for these frames, so an uncertain one is
+    // reported (and never retried) without latching a CD fault, like SOURCE.
+    cd_last_result_ = confirmed ? "TX_VERIFIED" : "TX_UNCERTAIN";
+    std::fprintf(stderr, "XS8 CD_TRANSPORT action=%s result=%s gpio_tx=%s "
+                         "waveform=%s receiver_execution=UNVERIFIED\n",
+        action, cd_last_result_.c_str(),
+        evidence.gpio_completed ? "TX_OK" : "TX_FAIL",
+        waveform_name(evidence.waveform));
+    return std::string(confirmed ? "OK CD_TRANSPORT_TX" : "ERR CD_TRANSPORT_UNCERTAIN") +
+        " action=" + action +
+        " gpio_tx=" + (evidence.gpio_completed ? "TX_OK" : "TX_FAIL") +
+        " waveform=" + waveform_name(evidence.waveform) +
+        " receiver_execution=UNVERIFIED\n";
+}
+
 std::string Xs8ServiceCore::command(const std::string& line, Time received,
                                     Time now, uint64_t client_id)
 {
@@ -342,6 +371,11 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
         return cd_press(0x6A, "SEEK_BACKWARD", now);
     if (line.compare(0, 9, "CD_PRESS ") == 0)
         return "ERR CD_UNKNOWN_ACTION\n";
+    // Single ROOT key frames with no KEY UP: 0x41 and 0x9C are physically
+    // observed; 0xBC is a historical PLAY/PAUSE mapping, not yet verified.
+    if (line == "CD_PLAY") return cd_transport(0x41, "PLAY");
+    if (line == "CD_PLAY_PAUSE") return cd_transport(0xBC, "PLAY_PAUSE");
+    if (line == "CD_STOP") return cd_transport(0x9C, "STOP");
     if (line == "CD_TRACK_NEXT") return cd_track(0xFC, "NEXT");
     if (line == "CD_TRACK_PREVIOUS") return cd_track(0xEC, "PREVIOUS");
     if (line.compare(0, 14, "SELECT_SOURCE ") == 0) {

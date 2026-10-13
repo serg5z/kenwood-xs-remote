@@ -1319,6 +1319,118 @@ static void test_volume_step()
     assert(start_fail_tx.sent == (Bytes{0x17, 0x07}));
 }
 
+static void test_cd_transport_keys()
+{
+    using Bytes = std::vector<uint8_t>;
+    struct Key { const char *line; uint8_t byte; const char *action; };
+    const Key keys[] = {{"CD_PLAY", 0x41, "PLAY"}, {"CD_PLAY_PAUSE", 0xBC, "PLAY_PAUSE"},
+                        {"CD_STOP", 0x9C, "STOP"}};
+    for (const auto& key : keys) {
+        FakeTx tx;
+        Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+        core.connected();
+        // Exactly one ROOT frame, no 0x17, no KEY UP, no hold.
+        assert(core.command(key.line, at(1), at(1)) ==
+               std::string("OK CD_TRANSPORT_TX action=") + key.action +
+               " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n");
+        assert(tx.sent == (Bytes{key.byte}));
+        assert(!core.cd_release_owed() && !core.cd_fault());
+        assert(status_has(core, 2, " cd_state=IDLE "));
+        assert(status_has(core, 2, (std::string(" cd_action=") + key.action + " ").c_str()));
+        assert(status_has(core, 2, " cd_last_result=TX_VERIFIED "));
+        // Immediately usable again: no hold or lease was created.
+        assert(core.command(key.line, at(3), at(3)).rfind("OK CD_TRANSPORT_TX", 0) == 0);
+        assert(core.command("CD_TRACK_NEXT", at(4), at(4)).rfind("OK CD_TRACK_TX", 0) == 0);
+        assert(tx.sent == (Bytes{key.byte, key.byte, 0xFC, 0x72}));
+        core.tick(at(10000));
+        assert(tx.sent.size() == 4);
+
+        // Uncertain GPIO or waveform: reported, never retried, no CD fault.
+        for (int mode = 0; mode < 2; ++mode) {
+            FakeTx fail_tx;
+            Xs8ServiceCore fail(fail_tx, Ms(2000), true, {}, [] { return at(0); });
+            fail.connected();
+            if (mode == 0) fail_tx.fail_gpio_next = true;
+            else fail_tx.fail_next = true;
+            assert(fail.command(key.line, at(1), at(1)) ==
+                   std::string("ERR CD_TRANSPORT_UNCERTAIN action=") + key.action +
+                   (mode == 0 ? " gpio_tx=TX_FAIL" : " gpio_tx=TX_OK") +
+                   " waveform=MISSING receiver_execution=UNVERIFIED\n");
+            assert(fail_tx.sent == (Bytes{key.byte}));
+            assert(!fail.cd_fault() && !fail.cd_release_owed());
+            assert(status_has(fail, 2, " cd_last_result=TX_UNCERTAIN "));
+            assert(status_has(fail, 2, " state=IDLE "));
+            fail.tick(at(5000));
+            assert(fail_tx.sent == (Bytes{key.byte}));
+        }
+    }
+    for (const char *line : {"CD_PLAY ", "CD_PAUSE", "cd_stop", "CD_STOP 1", "CD_PLAYPAUSE"}) {
+        FakeTx tx;
+        Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+        core.connected();
+        assert(core.command(line, at(1), at(1)) == "ERR UNKNOWN_COMMAND\n");
+        assert(tx.sent.empty());
+    }
+
+    // Refusals transmit nothing and leave existing CD and volume state alone.
+    FakeTx boot_tx;
+    Xs8ServiceCore boot(boot_tx, Ms(2000), false, {}, [] { return at(0); });
+    boot.connected();
+    assert(boot.command("CD_STOP", at(1), at(1)) == "ERR BOOT_INHIBIT\n");
+    assert(boot.command("CD_STOP", at(1), at(1), 7) == "ERR NO_CLIENT\n");
+    assert(boot_tx.sent.empty());
+
+    FakeTx hold_tx;
+    Xs8ServiceCore hold(hold_tx, Ms(2000), true, {}, [] { return at(0); });
+    hold.connected();
+    const auto token = hold_token(hold.command("CD_PRESS SEEK_FORWARD", at(1), at(1)));
+    for (const char *line : {"CD_PLAY", "CD_PLAY_PAUSE", "CD_STOP"})
+        assert(hold.command(line, at(2), at(2)) == "ERR CD_TRACK_BUSY\n");
+    assert(status_has(hold, 2, " cd_state=HOLDING cd_action=SEEK_FORWARD "));
+    assert(hold.command("CD_RELEASE " + token, at(3), at(3)).rfind("OK CD_RELEASE_TX", 0) == 0);
+    assert(hold_tx.sent == (Bytes{0x7A, 0x72}));
+
+    FakeTx fault_tx;
+    Xs8ServiceCore fault(fault_tx, Ms(2000), true, {}, [] { return at(0); });
+    fault.connected();
+    const auto fault_token = hold_token(fault.command("CD_PRESS SEEK_BACKWARD", at(1), at(1)));
+    fault_tx.fail_release = true;
+    fault.command("CD_RELEASE " + fault_token, at(2), at(2));
+    assert(fault.command("CD_STOP", at(3), at(3)) == "ERR CD_FAULT_LATCHED\n");
+    assert(fault_tx.sent == (Bytes{0x6A, 0x72}));
+
+    FakeTx volume_tx;
+    Xs8ServiceCore volume(volume_tx, Ms(2000), true, {}, [] { return at(0); });
+    volume.connected();
+    volume.command("VOLUME_PRESS UP", at(1), at(1));
+    assert(volume.command("CD_PLAY_PAUSE", at(2), at(2)) == "ERR HOLDING_UP\n");
+    assert(volume.state() == VolumeControl::State::HOLDING_UP);
+    assert(volume_tx.sent == (Bytes{0x17, 0xF9}));
+
+    FakeTx context_tx;
+    Xs8ServiceCore context(context_tx, Ms(2000), true, {}, [] { return at(0); });
+    context.connected(1);
+    context.set_research_context_enabled(true);
+    context.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED", at(1), at(1), 1);
+    assert(context.command("CD_PLAY_PAUSE", at(2), at(2), 1) ==
+           "ERR RESEARCH_CONTEXT_ACTIVE\n");
+    assert(context_tx.sent == (Bytes{0x17}));
+
+    FakeTx monitor_tx;
+    Xs8ServiceCore monitor(monitor_tx, Ms(2000), true, {}, [] { return at(0); });
+    monitor.connected();
+    monitor_tx.healthy = false;
+    assert(monitor.command("CD_PLAY", at(1), at(1)) == "ERR MONITOR_FAILED\n");
+    assert(monitor_tx.sent.empty());
+
+    FakeTx shut_tx;
+    Xs8ServiceCore shut(shut_tx, Ms(2000), true, {}, [] { return at(0); });
+    shut.connected();
+    assert(shut.shutdown(at(1)));
+    assert(shut.command("CD_STOP", at(2), at(2)) == "ERR SHUTDOWN\n");
+    assert(shut_tx.sent.empty());
+}
+
 int main()
 {
     test_startup_and_parsing();
@@ -1342,6 +1454,7 @@ int main()
     test_cd_hold_interleaved_clients_and_volume_owner();
     test_cd_hold_max_hold();
     test_volume_step();
+    test_cd_transport_keys();
     test_context_gates_and_authorization();
     test_context_send_exit_and_token_ownership();
     test_context_excludes_every_other_transmission();
