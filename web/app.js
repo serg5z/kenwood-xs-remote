@@ -4,6 +4,8 @@ const syncButton = document.getElementById('sync-button');
 const sourceButtons = [...document.querySelectorAll('.source-grid button[data-source]')];
 const cdButtons = [document.getElementById('cd-previous'), document.getElementById('cd-next')];
 const volumeButtons = [document.getElementById('volume-up'), document.getElementById('volume-down')];
+const playbackButtons = [document.getElementById('cd-play-pause'), document.getElementById('cd-stop')];
+const seekButtons = [document.getElementById('cd-rew'), document.getElementById('cd-ff')];
 let csrfToken = null;
 let serviceReady = false;
 let muteReady = false;
@@ -12,6 +14,17 @@ let queryReady = false;
 let cdReady = false;
 let cdFault = false;
 let volumeReady = false;
+let playbackReady = false;
+let enabledPlaybackActions = [];
+let seekReady = false;
+let enabledSeekDirections = [];
+// Pacing for held FF/REW from capabilities. The service lease (2 s) and maximum
+// (10 s) remain the authority; these only keep the browser inside them.
+let seekHeartbeatMs = 500;
+let seekMaxHoldMs = 10000;
+const SEEK_REQUEST_TIMEOUT_MS = 4000;
+// { button, direction, token, holdId, phase, cancelled, reason, started, pointerId, timer, wake }
+let seek = null;
 let enabledVolumeDirections = [];
 // Phase 1: single taps only. Spacing guards duplicate taps; the Gateway enforces it too.
 let volumeIntervalMs = 250;
@@ -63,8 +76,21 @@ function updateControls() {
     button.disabled = controlBusy || !csrfToken || !serviceReady || !volumeReady ||
       !enabledVolumeDirections.includes(button.dataset.volumeDirection);
   }
+  for (const button of playbackButtons) {
+    button.disabled = controlBusy || !csrfToken || !serviceReady || !playbackReady ||
+      !enabledPlaybackActions.includes(button.dataset.cdPlayback) || !!gesture;
+  }
+  for (const button of seekButtons) {
+    // The held button stays enabled so its pointerup and capture events arrive.
+    button.disabled = seek ? button !== seek.button
+      : controlBusy || !csrfToken || !serviceReady || !seekReady ||
+        !enabledSeekDirections.includes(button.dataset.cdSeek) || !!gesture;
+    if (seek && button === seek.button) button.dataset.active = 'true';
+    else delete button.dataset.active;
+  }
   const available = !controlBusy && serviceReady && csrfToken &&
-    (muteReady || sourceReady || queryReady || cdReady || volumeReady);
+    (muteReady || sourceReady || queryReady || cdReady || volumeReady || playbackReady ||
+      seekReady);
   // A latched CD fault needs physical attention; never hide it behind a result.
   text('availability-text', cdFault && !controlBusy
     ? 'CD FAULT LATCHED · STOP AND INSPECT CHANGER'
@@ -139,6 +165,23 @@ function applyRefresh(statusData, sessionData, capabilitiesData) {
   enabledCdActions = cdReady ? cd.available_actions : [];
   cdIntervalMs = cd && Number.isInteger(cd.min_interval_ms) && (cd.min_interval_ms === 0 ||
     (cd.min_interval_ms >= 200 && cd.min_interval_ms <= 1000)) ? cd.min_interval_ms : 1000;
+  const cdIdle = !!status && status.cd_state === 'IDLE' && status.cd_release_owed === '0';
+  const operations = capabilitiesData && capabilitiesData.operations;
+  const playback = operations && operations.cd_playback;
+  playbackReady = !!csrfToken && sessionData.cd_playback_available === true && cdIdle &&
+    !!playback && playback.enabled === true && Array.isArray(playback.available_actions);
+  enabledPlaybackActions = playbackReady ? playback.available_actions : [];
+  const seekOperation = operations && operations.cd_seek;
+  seekReady = !!csrfToken && sessionData.cd_seek_available === true && cdIdle &&
+    !!seekOperation && seekOperation.enabled === true &&
+    Array.isArray(seekOperation.available_directions);
+  enabledSeekDirections = seekReady ? seekOperation.available_directions : [];
+  seekHeartbeatMs = seekOperation && Number.isInteger(seekOperation.heartbeat_ms) &&
+    seekOperation.heartbeat_ms >= 200 && seekOperation.heartbeat_ms <= 1000
+    ? seekOperation.heartbeat_ms : 500;
+  seekMaxHoldMs = seekOperation && Number.isInteger(seekOperation.max_hold_ms) &&
+    seekOperation.max_hold_ms >= 1000 && seekOperation.max_hold_ms <= 10000
+    ? seekOperation.max_hold_ms : 10000;
   const volume = capabilitiesData && capabilitiesData.operations &&
     capabilitiesData.operations.volume_step;
   volumeReady = !!csrfToken && sessionData.volume_step_available === true &&
@@ -165,7 +208,7 @@ async function fetchJson(url, options = {}) {
   const data = await response.json();
   const timing = response.headers && typeof response.headers.get === 'function'
     ? response.headers.get('Server-Timing') : null;
-  return { ok: response.ok, data, ms: Date.now() - started, timing };
+  return { ok: response.ok, status: response.status, data, ms: Date.now() - started, timing };
 }
 
 function serverTiming(header) {
@@ -227,7 +270,9 @@ async function refresh() {
           if (session.data.source_available === true ||
               session.data.receiver_query_available === true ||
               session.data.cd_track_available === true ||
-              session.data.volume_step_available === true) {
+              session.data.volume_step_available === true ||
+              session.data.cd_playback_available === true ||
+              session.data.cd_seek_available === true) {
             try {
               const capabilities = await fetchJson('/api/v1/capabilities', {
                 cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
@@ -285,7 +330,7 @@ async function sendControl(url, body, success, failure, options = {}) {
   }
   const token = tokenOverride || csrfToken;
   csrfToken = null; muteReady = false; sourceReady = false; queryReady = false;
-  cdReady = false; volumeReady = false;
+  cdReady = false; volumeReady = false; playbackReady = false; seekReady = false;
   updateControls();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 6000);
@@ -305,12 +350,14 @@ async function sendControl(url, body, success, failure, options = {}) {
   } catch (_) {
     controlResult = url.endsWith('/mute') ? 'MUTE RESULT UNKNOWN · CHECK RECEIVER'
       : url.endsWith('/query') ? 'SYNC RESULT UNKNOWN · CHECK RECEIVER'
-      : url.endsWith('/cd/track') ? 'CD RESULT UNKNOWN · CHECK CHANGER'
+      : url.endsWith('/cd/track') || url.endsWith('/cd/playback')
+        ? 'CD RESULT UNKNOWN · CHECK CHANGER'
       : url.endsWith('/volume/step') ? 'VOLUME RESULT UNKNOWN · CHECK RECEIVER'
       : 'SOURCE RESULT UNKNOWN · CHECK RECEIVER';
   } finally {
     clearTimeout(timeout);
     if (url.endsWith('/volume/step')) lastVolumeCompleted = Date.now();
+    if (url.endsWith('/cd/playback')) lastCdCompleted = Date.now();
     if (url.endsWith('/cd/track')) {
       lastCdCompleted = Date.now();
       if (cdTiming) { cdTiming.completed = lastCdCompleted; cdTiming.awaitingRefresh = true; }
@@ -369,6 +416,196 @@ for (const button of volumeButtons) {
       `${label} TX VERIFIED · VOLUME CHANGE UNVERIFIED`,
       (data) => volumeFailure(label, data));
   });
+}
+
+// One click, one single-frame CD key. PLAY/PAUSE (0xBC) is provisionally mapped.
+for (const button of playbackButtons) {
+  button.addEventListener('click', async () => {
+    if (button.disabled || controlBusy || seek ||
+        Date.now() - lastCdCompleted < cdIntervalMs) return;
+    const action = button.dataset.cdPlayback;
+    const label = action === 'STOP' ? 'STOP' : 'PLAY/PAUSE';
+    await sendControl('/api/v1/cd/playback', JSON.stringify({ action }),
+      `${label} TX VERIFIED · CHANGER ACTION UNVERIFIED`,
+      (data) => cdFailure(label, data));
+  });
+}
+
+const seekLabel = (direction) => (direction === 'FORWARD' ? 'FF' : 'REW');
+
+// The single-use token for the next seek request: the successor returned by the
+// previous one, or, after a lost or refused response, the session's current token.
+async function seekToken(s) {
+  if (s.token) {
+    const token = s.token;
+    s.token = null;
+    return token;
+  }
+  try {
+    const session = await fetchJson('/api/v1/session', {
+      cache: 'no-store', credentials: 'same-origin',
+    });
+    return session.ok && typeof session.data.csrf_token === 'string'
+      ? session.data.csrf_token : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// One POST, never repeated. status 0 and data null mean no reply was received.
+async function seekPost(s, body) {
+  const token = await seekToken(s);
+  if (!token) return { ok: false, status: 0, data: null };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SEEK_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetchJson('/api/v1/cd/seek', {
+      method: 'POST', credentials: 'same-origin', signal: controller.signal,
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token },
+      body: JSON.stringify(body),
+    });
+    if (response.data && typeof response.data.csrf_token === 'string') {
+      s.token = response.data.csrf_token;
+    }
+    return { ok: response.ok, status: response.status || 0, data: response.data || null };
+  } catch (_) {
+    return { ok: false, status: 0, data: null };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function seekWait(s, ms) {
+  return new Promise((resolve) => {
+    s.wake = resolve;
+    s.timer = setTimeout(resolve, ms);
+  });
+}
+
+function startSeek(button, event) {
+  if (seek || button.disabled || controlBusy ||
+      Date.now() - lastCdCompleted < cdIntervalMs) return;
+  if (prevGesture && prevGesture.pending) cancelPrev('OTHER CONTROL');
+  const s = { button, direction: button.dataset.cdSeek, token: csrfToken, holdId: null,
+    phase: 'starting', cancelled: false, reason: null, started: Date.now(),
+    pointerId: event && event.pointerId, timer: null, wake: null };
+  seek = s;
+  controlBusy = true;
+  ++refreshVersion;
+  if (refreshController) {
+    refreshController.abort();
+    refreshController = null;
+  }
+  csrfToken = null; muteReady = false; sourceReady = false; queryReady = false;
+  cdReady = false; volumeReady = false; playbackReady = false; seekReady = false;
+  controlResult = `${seekLabel(s.direction)} STARTING`;
+  try {
+    if (event && typeof button.setPointerCapture === 'function') {
+      button.setPointerCapture(event.pointerId);
+    }
+  } catch (_) {
+    // Window-level release handlers still end the seek.
+  }
+  updateControls();
+  runSeek(s);
+}
+
+// Pointer release, cancellation, blur or hiding. Idempotent; a release that
+// arrives while START is in flight is honoured as soon as START answers.
+function cancelSeek(reason) {
+  const s = seek;
+  if (!s || s.cancelled) return;
+  s.cancelled = true;
+  s.reason = reason;
+  clearTimeout(s.timer);
+  if (s.wake) s.wake();
+}
+
+async function runSeek(s) {
+  const label = seekLabel(s.direction);
+  const start = await seekPost(s, { action: 'START', direction: s.direction });
+  if (!start.ok || !start.data || start.data.result !== 'SEEK_STARTED' ||
+      typeof start.data.hold_id !== 'string') {
+    if (start.data && start.status < 500) {
+      // A refusal before or without transmission: nothing to release.
+      finishSeek(s, cdFailure(label, start.data));
+      return;
+    }
+    // No reply or an uncertain one: a hold may exist that this browser cannot
+    // name. Release this session's hold once (stop-only, never a new START).
+    s.phase = 'releasing';
+    const release = await seekPost(s, { action: 'RELEASE' });
+    finishSeek(s, release.data && release.data.result === 'RELEASED'
+      ? `${label} START UNCERTAIN · RELEASE TX VERIFIED · CHECK CHANGER`
+      : `${label} ${start.data && start.data.result || 'RESULT UNKNOWN'} · CHECK CHANGER`);
+    return;
+  }
+  s.holdId = start.data.hold_id;
+  s.phase = 'holding';
+  if (!s.cancelled) {
+    controlResult = `${label} SEEKING · CHANGER ACTION UNVERIFIED`;
+    updateControls();
+  }
+  let ended = null;
+  while (!s.cancelled) {
+    await seekWait(s, seekHeartbeatMs);
+    if (s.cancelled) break;
+    if (Date.now() - s.started >= seekMaxHoldMs) {
+      s.reason = 'MAX_HOLD';
+      break;
+    }
+    const beat = await seekPost(s, { action: 'HEARTBEAT', hold_id: s.holdId });
+    if (beat.ok) continue;
+    if (beat.data && beat.data.result === 'NOT_ACTIVE') {
+      ended = beat.data.cd_last_result || beat.data.reason || 'NOT ACTIVE';
+      break;
+    }
+    if (beat.data && beat.status !== 403 && beat.status < 500) break;
+    // Lost response, consumed token or a Gateway/service timeout: keep holding.
+    // The next heartbeat recovers a token; the service lease ends the hold if
+    // renewals keep failing.
+  }
+  // Always one RELEASE, also after an expiry the Gateway already reported:
+  // it is stop-only and returns NOT_ACTIVE without transmitting when nothing is held.
+  s.phase = 'releasing';
+  const release = await seekPost(s, { action: 'RELEASE', hold_id: s.holdId });
+  const result = release.data && release.data.result;
+  finishSeek(s, result === 'RELEASED' ? `${label} RELEASE TX VERIFIED · SEEK RESULT UNVERIFIED`
+    : result === 'NOT_ACTIVE'
+      ? `${label} ENDED · ${ended || release.data.cd_last_result || 'NOT ACTIVE'}`
+    : result === 'SERVICE_UNCERTAIN' ? 'CD FAULT LATCHED · STOP AND INSPECT CHANGER'
+    : release.data ? cdFailure(`${label} RELEASE`, release.data)
+    : `${label} RELEASE UNKNOWN · LEASE ENDS SEEK WITHIN 2 s · CHECK CHANGER`);
+}
+
+async function finishSeek(s, message) {
+  if (seek !== s) return;
+  seek = null;
+  clearTimeout(s.timer);
+  try {
+    if (s.pointerId !== undefined && typeof s.button.releasePointerCapture === 'function') {
+      s.button.releasePointerCapture(s.pointerId);
+    }
+  } catch (_) {
+    // Capture may already be gone.
+  }
+  lastCdCompleted = Date.now();
+  controlResult = message;
+  controlBusy = false;
+  updateControls();
+  await refresh();
+}
+
+for (const button of seekButtons) {
+  button.addEventListener('pointerdown', (event) => {
+    if (event && event.button !== undefined && event.button !== 0) return;
+    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+    startSeek(button, event);
+  });
+  for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+    button.addEventListener(type, () => cancelSeek(type.toUpperCase()));
+  }
+  button.addEventListener('contextmenu', (event) => event.preventDefault());
 }
 
 function cdFailure(label, data) {
@@ -539,13 +776,24 @@ async function firstPrev() {
 
 // Leaving the page drops a pending tap; nothing is stored, so nothing replays.
 function cancelOnHide() {
-  if (typeof document.hidden !== 'boolean' || document.hidden) cancelPrev('PAGE HIDDEN');
+  if (typeof document.hidden !== 'boolean' || document.hidden) {
+    cancelPrev('PAGE HIDDEN');
+    cancelSeek('PAGE HIDDEN');
+  }
 }
 if (typeof document.addEventListener === 'function') {
   document.addEventListener('visibilitychange', cancelOnHide);
 }
 if (typeof globalThis.addEventListener === 'function') {
-  globalThis.addEventListener('pagehide', () => cancelPrev('PAGE HIDDEN'));
+  globalThis.addEventListener('pagehide', () => {
+    cancelPrev('PAGE HIDDEN');
+    cancelSeek('PAGE HIDDEN');
+  });
+  // A held seek also ends when focus leaves the page or a pointer is released
+  // anywhere, in case the button's own events are lost.
+  globalThis.addEventListener('blur', () => cancelSeek('BLUR'));
+  globalThis.addEventListener('pointerup', () => cancelSeek('POINTERUP'));
+  globalThis.addEventListener('pointercancel', () => cancelSeek('POINTERCANCEL'));
 }
 
 for (const button of cdButtons) {

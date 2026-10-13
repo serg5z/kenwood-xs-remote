@@ -1,6 +1,6 @@
 # CD transport socket API, phase 2
 
-`xs8-service` remains the only XS8 GPIO owner. Commands use its **local Unix socket** and ROOT context. The [protocol evidence](xs8-protocol.md#cd-transport-press-and-release-in-root) is specific to the KR-V6070 and connected changer. The Web Remote exposes only the discrete `CD_TRACK_NEXT`/`CD_TRACK_PREVIOUS` requests behind a default-off Gateway gate ([Web API, Phase A](web-api.md#cd-track-nextprevious-phase-a)). The single-frame PLAY, PLAY/PAUSE and STOP keys, token holds and connection-owned `KEY_DOWN`/`KEY_UP` holds are socket-only.
+`xs8-service` remains the only XS8 GPIO owner. Commands use its **local Unix socket** and ROOT context. The [protocol evidence](xs8-protocol.md#cd-transport-press-and-release-in-root) is specific to the KR-V6070 and connected changer. The Web Remote exposes `CD_TRACK_NEXT`/`CD_TRACK_PREVIOUS` ([Phase A](web-api.md#cd-track-nextprevious-phase-a)), `CD_PLAY_PAUSE`/`CD_STOP` and held `SEEK_FORWARD`/`SEEK_BACKWARD` ([playback and seek](web-api.md#cd-playback-and-held-seek)), each behind its own default-off Gateway gate. `CD_PLAY` and the held TRACK actions remain socket-only.
 
 | Request line | Logical ROOT frame(s) | Meaning in the tested setup |
 |---|---|---|

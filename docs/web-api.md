@@ -1,6 +1,6 @@
 # Web Remote and HTTP API v0.1
 
-The Gateway remains **read-only by default**. Explicit production `--enable-mute` and `--enable-source` options independently gate MUTE and the four evidenced source commands through authenticated HTTPS and the systemd Unix socket. TV1, TV2 and TAPE2 remain blocked pending controlled TX validation. A separate default-off `--enable-volume` option gates single-tap VOL+/VOL− steps ([below](#volume-step-phase-1)); hold and repeat are not exposed. A separate default-off `--enable-cd-track` option gates discrete CD NEXT/PREVIOUS ([below](#cd-track-nextprevious-phase-a)); CD PLAY/PAUSE, STOP and held SEEK are not exposed. The checked-in systemd unit enables no control. See [MUTE deployment](mute-control.md) and [source selection evidence and rollout](source-selection.md) before opting in.
+The Gateway remains **read-only by default**. Explicit production `--enable-mute` and `--enable-source` options independently gate MUTE and the four evidenced source commands through authenticated HTTPS and the systemd Unix socket. TV1, TV2 and TAPE2 remain blocked pending controlled TX validation. A separate default-off `--enable-volume` option gates single-tap VOL+/VOL− steps ([below](#volume-step-phase-1)); hold and repeat are not exposed. `--enable-cd-playback` and `--enable-cd-seek` gate CD PLAY/PAUSE and STOP, and held FF/REW ([below](#cd-playback-and-held-seek)). A separate default-off `--enable-cd-track` option gates discrete CD NEXT/PREVIOUS ([below](#cd-track-nextprevious-phase-a)). The checked-in systemd unit enables no control. See [MUTE deployment](mute-control.md) and [source selection evidence and rollout](source-selection.md) before opting in.
 
 An independent default-off `--enable-receiver-query` gate permits one explicit authenticated `POST /api/v1/receiver/query` for live source/MONITOR synchronization. GET status and background polling remain passive. See [live receiver status](receiver-status.md) for the cache fields, uncertainty model, and manual rollout.
 
@@ -40,10 +40,12 @@ python3 -m unittest discover -s tests -p 'test_gateway.py'
 | --- | --- |
 | `GET /api/v1/status` | JSON with `gateway`, `xs8_service`, and parsed service `status`. Returns HTTP 503 when the service is unavailable or its reply is invalid. |
 | `GET /api/v1/capabilities` | JSON classifications and enabled flags. MUTE and evidenced sources require their own gates, a session, and XS8 eligibility. |
-| `GET /api/v1/session` | Returns 404 when every control gate is disabled; otherwise issues a secure session cookie and one-use CSRF token, plus per-control `*_available` flags including `cd_track_available` and `volume_step_available`. |
+| `GET /api/v1/session` | Returns 404 when every control gate is disabled; otherwise issues a secure session cookie and one-use CSRF token, plus per-control `*_available` flags including `cd_track_available` `volume_step_available`, `cd_playback_available` and `cd_seek_available`. |
 | `POST /api/v1/mute` | Returns 501 with MUTE disabled. With the production gate, a valid request checks fresh XS8 eligibility and sends one `MUTE` to the local service. |
 | `POST /api/v1/source` | Returns 501 with source disabled. With the production gate, accepts one allowlisted `{ "source": "CD" }` style JSON body, checks fresh XS8 eligibility, and dispatches at most one command. TV1, TV2 and TAPE2 return 409 without dispatch. |
 | `POST /api/v1/cd/track` | Returns 501 with the CD gate disabled. With `--enable-cd-track`, accepts exactly `{ "action": "NEXT" }` or `{ "action": "PREVIOUS" }`, checks fresh XS8 and CD eligibility, and dispatches at most one discrete `CD_TRACK_*` pair. |
+| `POST /api/v1/cd/playback` | Returns 501 with `--enable-cd-playback` off. Otherwise accepts exactly `{ "action": "PLAY_PAUSE" }` or `{ "action": "STOP" }` and dispatches at most one single-frame key. |
+| `POST /api/v1/cd/seek` | Returns 501 with `--enable-cd-seek` off. Otherwise accepts `START` (with `direction` `FORWARD`/`BACKWARD`), `HEARTBEAT` (with `hold_id`) or `RELEASE` (optional `hold_id`) for one held seek. |
 | `POST /api/v1/volume/step` | Returns 501 with the volume gate disabled. With `--enable-volume`, accepts exactly `{ "direction": "UP" }` or `{ "direction": "DOWN" }`, checks fresh XS8 eligibility, and dispatches at most one atomic `VOLUME_STEP`. |
 
 `status` preserves the service's `last_gpio_tx`, `last_waveform`, and `receiver_execution` fields. `TX_OK` and `MATCH` do not prove that the Kenwood executed a command. The gateway opens one short-lived Unix socket connection per status request. It does not modify XS8 state.
@@ -91,7 +93,7 @@ Before dispatch the Gateway reads a fresh STATUS. It requires `state=IDLE`, a he
 
 ### Web Remote behavior
 
-The CD transport section shows only PREV and NEXT; PLAY/PAUSE and STOP were removed. Both buttons stay disabled unless the session reports `cd_track_available`, capabilities list the action, and the latest STATUS shows `cd_state=IDLE` with no owed RELEASE. Each click consumes the one-use CSRF token. Buttons stay disabled while a request is in flight and until the follow-up refresh delivers a fresh token; taps in that window are dropped, never queued. The client also ignores taps less than `min_interval_ms` after its previous CD request completed, using the value from capabilities; a missing or out-of-range value falls back to 1000 ms. Results read `NEXT TX VERIFIED · TRACK CHANGE UNVERIFIED`; failures say `CHECK CHANGER` when `physical_check_required` is set and `NOTHING SENT` otherwise; a network error reads `CD RESULT UNKNOWN · CHECK CHANGER`. While STATUS reports a CD fault, the status line shows `CD FAULT LATCHED · STOP AND INSPECT CHANGER` in place of other results. Connection details include the CD state, last CD result and an owed-RELEASE marker. PREVIOUS may restart the current track rather than move back, as observed in the validated setup.
+In the CD transport section, PREV and NEXT use this endpoint; PLAY / PAUSE, STOP, REW and FF use their own gates ([below](#cd-playback-and-held-seek)). PREV and NEXT stay disabled unless the session reports `cd_track_available`, capabilities list the action, and the latest STATUS shows `cd_state=IDLE` with no owed RELEASE. Each click consumes the one-use CSRF token. Buttons stay disabled while a request is in flight and until the follow-up refresh delivers a fresh token; taps in that window are dropped, never queued. The client also ignores taps less than `min_interval_ms` after its previous CD request completed, using the value from capabilities; a missing or out-of-range value falls back to 1000 ms. Results read `NEXT TX VERIFIED · TRACK CHANGE UNVERIFIED`; failures say `CHECK CHANGER` when `physical_check_required` is set and `NOTHING SENT` otherwise; a network error reads `CD RESULT UNKNOWN · CHECK CHANGER`. While STATUS reports a CD fault, the status line shows `CD FAULT LATCHED · STOP AND INSPECT CHANGER` in place of other results. Connection details include the CD state, last CD result and an owed-RELEASE marker. PREVIOUS may restart the current track rather than move back, as observed in the validated setup.
 
 **One PREVIOUS tap vs two.** Each command is one separate `CD_TRACK_PREVIOUS` pair (`0xEC → 100 ms → 0x72`). In attended validation, a single PREVIOUS restarted the current track and two successive PREVIOUS commands moved to the preceding track. The changer decides between restart and moving back, so every result remains `TRACK CHANGE UNVERIFIED`.
 
@@ -147,6 +149,68 @@ Not performed by this change. Follow the [source-selection rollout pattern](sour
 
 Offline tests: `python3 -m unittest tests.test_gateway` (class `CdTrackGatewayTest`), `node tests/test_web_cd.js`, `node tests/test_web_cd_sequence.js` (consecutive fresh-token actions and duplicate browser events) `node tests/test_web_cd_rapid.js` (completion-based spacing, overlap and interval fallback), `node tests/test_web_cd_timing.js` and `node tests/test_web_cd_prev_gesture.js` (double-PREV gesture, cooldown, cancellation and no retry). They use fake services and establish Gateway routing, parsing and refusal behavior only.
 
+## CD playback and held seek
+
+Two further default-off gates complete the CD transport. Each has the same startup requirements as `--enable-cd-track`: `--systemd-socket`, a verified `--nginx-uid`, an exact `--https-origin`, the real XS8 Service socket, and never the offline MUTE mode. The startup mode prints `CD PLAYBACK` or `CD SEEK`. Capabilities gain `cd_playback` and `cd_seek` operations, and `cd_transport.blocked_actions` lists only what the configured gates do not expose. Existing fields are unchanged.
+
+### PLAY/PAUSE and STOP
+
+`--enable-cd-playback` enables `POST /api/v1/cd/playback`, which follows the CD track conventions exactly:
+- Origin, session and a single-use CSRF token;
+- the server-wide CD lock and the same completion-based spacing as PREV/NEXT;
+- a fresh STATUS that must show an idle CD;
+- one `CD_PLAY_PAUSE` or `CD_STOP` dispatch, never retried, with strict reply parsing;
+- `physical_check_required` on anything but a clean refusal.
+
+A verified `PLAY_PAUSE` reply carries `"mapping": "PROVISIONAL"`, because `0xBC` is a historical mapping not yet physically verified ([service API](cd-transport-api.md#single-frame-keys-play-playpause-and-stop)). `PLAY` (`0x41`) is not exposed.
+
+### Held FF/REW
+
+`--enable-cd-seek` enables `POST /api/v1/cd/seek`. It uses the service's **connection-owned** hold: `KEY_DOWN SEEK_FORWARD|SEEK_BACKWARD` and `KEY_UP` ([service API](cd-transport-api.md#connection-owned-seek-key_down--key_up)). It is not replaced by discrete bursts, and the service's token API (`CD_PRESS`/`CD_HEARTBEAT`/`CD_RELEASE`) is not used by the Gateway.
+
+- **One persistent service connection per active seek.** The Gateway keeps it in a server-wide registry, together with the session that started it. The service releases the hold as soon as that connection closes, so **closing it is the Gateway's emergency release**. The browser receives only a random `hold_id`, which is never logged.
+- **START** takes the CD lock and spacing and reads STATUS. If a registry entry exists but STATUS already shows an idle CD (the service ended the hold), that dead connection is closed. START refuses with `CD_BUSY`, `CD_FAULT_LATCHED` or `NOT_ELIGIBLE`; otherwise it opens a new connection and sends exactly one `KEY_DOWN`, then strictly validates the reply.
+  - A verified press keeps the connection and answers `SEEK_STARTED` with `hold_id`, `heartbeat_ms` 500, `lease_ms` 1200 (the service's inactivity limit) and `max_hold_ms` 10000.
+  - Any other reply, an error or a timeout closes the connection and registers nothing. Closing makes the service release any press it did make.
+  - If the `SEEK_STARTED` reply cannot be written to the browser, the connection is closed at once.
+- **HEARTBEAT** must name the session's current `hold_id`; otherwise it is refused without touching the connection. It sends the same `KEY_DOWN` on the owning connection and accepts only `OK KEY_ALIVE`, which renews the service's inactivity limit **without a new XS8 frame**.
+  - A late keepalive after the service's own `INACTIVITY` or `MAX_HOLD` release gets `KEY_EXPIRED`, never a new press. The Gateway closes the connection and reports `NOT_ACTIVE` with `cd_last_result`.
+  - At 10 s the Gateway stops forwarding renewals and closes the connection (`reason: MAX_HOLD`).
+  - Any error, timeout or unexpected reply closes the connection and is reported with `physical_check_required`.
+- **RELEASE** is stop-only. It sends `KEY_UP` on the owning connection, reads the reply, and **always closes** the connection.
+  - Without `hold_id` it releases the session's current hold, so a browser that lost the START response can still stop it.
+  - With a stale `hold_id` it returns `NOT_OWNER` and touches nothing, so it can never stop a newer hold.
+  - With no hold it returns `NOT_ACTIVE` without contacting the service; `KEY_UP_NONE` from the service is also reported as `NOT_ACTIVE` with `cd_last_result`.
+  - `KEY_UP_UNCERTAIN` reports `SERVICE_UNCERTAIN`; the service has latched a CD fault and kept its obligation. A timed-out, disconnected or malformed reply is uncertain; the close still makes the service release.
+- **Cleanup without threads.** The server's `service_actions()` hook, run by `serve_forever` about every 0.5 s, closes the owning connection when the browser has been silent for 1.5 s, the session has expired or been removed, or the hold reaches 10 s. Gateway shutdown (`server_close`) closes it too, and a Gateway crash closes it in the kernel. Nothing is ever reconnected or resent.
+- **CSRF.** Every seek POST consumes its token. Every reply that passed the CSRF check carries the single-use successor, so RELEASE never waits for a refresh. After a lost response the browser recovers the current token with `GET /api/v1/session`. A malformed body gets 400 before the token is consumed.
+- **Backstops.** Independently of the Gateway and browser, the service releases on connection close, after 1200 ms without `KEY_DOWN`, and at its 10 s maximum.
+
+### Web Remote behavior
+
+The CD grid shows PREV, PLAY / PAUSE and NEXT, then REW, STOP and FF. PLAY / PAUSE and STOP are click controls with the same enablement, in-flight, spacing, failure and no-retry rules as PREV/NEXT.
+
+FF and REW are **press-and-hold** controls driven by pointer events. They have no click or keyboard action.
+- **Press:** `pointerdown` with the primary button captures the pointer and sends START. Further pointerdowns, and the other seek button, are ignored while a seek exists. Every other control is disabled; the held button stays enabled so its release events arrive.
+- **Hold:** one HEARTBEAT is sent every `heartbeat_ms` after the previous one completes, using the returned successor token.
+- **Release:** any of these ends the hold:
+  - `pointerup`, `pointercancel` or `lostpointercapture` on the button;
+  - window `blur`, or a window-level `pointerup`/`pointercancel`;
+  - `visibilitychange` to hidden, or `pagehide`.
+  
+  Cancellation is idempotent: heartbeats stop immediately and exactly one RELEASE is sent.
+- **Release before START answers:** the cancellation is recorded, and RELEASE is sent as soon as START answers. A delayed START therefore never leaves a seek running.
+- **Unknown START outcome** (no reply, or a 5xx such as `SERVICE_UNCERTAIN`): the browser sends one session-scoped RELEASE and never another START. A clean refusal (`CD_BUSY`, `TOO_FAST`, `NOT_ELIGIBLE`, `REJECTED`) releases nothing.
+- **Lost heartbeat response, consumed token or Gateway timeout:** the hold continues, and the next heartbeat recovers a token by GET. If renewals keep failing, the service lease ends the hold. A `NOT_ACTIVE` reply ends the loop.
+- **Client maximum:** the browser also releases on its own at `max_hold_ms` (10 s), even if the pointer stays down.
+- **Results** read `FF RELEASE TX VERIFIED · SEEK RESULT UNVERIFIED`, `FF ENDED · LEASE_EXPIRED`, `CD FAULT LATCHED · STOP AND INSPECT CHANGER`, or `FF RELEASE UNKNOWN · LEASE ENDS SEEK WITHIN 2 s · CHECK CHANGER`.
+
+Offline tests: `python3 -m unittest tests.test_gateway` (classes `CdPlaybackGatewayTest`, `CdSeekGatewayTest`, and `RealServiceSeekTest`, which drives the real service socket loop with its fake GPIO backend after `make test`), `node tests/test_web_cd_seek.js`, and the service's `make test`. They establish routing, parsing, connection ownership and timing logic only, not physical behavior.
+
+### Rollout and rollback
+
+Rollout follows the [CD track pattern](#rollout-and-rollback), with `--enable-cd-playback` and/or `--enable-cd-seek`. The XS8 Service must be a build with `CD_PLAY_PAUSE`/`CD_STOP` and the 10 s CD hold maximum. To roll back, remove the flags and confirm that both endpoints return 501 and the four buttons are disabled.
+
 ## Volume step (phase 1)
 
 `POST /api/v1/volume/step` exposes the service's [atomic `VOLUME_STEP`](volume-step-api.md): one request is one bounded `0x17 → 0xF9/0xE9 → 0x09 → 0x07` movement, with STOP, ROOT exit and fault latching owned by the XS8 Service. The Gateway adds no frame, timing or STOP logic and never sends `VOLUME_PRESS` or `VOLUME_RELEASE`, so it never holds volume and cannot take a hold from the CEC client.
@@ -187,7 +251,7 @@ The following paths return HTTP 501 and do not access the XS8 service:
 
 | Endpoint | Proposed request | Safety condition before implementation |
 | --- | --- | --- |
-| `POST /api/v1/cd/transport` | None; superseded by `/api/v1/cd/track` | PLAY/PAUSE and STOP have no service API and no validated Web profile; ROOT `0x9C` is a STOP/CANCEL, not a KEY UP. Held SEEK (Phase B) needs a separately reviewed server-side token and heartbeat design. |
+| `POST /api/v1/cd/transport` | None; superseded by `/api/v1/cd/track`, `/api/v1/cd/playback` and `/api/v1/cd/seek` | Kept as a 501 placeholder so older clients fail closed. |
 
 No new XS8 byte values are assigned by this API design. Future iOS clients can use the same versioned JSON endpoints and show capabilities before presenting enabled controls.
 

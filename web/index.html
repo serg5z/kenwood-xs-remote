@@ -48,9 +48,25 @@
                 <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 5v14M19 6 9 12l10 6V6Z"/></svg>
                 <small>PREV</small>
               </button>
+              <button id="cd-play-pause" disabled type="button" data-cd-playback="PLAY_PAUSE" aria-label="Play or pause">
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m4 5 9 7-9 7V5ZM17 5v14M21 5v14"/></svg>
+                <small>PLAY / PAUSE</small>
+              </button>
               <button id="cd-next" disabled type="button" data-cd-action="NEXT" aria-label="Next track">
                 <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m5 6 10 6-10 6V6ZM19 5v14"/></svg>
                 <small>NEXT</small>
+              </button>
+              <button id="cd-rew" disabled type="button" data-cd-seek="BACKWARD" aria-label="Rewind (hold)">
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M11 6 3 12l8 6V6ZM21 6l-8 6 8 6V6Z"/></svg>
+                <small>REW</small>
+              </button>
+              <button id="cd-stop" disabled type="button" data-cd-playback="STOP" aria-label="Stop">
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="5" width="14" height="14" rx="1"/></svg>
+                <small>STOP</small>
+              </button>
+              <button id="cd-ff" disabled type="button" data-cd-seek="FORWARD" aria-label="Fast forward (hold)">
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m3 6 8 6-8 6V6ZM13 6l8 6-8 6V6Z"/></svg>
+                <small>FF</small>
               </button>
             </div>
           </section>

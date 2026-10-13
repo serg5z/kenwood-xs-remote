@@ -46,6 +46,21 @@ CD_TRACK_INTERVAL_RANGE_MS = (200, 1000)
 # Experimental: 0 removes the cooldown. Serialization, STATUS, CSRF and reply
 # checks still apply, and each XS8 pair still completes before the next starts.
 CD_TRACK_INTERVAL_OFF = 0
+# Single ROOT key frames. 0x9C STOP is physically observed; 0xBC PLAY/PAUSE is a
+# historical mapping that is not yet physically verified.
+CD_PLAYBACK_COMMANDS = {"PLAY_PAUSE": "CD_PLAY_PAUSE", "STOP": "CD_STOP"}
+CD_PLAYBACK_ACTIONS = tuple(CD_PLAYBACK_COMMANDS)
+CD_PROVISIONAL_ACTIONS = ("PLAY_PAUSE",)
+# Held FF/REW through the service's CD hold API. The service lease (2 s) and
+# maximum (10 s) stay authoritative; these values only pace and bound clients.
+CD_SEEK_DIRECTIONS = {"FORWARD": "SEEK_FORWARD", "BACKWARD": "SEEK_BACKWARD"}
+CD_SEEK_HEARTBEAT_MS = 500
+# The service's inactivity limit for a connection-owned KEY_DOWN hold.
+CD_SEEK_LEASE_MS = 1200
+CD_SEEK_MAX_HOLD_MS = 10000
+# Gateway socket hygiene: close the owning service connection (which makes the
+# service release at once) when the browser stops heartbeating for this long.
+CD_SEEK_BROWSER_TIMEOUT_MS = 1500
 VOLUME_DIRECTIONS = ("UP", "DOWN")
 # Server-wide spacing from one completed VOLUME_STEP dispatch to the next. Phase 1
 # exposes single taps only; this guards against duplicate submissions, not hold.
@@ -194,6 +209,146 @@ def send_cd_track(socket_path, action, timeout=3.0):
     raise MuteServiceError("INVALID_REPLY", "Invalid XS8 CD track reply")
 
 
+def _evidence(parts, keys):
+    evidence = {}
+    for key, part in zip(keys, parts):
+        name, _, value = part.partition("=")
+        if name != key:
+            return None
+        evidence[key] = value
+    return evidence if len(evidence) == len(keys) else None
+
+
+def send_cd_playback(socket_path, action, timeout=3.0):
+    """One single-frame CD key; no KEY UP exists and the service never retries."""
+    if action not in CD_PLAYBACK_COMMANDS:
+        raise MuteServiceError("REJECTED", "CD action is not allowlisted")
+    line = _send_control(socket_path, f"{CD_PLAYBACK_COMMANDS[action]}\n".encode("ascii"),
+                         timeout, fake_only=False, max_reply=512)
+    parts = line.split()
+    if len(parts) == 6 and parts[2] == f"action={action}" and \
+            parts[5] == "receiver_execution=UNVERIFIED":
+        evidence = _evidence(parts[3:5], ("gpio_tx", "waveform"))
+        if (evidence and evidence["gpio_tx"] in ("TX_OK", "TX_FAIL") and
+                evidence["waveform"] in CD_WAVEFORMS):
+            evidence["receiver_execution"] = "UNVERIFIED"
+            if parts[:2] == ["OK", "CD_TRANSPORT_TX"] and \
+                    evidence["gpio_tx"] == "TX_OK" and evidence["waveform"] == "MATCH":
+                return evidence
+            if parts[:2] == ["ERR", "CD_TRANSPORT_UNCERTAIN"]:
+                raise MuteServiceError("SERVICE_UNCERTAIN", line, evidence)
+    if line == "ERR CD_FAULT_LATCHED":
+        raise MuteServiceError("CD_FAULT_LATCHED", line)
+    if (line.startswith("ERR ") and len(parts) >= 2 and
+            not parts[1].startswith("CD_TRANSPORT")):
+        raise MuteServiceError("REJECTED", line)
+    raise MuteServiceError("INVALID_REPLY", "Invalid XS8 CD playback reply")
+
+
+class ServiceConnection:
+    """One persistent XS8 Service socket that owns at most one KEY_DOWN hold.
+
+    The service releases the hold as soon as this socket closes, so close() is
+    the emergency release. Any error or unexpected reply closes it; nothing here
+    reconnects or resends."""
+
+    def __init__(self, socket_path, timeout):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.sock.settimeout(timeout)
+            self.sock.connect(socket_path)
+        except socket.timeout as exc:
+            self.close()
+            raise MuteServiceError("TIMEOUT", "XS8 service connection timed out") from exc
+        except OSError as exc:
+            self.close()
+            raise MuteServiceError("UNAVAILABLE", "XS8 service unavailable") from exc
+
+    @property
+    def closed(self):
+        return self.sock is None
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            finally:
+                self.sock = None
+
+    def exchange(self, line, timeout, max_reply=512):
+        """Send one line and read exactly one reply line; close on any failure."""
+        if self.sock is None:
+            raise MuteServiceError("DISCONNECTED", "XS8 service connection is closed")
+        try:
+            self.sock.settimeout(timeout)
+            self.sock.sendall(line.encode("ascii") + b"\n")
+            response = bytearray()
+            while b"\n" not in response:
+                chunk = self.sock.recv(128)
+                if not chunk:
+                    raise MuteServiceError("DISCONNECTED",
+                                           "XS8 service disconnected; delivery is uncertain")
+                response.extend(chunk)
+                if len(response) > max_reply:
+                    raise MuteServiceError("INVALID_REPLY", "XS8 service reply too long")
+            if not response.endswith(b"\n") or response.count(b"\n") != 1:
+                raise MuteServiceError("INVALID_REPLY", "Unexpected extra XS8 service data")
+            return bytes(response[:-1]).decode("ascii")
+        except socket.timeout as exc:
+            self.close()
+            raise MuteServiceError("TIMEOUT", "XS8 service reply timed out; delivery is uncertain") from exc
+        except UnicodeError as exc:
+            self.close()
+            raise MuteServiceError("INVALID_REPLY", "Invalid XS8 service reply") from exc
+        except OSError as exc:
+            self.close()
+            raise MuteServiceError("DISCONNECTED", "XS8 service disconnected; delivery is uncertain") from exc
+        except MuteServiceError:
+            self.close()
+            raise
+
+
+def parse_key_down(line, action):
+    """Strict KEY_DOWN start reply. Raises for anything but a verified press."""
+    parts = line.split()
+    if parts == ["OK", "KEY_DOWN_TX", f"action={action}", "gpio_tx=TX_OK", "waveform=MATCH",
+                 "receiver_execution=UNVERIFIED"]:
+        return {"gpio_tx": "TX_OK", "waveform": "MATCH", "receiver_execution": "UNVERIFIED"}
+    if (len(parts) == 8 and parts[:2] == ["ERR", "KEY_DOWN_UNCERTAIN"] and
+            parts[2] == f"action={action}" and parts[7] == "receiver_execution=UNVERIFIED"):
+        evidence = _evidence(parts[3:7], ("gpio_tx", "waveform", "release_gpio_tx",
+                                          "release_waveform"))
+        if evidence:
+            evidence["receiver_execution"] = "UNVERIFIED"
+            raise MuteServiceError("SERVICE_UNCERTAIN", line, evidence)
+    if line == "ERR CD_FAULT_LATCHED":
+        raise MuteServiceError("CD_FAULT_LATCHED", line)
+    if (line.startswith("ERR ") and len(parts) >= 2 and
+            not parts[1].startswith("KEY_DOWN")):
+        raise MuteServiceError("REJECTED", line)
+    raise MuteServiceError("INVALID_REPLY", "Invalid XS8 KEY_DOWN reply")
+
+
+def parse_key_up(line, action):
+    """Strict KEY_UP reply: released, already ended, or uncertain."""
+    parts = line.split()
+    if (len(parts) == 6 and parts[2] == f"action={action}" and
+            parts[5] == "receiver_execution=UNVERIFIED"):
+        evidence = _evidence(parts[3:5], ("gpio_tx", "waveform"))
+        if evidence and evidence["gpio_tx"] in ("TX_OK", "TX_FAIL") and \
+                evidence["waveform"] in CD_WAVEFORMS:
+            evidence["receiver_execution"] = "UNVERIFIED"
+            if parts[:2] == ["OK", "KEY_UP_TX"] and \
+                    evidence["gpio_tx"] == "TX_OK" and evidence["waveform"] == "MATCH":
+                return "RELEASED", evidence
+            if parts[:2] == ["ERR", "KEY_UP_UNCERTAIN"]:
+                raise MuteServiceError("SERVICE_UNCERTAIN", line, evidence)
+    if len(parts) == 3 and parts[:2] == ["OK", "KEY_UP_NONE"] and \
+            parts[2].startswith("last=") and len(parts[2]) > 5:
+        return "NOT_ACTIVE", {"cd_last_result": parts[2][5:]}
+    raise MuteServiceError("INVALID_REPLY", "Invalid XS8 KEY_UP reply")
+
+
 def send_volume_step(socket_path, direction, timeout=3.0):
     """One atomic VOLUME_STEP; the service owns STOP, ROOT exit and fault latching."""
     if direction not in VOLUME_DIRECTIONS:
@@ -337,7 +492,8 @@ def receiver_state(status):
 
 def capabilities(mute_available=False, source_available=False, query_available=False,
                  cd_track_available=False, cd_track_interval_ms=CD_TRACK_INTERVAL_MS,
-                 volume_step_available=False):
+                 volume_step_available=False, cd_playback_available=False,
+                 cd_seek_available=False, cd_blocked_actions=CD_BLOCKED_ACTIONS):
     return {
         "api_version": "v0.1",
         "operations": {
@@ -362,12 +518,72 @@ def capabilities(mute_available=False, source_available=False, query_available=F
             "cd_transport": {
                 "classification": "unverified", "enabled": cd_track_available,
                 "available_actions": list(CD_TRACK_ACTIONS),
-                "blocked_actions": list(CD_BLOCKED_ACTIONS),
+                "blocked_actions": list(cd_blocked_actions),
                 "min_interval_ms": cd_track_interval_ms,
-                "reason": "TX and waveform do not confirm a track change; PLAY/PAUSE, STOP and held SEEK are not exposed",
+                "reason": "TX and waveform do not confirm a track change; blocked actions are not exposed by this Gateway",
+            },
+            "cd_playback": {
+                "classification": "unverified", "enabled": cd_playback_available,
+                "available_actions": list(CD_PLAYBACK_ACTIONS),
+                "provisional_actions": list(CD_PROVISIONAL_ACTIONS),
+                "min_interval_ms": cd_track_interval_ms,
+                "reason": "STOP 0x9C is physically observed; PLAY/PAUSE 0xBC is a historical mapping not yet physically verified",
+            },
+            "cd_seek": {
+                "classification": "unverified", "enabled": cd_seek_available,
+                "available_directions": list(CD_SEEK_DIRECTIONS),
+                "heartbeat_ms": CD_SEEK_HEARTBEAT_MS, "lease_ms": CD_SEEK_LEASE_MS,
+                "max_hold_ms": CD_SEEK_MAX_HOLD_MS,
+                "reason": "Held KEY DOWN with a service lease and maximum; TX and waveform do not confirm seeking",
             },
         },
     }
+
+
+def cd_seek_state(server):
+    # Server-wide: the service allows one CD hold. Its owning service connection
+    # stays here, bound to the session that started it; browsers see only hold_id.
+    return server.__dict__.setdefault("cd_seek", {"hold": None})
+
+
+def end_cd_seek(server, reason):
+    """Forget the hold and close its service connection; the service releases
+    on close. Idempotent."""
+    registry = cd_seek_state(server)
+    hold = registry["hold"]
+    registry["hold"] = None
+    if hold is not None:
+        hold["connection"].close()
+        print(f"XS8 gateway CD_SEEK connection closed reason={reason}", file=sys.stderr)
+
+
+class CdSeekCleanupMixin:
+    """Closes abandoned seek connections from the serve_forever loop; no threads."""
+
+    def service_actions(self):
+        super().service_actions()
+        hold = cd_seek_state(self)["hold"]
+        if hold is None:
+            return
+        now = time.monotonic()
+        sessions = getattr(self.RequestHandlerClass, "sessions", None) or {}
+        session = hold["session"]
+        if hold["connection"].closed:
+            end_cd_seek(self, "CONNECTION_LOST")
+        elif session["expires"] < now or not any(s is session for s in sessions.values()):
+            end_cd_seek(self, "SESSION_ENDED")
+        elif (now - hold["browser_seen"]) * 1000 >= CD_SEEK_BROWSER_TIMEOUT_MS:
+            end_cd_seek(self, "BROWSER_INACTIVE")
+        elif (now - hold["started"]) * 1000 >= CD_SEEK_MAX_HOLD_MS:
+            end_cd_seek(self, "MAX_HOLD")
+
+    def server_close(self):
+        end_cd_seek(self, "GATEWAY_SHUTDOWN")
+        super().server_close()
+
+
+class GatewayHTTPServer(CdSeekCleanupMixin, HTTPServer):
+    pass
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -379,6 +595,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
     cd_track_enabled = False
     cd_track_interval_ms = CD_TRACK_INTERVAL_MS
     volume_step_enabled = False
+    cd_playback_enabled = False
+    cd_seek_enabled = False
     https_origin = None
     sessions = None
 
@@ -388,7 +606,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def control_enabled(self):
         return (self.mute_enabled() or self.production_source_enabled or
                 self.receiver_query_enabled or self.cd_track_enabled or
-                self.volume_step_enabled)
+                self.volume_step_enabled or self.cd_playback_enabled or
+                self.cd_seek_enabled)
 
     def authenticated_user(self):
         # nginx overwrites this header with $remote_user after Basic Auth.
@@ -467,7 +686,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "cd_track": (self.cd_track_enabled and status is not None and
                              self.status_allows_cd_track(status)),
                 "volume_step": (self.volume_step_enabled and status is not None and
-                                self.status_allows_volume_step(status))}
+                                self.status_allows_volume_step(status)),
+                "cd_playback": (self.cd_playback_enabled and status is not None and
+                                self.status_allows_cd_track(status)),
+                "cd_seek": (self.cd_seek_enabled and status is not None and
+                            self.status_allows_cd_track(status))}
+
+    def cd_blocked_actions(self):
+        enabled = ((CD_PLAYBACK_ACTIONS if self.cd_playback_enabled else ()) +
+                   (("SEEK_FORWARD", "SEEK_BACKWARD") if self.cd_seek_enabled else ()))
+        return tuple(a for a in CD_BLOCKED_ACTIONS if a not in enabled)
 
     def send_body(self, code, body, content_type, headers=None):
         self.response_code = code
@@ -512,7 +740,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.send_json(200, capabilities(available["mute"], available["source"],
                                               available["query"], available["cd_track"],
                                               self.cd_track_interval_ms,
-                                              available["volume_step"]))
+                                              available["volume_step"],
+                                              available["cd_playback"], available["cd_seek"],
+                                              self.cd_blocked_actions()))
             return
         if path == "/api/v1/session" and self.control_enabled():
             user = self.authenticated_user()
@@ -534,7 +764,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                  "source_available": available["source"],
                                  "receiver_query_available": available["query"],
                                  "cd_track_available": available["cd_track"],
-                                 "volume_step_available": available["volume_step"]}, headers)
+                                 "volume_step_available": available["volume_step"],
+                                 "cd_playback_available": available["cd_playback"],
+                                 "cd_seek_available": available["cd_seek"]}, headers)
             return
         assets = {
             "/": ("index.html", "text/html; charset=utf-8"),
@@ -561,6 +793,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.cd_track_state()["completed"] = time.monotonic()
             self.add_timing("xs8cd", started)
 
+    def dispatch_cd_playback(self, action):
+        started = time.monotonic()
+        try:
+            return send_cd_playback(self.socket_path, action)
+        finally:
+            self.cd_track_state()["completed"] = time.monotonic()
+            self.add_timing("xs8cd", started)
+
+    def cd_seek_state(self):
+        return cd_seek_state(self.server)
+
+    def forget_stale_hold(self, status):
+        # STATUS IDLE means the service already ended the hold (inactivity,
+        # maximum, monitor). Closing the dead connection also clears the service's
+        # re-arm block for it.
+        if status.get("cd_state") == "IDLE":
+            end_cd_seek(self.server, "SERVICE_IDLE")
+
     def volume_step_state(self):
         # Server-wide, like CD: one receiver, whichever session sends.
         return self.server.__dict__.setdefault(
@@ -579,6 +829,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.start_timing()
         self.held_lock = None
         self.cd_action = None
+        self.cd_kind = "CD_TRACK"
         self.volume_direction = None
         try:
             self.handle_post()
@@ -594,7 +845,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                           for name, duration in self.timings))
             if self.cd_action is not None:
                 # One journal line per CD request for attended timing analysis.
-                self.log_message("CD_TRACK action=%s code=%s result=%s %s", self.cd_action,
+                self.log_message("%s action=%s code=%s result=%s %s", self.cd_kind,
+                                 self.cd_action,
                                  getattr(self, "response_code", "-"),
                                  getattr(self, "response_result", None) or "-",
                                  " ".join(f"{name}_ms={duration:.1f}"
@@ -607,7 +859,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         is_query = path == "/api/v1/receiver/query" and self.receiver_query_enabled
         is_cd = path == "/api/v1/cd/track" and self.cd_track_enabled
         is_volume = path == "/api/v1/volume/step" and self.volume_step_enabled
-        if (not (is_mute or is_source or is_query or is_cd or is_volume) or
+        is_playback = path == "/api/v1/cd/playback" and self.cd_playback_enabled
+        is_seek = path == "/api/v1/cd/seek" and self.cd_seek_enabled
+        if (not (is_mute or is_source or is_query or is_cd or is_volume or
+                 is_playback or is_seek) or
                 not getattr(self.server, "proxy_peer_verified", False)):
             length = self.headers.get("Content-Length", "")
             if len(length) <= 4 and length.isdecimal() and 0 < int(length) <= 4096:
@@ -647,7 +902,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if body != b"{}":
                 self.send_json(400, {"error": "Expected JSON body {}"})
                 return
-        elif is_cd:
+        elif is_seek:
+            request = self.parse_seek(body)
+            if request is None:
+                self.send_json(400, {"error": "Expected one allowlisted CD seek request"})
+                return
+            self.cd_kind = "CD_SEEK"
+            self.cd_action = request["action"]
+            self.handle_seek(session, request)
+            return
+        elif is_cd or is_playback:
             try:
                 pairs = json.loads(body, object_pairs_hook=list)
                 action = (pairs[0][1] if isinstance(pairs, list) and
@@ -655,9 +919,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                           pairs[0][0] == "action" else None)
             except (UnicodeError, ValueError, TypeError, IndexError):
                 action = None
-            if not isinstance(action, str) or action not in CD_TRACK_ACTIONS:
+            if not isinstance(action, str) or action not in (
+                    CD_TRACK_ACTIONS if is_cd else CD_PLAYBACK_ACTIONS):
                 self.send_json(400, {"error": "Expected one allowlisted CD action"})
                 return
+            if is_playback:
+                self.cd_kind = "CD_PLAYBACK"
             self.cd_action = action
             state = self.cd_track_state()
             if state["completed"] != float("-inf"):
@@ -731,18 +998,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
             session["last_query_request"] = now
         # Single use: a repeated request with the same token cannot dispatch again.
         session["csrf"] = secrets.token_urlsafe(32)
-        if (is_source or is_query or is_cd or is_volume or self.production_mute_enabled):
+        if (is_source or is_query or is_cd or is_volume or is_playback or
+                self.production_mute_enabled):
             try:
                 status = self.read_service_status()
             except ServiceError:
                 self.send_json(503, {"result": "UNAVAILABLE", "receiver_execution": "UNVERIFIED"})
                 return
-            if is_cd and self.cd_fault(status):
+            if (is_cd or is_playback) and self.cd_seek_enabled:
+                self.forget_stale_hold(status)
+            if (is_cd or is_playback) and self.cd_fault(status):
                 self.send_json(409, {"result": "CD_FAULT_LATCHED",
                                      "physical_check_required": True,
                                      "receiver_execution": "UNVERIFIED"})
                 return
-            if is_cd and status.get("cd_state") in ("ACTIVE", "HOLDING"):
+            if (is_cd or is_playback) and status.get("cd_state") in ("ACTIVE", "HOLDING"):
                 self.send_json(409, {"result": "CD_BUSY", "receiver_execution": "UNVERIFIED"})
                 return
             if is_volume:
@@ -757,7 +1027,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         payload["physical_check_required"] = True
                     self.send_json(409, payload)
                     return
-            if not (self.status_allows_cd_track(status) if is_cd
+            if not (self.status_allows_cd_track(status) if (is_cd or is_playback)
                     else self.status_allows_volume_step(status) if is_volume
                     else self.status_allows_mute(status)):
                 self.send_json(409, {"result": "NOT_ELIGIBLE", "receiver_execution": "UNVERIFIED"})
@@ -766,6 +1036,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             reply = (send_mute(self.socket_path, fake_only=not self.production_mute_enabled)
                      if is_mute else send_receiver_query(self.socket_path) if is_query
                      else self.dispatch_cd_track(action) if is_cd
+                     else self.dispatch_cd_playback(action) if is_playback
                      else self.dispatch_volume_step(direction) if is_volume
                      else send_source(self.socket_path, source))
         except MuteServiceError as exc:
@@ -773,14 +1044,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "FAULT_LATCHED": 409, "TIMEOUT": 504}.get(exc.result, 502)
             payload = {"result": exc.result, "error": str(exc),
                        "receiver_execution": "UNVERIFIED"}
-            if (is_source or is_cd or is_volume) and exc.evidence:
+            if (is_source or is_cd or is_volume or is_playback) and exc.evidence:
                 payload.update(exc.evidence)
             if is_volume:
                 payload["direction"] = direction
                 # Never retried here or in the browser; only a clean refusal sent nothing.
                 payload["physical_check_required"] = exc.result not in (
                     "UNAVAILABLE", "REJECTED")
-            if is_cd:
+            if is_cd or is_playback:
                 payload["action"] = action
                 # Anything but a clean refusal may have moved the changer.
                 payload["physical_check_required"] = exc.result not in (
@@ -793,8 +1064,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
             payload.update(reply)
             # Same single-use successor as CD track; GET /api/v1/session grants it too.
             payload["csrf_token"] = session["csrf"]
-        elif is_cd:
+        elif is_cd or is_playback:
             payload["action"] = action
+            if action in CD_PROVISIONAL_ACTIONS:
+                payload["mapping"] = "PROVISIONAL"
             payload.update(reply)
             # The token rotated before dispatch, so the one just used is already
             # invalid. Returning its single-use successor (only on a verified
@@ -811,7 +1084,186 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_json(200, payload)
 
 
-class ActivatedUnixServer(socketserver.TCPServer):
+    @staticmethod
+    def parse_seek(body):
+        try:
+            pairs = json.loads(body, object_pairs_hook=list)
+        except (UnicodeError, ValueError):
+            return None
+        if (not isinstance(pairs, list) or
+                not all(isinstance(pair, tuple) and isinstance(pair[1], str) for pair in pairs)):
+            return None
+        request = dict(pairs)
+        if len(request) != len(pairs):
+            return None
+        action = request.get("action")
+        hold_id = request.get("hold_id")
+        if hold_id is not None and not (0 < len(hold_id) <= 43 and all(
+                c.isascii() and (c.isalnum() or c in "-_") for c in hold_id)):
+            return None
+        if action == "START" and set(request) == {"action", "direction"} and \
+                request["direction"] in CD_SEEK_DIRECTIONS:
+            return request
+        if action == "HEARTBEAT" and set(request) == {"action", "hold_id"}:
+            return request
+        if action == "RELEASE" and set(request) in ({"action"}, {"action", "hold_id"}):
+            return request
+        return None
+
+    def seek_failure(self, exc, physical):
+        code = {"UNAVAILABLE": 503, "REJECTED": 409, "CD_FAULT_LATCHED": 409,
+                "NOT_ACTIVE": 409, "TIMEOUT": 504}.get(exc.result, 502)
+        payload = {"result": exc.result, "error": str(exc),
+                   "physical_check_required": physical}
+        if exc.evidence:
+            payload.update(exc.evidence)
+        return code, payload
+
+    def handle_seek(self, session, request):
+        """START, HEARTBEAT or RELEASE of the one server-wide held CD seek.
+
+        The hold is owned by one persistent service connection: KEY_DOWN starts
+        it, repeated KEY_DOWN on that connection keeps it alive without a new
+        XS8 frame, KEY_UP ends it, and closing the connection makes the service
+        release at once. Nothing is ever reconnected or resent."""
+        # Single use, like every control POST. Every reply that passed the CSRF
+        # check carries the successor so RELEASE never waits for a token refresh;
+        # it grants nothing GET /api/v1/session would not.
+        session["csrf"] = secrets.token_urlsafe(32)
+
+        def reply(code, payload):
+            payload["receiver_execution"] = "UNVERIFIED"
+            payload["csrf_token"] = session["csrf"]
+            self.send_json(code, payload)
+
+        registry = self.cd_seek_state()
+        hold = registry["hold"]
+        action = request["action"]
+        now = time.monotonic()
+        if action == "HEARTBEAT":
+            if (hold is None or hold["session"] is not session or
+                    not secrets.compare_digest(hold["hold_id"], request["hold_id"])):
+                reply(409, {"result": "NOT_ACTIVE"})
+                return
+            if (now - hold["started"]) * 1000 >= CD_SEEK_MAX_HOLD_MS:
+                # Independent backstop: never renew past the maximum; closing
+                # the owning connection makes the service release now.
+                end_cd_seek(self.server, "MAX_HOLD")
+                reply(409, {"result": "NOT_ACTIVE", "reason": "MAX_HOLD"})
+                return
+            started = time.monotonic()
+            try:
+                line = hold["connection"].exchange(f"KEY_DOWN {hold['action']}", 1.0)
+            except MuteServiceError as exc:
+                # The connection is closed, so the service is releasing. Whether
+                # this renewal arrived first is unknown.
+                end_cd_seek(self.server, exc.result)
+                code, payload = self.seek_failure(exc, True)
+                reply(code, payload)
+                return
+            finally:
+                self.add_timing("xs8heartbeat", started)
+            if line == f"OK KEY_ALIVE action={hold['action']}":
+                hold["browser_seen"] = time.monotonic()
+                reply(200, {"result": "LEASE_RENEWED"})
+                return
+            # Never a new press: the service refuses a late keepalive with
+            # KEY_EXPIRED after INACTIVITY or MAX_HOLD; any other reply is unexpected.
+            end_cd_seek(self.server, "HEARTBEAT_REFUSED")
+            if line.startswith("ERR KEY_EXPIRED last=") and len(line) > 21:
+                reply(409, {"result": "NOT_ACTIVE", "cd_last_result": line[21:]})
+            else:
+                code, payload = self.seek_failure(
+                    MuteServiceError("INVALID_REPLY", "Unexpected XS8 keepalive reply"), True)
+                reply(code, payload)
+            return
+        if action == "RELEASE":
+            if hold is None or hold["session"] is not session:
+                reply(200, {"result": "NOT_ACTIVE"})
+                return
+            if "hold_id" in request and not secrets.compare_digest(
+                    hold["hold_id"], request["hold_id"]):
+                # A stale release never stops a newer hold.
+                reply(409, {"result": "NOT_OWNER"})
+                return
+            started = time.monotonic()
+            try:
+                result, evidence = parse_key_up(
+                    hold["connection"].exchange(f"KEY_UP {hold['action']}", 2.0),
+                    hold["action"])
+            except MuteServiceError as exc:
+                # SERVICE_UNCERTAIN: the service latched a CD fault and kept its
+                # obligation. Otherwise delivery is unknown; closing the
+                # connection below still makes the service release.
+                code, payload = self.seek_failure(exc, True)
+                reply(code, payload)
+                return
+            finally:
+                # Always: the connection's only job was this hold.
+                end_cd_seek(self.server, "RELEASE")
+                self.cd_track_state()["completed"] = time.monotonic()
+                self.add_timing("xs8cd", started)
+            reply(200, {"result": result, **evidence})
+            return
+        direction = request["direction"]
+        key_action = CD_SEEK_DIRECTIONS[direction]
+        state = self.cd_track_state()
+        if not state["lock"].acquire(blocking=False):
+            reply(409, {"result": "CD_BUSY"})
+            return
+        self.held_lock = state["lock"]
+        if (self.cd_track_interval_ms != CD_TRACK_INTERVAL_OFF and
+                (now - state["completed"]) * 1000 < self.cd_track_interval_ms):
+            reply(429, {"result": "TOO_FAST", "min_interval_ms": self.cd_track_interval_ms})
+            return
+        try:
+            status = self.read_service_status()
+        except ServiceError:
+            reply(503, {"result": "UNAVAILABLE"})
+            return
+        self.forget_stale_hold(status)
+        if self.cd_fault(status):
+            reply(409, {"result": "CD_FAULT_LATCHED", "physical_check_required": True})
+            return
+        if status.get("cd_state") in ("ACTIVE", "HOLDING") or registry["hold"] is not None:
+            reply(409, {"result": "CD_BUSY"})
+            return
+        if not self.status_allows_cd_track(status):
+            reply(409, {"result": "NOT_ELIGIBLE"})
+            return
+        started = time.monotonic()
+        connection = None
+        try:
+            connection = ServiceConnection(self.socket_path, 3.0)
+            evidence = parse_key_down(connection.exchange(f"KEY_DOWN {key_action}", 3.0),
+                                      key_action)
+        except MuteServiceError as exc:
+            # Closing makes the service release any press it did make.
+            if connection is not None:
+                connection.close()
+            code, payload = self.seek_failure(
+                exc, exc.result not in ("UNAVAILABLE", "REJECTED"))
+            payload["direction"] = direction
+            reply(code, payload)
+            return
+        finally:
+            state["completed"] = time.monotonic()
+            self.add_timing("xs8cd", started)
+        now = time.monotonic()
+        hold_id = secrets.token_urlsafe(16)
+        registry["hold"] = {"session": session, "connection": connection,
+                            "hold_id": hold_id, "direction": direction,
+                            "action": key_action, "started": now, "browser_seen": now}
+        try:
+            reply(200, {"result": "SEEK_STARTED", "direction": direction, "hold_id": hold_id,
+                        **evidence, "heartbeat_ms": CD_SEEK_HEARTBEAT_MS,
+                        "lease_ms": CD_SEEK_LEASE_MS, "max_hold_ms": CD_SEEK_MAX_HOLD_MS})
+        except OSError:
+            # The browser never learns of this hold: release it now.
+            end_cd_seek(self.server, "START_REPLY_UNDELIVERED")
+
+
+class ActivatedUnixServer(CdSeekCleanupMixin, socketserver.TCPServer):
     """Serve HTTP on a pre-existing AF_UNIX listener; never bind TCP."""
     address_family = socket.AF_UNIX
 
@@ -866,6 +1318,10 @@ def parse_args(argv=None):
                         help="enable discrete CD NEXT/PREVIOUS through the real local XS8 Service")
     parser.add_argument("--enable-volume", action="store_true",
                         help="enable single atomic VOLUME_STEP taps through the real local XS8 Service")
+    parser.add_argument("--enable-cd-playback", action="store_true",
+                        help="enable CD PLAY/PAUSE (provisional 0xBC) and STOP through the real local XS8 Service")
+    parser.add_argument("--enable-cd-seek", action="store_true",
+                        help="enable held CD FF/REW through the real local XS8 Service hold API")
     parser.add_argument("--cd-track-interval-ms", type=int,
                         help="experimental minimum ms from one completed CD track "
                              f"command to the next (default {CD_TRACK_INTERVAL_MS}, "
@@ -892,10 +1348,12 @@ def parse_args(argv=None):
         args.cd_track_interval_ms = CD_TRACK_INTERVAL_MS
     if args.enable_offline_mute and (args.enable_mute or args.enable_source or
                                     args.enable_receiver_query or args.enable_cd_track or
-                                    args.enable_volume):
+                                    args.enable_volume or args.enable_cd_playback or
+                                    args.enable_cd_seek):
         parser.error("offline and production MUTE modes are mutually exclusive")
     if (args.enable_offline_mute or args.enable_mute or args.enable_source or
-            args.enable_receiver_query or args.enable_cd_track or args.enable_volume):
+            args.enable_receiver_query or args.enable_cd_track or args.enable_volume or
+            args.enable_cd_playback or args.enable_cd_seek):
         if not args.systemd_socket or not args.https_origin:
             parser.error("active controls require --systemd-socket and --https-origin")
         try:
@@ -956,6 +1414,8 @@ def main(argv=None):
                     "cd_track_enabled": args.enable_cd_track,
                     "cd_track_interval_ms": args.cd_track_interval_ms,
                     "volume_step_enabled": args.enable_volume,
+                    "cd_playback_enabled": args.enable_cd_playback,
+                    "cd_seek_enabled": args.enable_cd_seek,
                     "https_origin": args.https_origin, "sessions": {}})
     if args.systemd_socket:
         try:
@@ -969,11 +1429,13 @@ def main(argv=None):
                     ("PRODUCTION SOURCE", args.enable_source),
                     ("RECEIVER QUERY", args.enable_receiver_query),
                     (f"CD TRACK {args.cd_track_interval_ms} ms", args.enable_cd_track),
-                    ("VOLUME STEP", args.enable_volume))
+                    ("VOLUME STEP", args.enable_volume),
+                    ("CD PLAYBACK", args.enable_cd_playback),
+                    ("CD SEEK", args.enable_cd_seek))
                     if enabled) or "read-only")
         print(f"XS8 gateway listening on {GATEWAY_SOCKET} ({mode})")
     else:
-        server = HTTPServer((args.bind, args.port), handler)
+        server = GatewayHTTPServer((args.bind, args.port), handler)
         print(f"XS8 gateway listening on http://{args.bind}:{server.server_port} (read-only)")
     try:
         server.serve_forever()

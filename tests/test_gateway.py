@@ -3,8 +3,10 @@ import contextlib
 import io
 import json
 import os
+import re
 import socket
 import struct
+import subprocess
 import tempfile
 import threading
 import time
@@ -44,6 +46,8 @@ VOLUME_OK = (b"OK VOLUME_STEP_TX direction=UP state=IDLE stop_owed=0 "
              b"context_may_be_open=0 receiver_execution=UNVERIFIED\n")
 VOLUME_UNCERTAIN = (b"ERR VOLUME_STEP_UNCERTAIN direction=UP state=FAULT_LATCHED "
                     b"stop_owed=1 context_may_be_open=1 receiver_execution=UNVERIFIED\n")
+CD_TRANSPORT_OK = (b"OK CD_TRANSPORT_TX action=STOP gpio_tx=TX_OK waveform=MATCH "
+                   b"receiver_execution=UNVERIFIED\n")
 QUERY_REPLY = (b"OK QUERY_STATUS reason=NONE gpio_tx=TX_OK waveform=MATCH "
                b"bytes=lsb/legacy@start_ns-end_ns:validity "
                b"tx=0x13/0x37@1-2:VALID rx1=0x47/0x1D@3-4:VALID "
@@ -163,6 +167,173 @@ class RecordingService:
             raise AssertionError("recording fake service did not stop")
 
 
+class KeyService:
+    """Fake XS8 Service with connection-owned KEY_DOWN/KEY_UP semantics.
+
+    One thread per connection. The connection that pressed owns the single CD
+    hold; KEY_UP or closing that connection releases it (0x72). A service-side
+    expiry blocks that connection's KEY_DOWN with KEY_EXPIRED. STATUS reports
+    the hold. `script[verb]` can queue raw replies (bytes), None (close without
+    replying) or ("delay", seconds, bytes)."""
+
+    PRESS = {"SEEK_FORWARD": "0x7A", "SEEK_BACKWARD": "0x6A"}
+
+    def __init__(self, path, status=CD_IDLE_STATUS):
+        self.path = path
+        self.status = status
+        self.lock = threading.Lock()
+        self.tx = []
+        self.events = []
+        self.hold = None
+        self.expired = {}
+        self.last = "NONE"
+        self.script = {}
+        self.sockets = {}
+        self.threads = []
+        self.next_id = 0
+        self.stop = threading.Event()
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(path)
+        self.listener.listen(16)
+        self.listener.settimeout(0.05)
+        self.thread = threading.Thread(target=self.accept_loop, daemon=True)
+        self.thread.start()
+
+    def accept_loop(self):
+        while not self.stop.is_set():
+            try:
+                client, _ = self.listener.accept()
+            except (socket.timeout, OSError):
+                continue
+            with self.lock:
+                self.next_id += 1
+                cid = self.next_id
+                self.sockets[cid] = client
+            thread = threading.Thread(target=self.serve, args=(cid, client), daemon=True)
+            self.threads.append(thread)
+            thread.start()
+
+    def serve(self, cid, client):
+        buffer = b""
+        try:
+            while True:
+                try:
+                    chunk = client.recv(256)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    reply = self.handle(cid, raw.decode())
+                    if isinstance(reply, tuple):
+                        time.sleep(reply[1])
+                        reply = reply[2]
+                    if reply is None:
+                        return
+                    try:
+                        client.sendall(reply)
+                    except OSError:
+                        return
+        finally:
+            client.close()
+            self.closed(cid)
+
+    def handle(self, cid, line):
+        with self.lock:
+            self.events.append((cid, line))
+            verb = line.split(" ", 1)[0]
+            if self.script.get(verb):
+                return self.script[verb].pop(0)
+            if line == "STATUS":
+                return (CD_HOLD_STATUS.replace(b"cd_action=TRACK_NEXT",
+                                               b"cd_action=" + self.hold["action"].encode())
+                        if self.hold else self.status)
+            action = line.split(" ", 1)[1] if " " in line else ""
+            if verb == "KEY_DOWN":
+                if action not in self.PRESS:
+                    return b"ERR KEY_UNKNOWN_ACTION\n"
+                if self.hold and self.hold["conn"] == cid and self.hold["action"] == action:
+                    return f"OK KEY_ALIVE action={action}\n".encode()
+                if self.hold:
+                    return b"ERR KEY_BUSY\n"
+                if cid in self.expired:
+                    return f"ERR KEY_EXPIRED last={self.expired[cid]}\n".encode()
+                self.hold = {"conn": cid, "action": action}
+                self.tx.append(self.PRESS[action])
+                return (f"OK KEY_DOWN_TX action={action} gpio_tx=TX_OK waveform=MATCH "
+                        "receiver_execution=UNVERIFIED\n").encode()
+            if verb == "KEY_UP":
+                if self.hold and self.hold["conn"] == cid:
+                    if self.hold["action"] != action:
+                        return b"ERR KEY_ACTION_MISMATCH\n"
+                    self.release("CLIENT_RELEASE")
+                    return (f"OK KEY_UP_TX action={action} gpio_tx=TX_OK waveform=MATCH "
+                            "receiver_execution=UNVERIFIED\n").encode()
+                if self.hold:
+                    return b"ERR KEY_NOT_OWNER\n"
+                self.expired.pop(cid, None)
+                return f"OK KEY_UP_NONE last={self.last}\n".encode()
+            return b"ERR UNKNOWN_COMMAND\n"
+
+    def release(self, reason):
+        self.tx.append("0x72")
+        self.last = reason
+        owner = self.hold["conn"]
+        self.hold = None
+        return owner
+
+    def closed(self, cid):
+        with self.lock:
+            self.events.append((cid, "CLOSE"))
+            if self.hold and self.hold["conn"] == cid:
+                self.release("CLIENT_DISCONNECT")
+            self.expired.pop(cid, None)
+
+    def expire(self, reason):
+        """Service-side INACTIVITY or MAX_HOLD release."""
+        with self.lock:
+            owner = self.release(reason)
+            self.expired[owner] = reason
+
+    def drop(self, cid):
+        """The service side closes a connection (for example, a service restart)."""
+        self.sockets[cid].shutdown(socket.SHUT_RDWR)
+
+    def key_connections(self):
+        with self.lock:
+            return sorted({cid for cid, line in self.events if line.startswith("KEY_")})
+
+    def lines(self, cid=None):
+        """Commands (no STATUS) on every connection, or one connection's
+        commands and its CLOSE."""
+        with self.lock:
+            if cid is None:
+                return [line for c, line in self.events if line not in ("STATUS", "CLOSE")]
+            return [line for c, line in self.events if c == cid and line != "STATUS"]
+
+    def wait(self, predicate, timeout=4.0):
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() >= deadline:
+                raise AssertionError("condition not reached; events: %r" % self.events)
+            time.sleep(0.02)
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=2)
+        self.listener.close()
+        for client in list(self.sockets.values()):
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        for thread in self.threads:
+            thread.join(timeout=2)
+        Path(self.path).unlink(missing_ok=True)
+
+
 class DisabledControls(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -182,7 +353,7 @@ class GatewayTest(unittest.TestCase):
                        {"socket_path": socket_path,
                         "dev_mute_enabled": False, "https_origin": None, "sessions": {},
                         "log_message": lambda *args: None})
-        self.server = xs8_gateway.HTTPServer(("127.0.0.1", 0), handler)
+        self.server = xs8_gateway.GatewayHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever,
                                        daemon=True)
         self.thread.start()
@@ -287,12 +458,12 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(code, 200)
         parser = DisabledControls()
         parser.feed(body.decode())
-        self.assertEqual(len(parser.buttons), 13)
+        self.assertEqual(len(parser.buttons), 17)
         self.assertTrue(all("disabled" in button for button in parser.buttons))
         for path in ("/api/v1/source", "/api/v1/mute",
                      "/api/v1/receiver/query",
                      "/api/v1/volume/step", "/api/v1/cd/transport",
-                     "/api/v1/cd/track",
+                     "/api/v1/cd/track", "/api/v1/cd/playback", "/api/v1/cd/seek",
                      "/api/v1/status", "/anything"):
             code, _ = self.request("POST", path)
             self.assertEqual(code, 501)
@@ -1805,6 +1976,706 @@ class VolumeStepGatewayTest(GatewayTest):
                         xs8_gateway.parse_args(list(options))
 
 
+class CdPlaybackGatewayTest(GatewayTest):
+    def enable(self):
+        handler = self.server.RequestHandlerClass
+        handler.cd_playback_enabled = True
+        handler.https_origin = "https://woodland-pi.local"
+        self.server.proxy_peer_verified = True
+
+    def post(self, path, token, cookie, body, **overrides):
+        headers = {"Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+                   "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": token,
+                   "Cookie": cookie, "Content-Type": "application/json"}
+        headers.update(overrides.pop("headers", {}))
+        return self.request_full("POST", path, body=body, headers=headers)
+
+    def playback(self, token, cookie, action="STOP", body=None):
+        return self.post("/api/v1/cd/playback", token, cookie,
+                         body if body is not None else json.dumps({"action": action}))
+
+    def dispatched(self, fake):
+        return [c for c in fake.commands if c.startswith(b"CD_")]
+
+    def elapse_interval(self):
+        state = getattr(self.server, "cd_track", None)
+        if state:
+            state["completed"] = float("-inf")
+
+    def test_gate_off_and_capabilities(self):
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                mute_reply=CD_TRANSPORT_OK)
+        self.assertEqual(self.playback("x", "x")[0], 501)
+        self.assertEqual(self.request("POST", "/api/v1/cd/transport")[0], 501)
+        operations = json.loads(self.request("GET", "/api/v1/capabilities")[1])["operations"]
+        self.assertFalse(operations["cd_playback"]["enabled"])
+        self.assertEqual(operations["cd_playback"]["available_actions"], ["PLAY_PAUSE", "STOP"])
+        self.assertEqual(operations["cd_playback"]["provisional_actions"], ["PLAY_PAUSE"])
+        self.assertIn("STOP", operations["cd_transport"]["blocked_actions"])
+        self.enable()
+        token, cookie = self.session()
+        code, body, _ = self.request_full("GET", "/api/v1/capabilities", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        fake.close()
+        operations = json.loads(body)["operations"]
+        self.assertTrue(operations["cd_playback"]["enabled"])
+        self.assertEqual(operations["cd_transport"]["blocked_actions"],
+                         ["SEEK_FORWARD", "SEEK_BACKWARD"])
+        self.assertFalse(operations["cd_transport"]["enabled"], "track gate stays separate")
+        self.assertEqual(self.dispatched(fake), [])
+
+    def test_actions_dispatch_one_exact_frame_command(self):
+        self.enable()
+        for action, command, provisional in (("PLAY_PAUSE", b"CD_PLAY_PAUSE\n", True),
+                                             ("STOP", b"CD_STOP\n", False)):
+            with self.subTest(action=action):
+                token, cookie = self.session()
+                self.elapse_interval()
+                fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                        mute_reply=CD_TRANSPORT_OK.replace(b"STOP", action.encode()))
+                code, body, _ = self.playback(token, cookie, action)
+                replay = self.playback(token, cookie, action)[0]
+                fake.close()
+                self.assertEqual(code, 200)
+                payload = json.loads(body)
+                self.assertEqual((payload["result"], payload["action"], payload["gpio_tx"],
+                                  payload["waveform"], payload["receiver_execution"]),
+                                 ("SERVICE_TX_OK", action, "TX_OK", "MATCH", "UNVERIFIED"))
+                self.assertIs(payload.get("mapping") == "PROVISIONAL", provisional)
+                self.assertEqual(fake.commands, [b"STATUS\n", command])
+                self.assertEqual(replay, 403)
+
+    def test_invalid_actions_never_dispatch(self):
+        self.enable()
+        token, cookie = self.session()
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                mute_reply=CD_TRANSPORT_OK)
+        for body in ('{"action":"PLAY"}', '{"action":"NEXT"}', '{"action":"stop"}',
+                     '{"action":"SEEK_FORWARD"}', '{"action":"STOP","x":1}', '{}', '[]'):
+            with self.subTest(body=body):
+                self.assertEqual(self.playback(token, cookie, body=body)[0], 400)
+        fake.close()
+        self.assertEqual(self.dispatched(fake), [])
+
+    def test_status_gating_and_shared_cd_spacing(self):
+        self.enable()
+        self.server.RequestHandlerClass.cd_track_enabled = True
+        for status, result in ((CD_HOLD_STATUS, "CD_BUSY"), (CD_FAULT_STATUS, "CD_FAULT_LATCHED"),
+                               (STATUS, "NOT_ELIGIBLE"),
+                               (CD_IDLE_STATUS.replace(b"OK state=IDLE", b"OK state=HOLDING_UP"),
+                                "NOT_ELIGIBLE")):
+            with self.subTest(result=result, status=status[-30:]):
+                token, cookie = self.session()
+                fake = RecordingService(self.socket_path, status=status, mute_reply=CD_TRANSPORT_OK)
+                code, body, _ = self.playback(token, cookie)
+                fake.close()
+                self.assertEqual((code, json.loads(body)["result"]), (409, result))
+                self.assertEqual(self.dispatched(fake), [])
+        # PREV/NEXT and playback share one CD lock and one completion interval.
+        self.server.RequestHandlerClass.cd_track_interval_ms = 1000
+        token, cookie = self.session()
+        self.elapse_interval()
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=CD_OK)
+        try:
+            self.assertEqual(self.post("/api/v1/cd/track", token, cookie,
+                                       json.dumps({"action": "NEXT"}))[0], 200)
+            code, body, _ = self.playback(self.fresh_token(cookie), cookie)
+            self.assertEqual((code, json.loads(body)["result"]), (429, "TOO_FAST"))
+            state = self.server.__dict__["cd_track"]
+            self.elapse_interval()
+            with state["lock"]:
+                code, body, _ = self.playback(self.fresh_token(cookie), cookie)
+            self.assertEqual((code, json.loads(body)["result"]), (409, "CD_BUSY"))
+        finally:
+            fake.close()
+        self.assertEqual(self.dispatched(fake), [b"CD_TRACK_NEXT\n"])
+
+    def fresh_token(self, cookie):
+        code, body, _ = self.request_full("GET", "/api/v1/session", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        return json.loads(body)["csrf_token"]
+
+    def test_uncertain_malformed_and_timeout_are_never_retried(self):
+        self.enable()
+        uncertain = (b"ERR CD_TRANSPORT_UNCERTAIN action=STOP gpio_tx=TX_OK waveform=MISSING "
+                     b"receiver_execution=UNVERIFIED\n")
+        for reply, code, result, check in (
+                (uncertain, 502, "SERVICE_UNCERTAIN", True),
+                (CD_TRANSPORT_OK.replace(b"action=STOP", b"action=PLAY_PAUSE"), 502,
+                 "INVALID_REPLY", True),
+                (CD_TRANSPORT_OK.replace(b"waveform=MATCH", b"waveform=MISSING"), 502,
+                 "INVALID_REPLY", True),
+                (CD_TRANSPORT_OK.replace(b" receiver_execution=UNVERIFIED", b""), 502,
+                 "INVALID_REPLY", True),
+                (b"ERR CD_FAULT_LATCHED\n", 409, "CD_FAULT_LATCHED", True),
+                (b"ERR CD_TRACK_BUSY\n", 409, "REJECTED", False),
+                (b"ERR UNKNOWN_COMMAND\n", 409, "REJECTED", False)):
+            with self.subTest(reply=reply):
+                token, cookie = self.session()
+                self.elapse_interval()
+                fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=reply)
+                status, body, _ = self.playback(token, cookie)
+                fake.close()
+                payload = json.loads(body)
+                self.assertEqual((status, payload["result"]), (code, result))
+                self.assertIs(payload["physical_check_required"], check)
+                self.assertNotIn("csrf_token", payload)
+                self.assertEqual(self.dispatched(fake), [b"CD_STOP\n"])
+        token, cookie = self.session()
+        self.elapse_interval()
+        with mock.patch.object(xs8_gateway, "read_status", return_value={
+                "state": "IDLE", "monitor": "HEALTHY", "stop_owed": "0",
+                "context_may_be_open": "0", "cd_state": "IDLE", "cd_release_owed": "0"}):
+            fake = FakeService(self.socket_path, CD_TRANSPORT_OK, delay=0.3)
+            original = xs8_gateway.send_cd_playback
+            with mock.patch.object(xs8_gateway, "send_cd_playback", side_effect=lambda path, a:
+                                   original(path, a, timeout=0.1)) as dispatch:
+                code, body, _ = self.playback(token, cookie)
+            fake.close()
+        self.assertEqual((code, json.loads(body)["result"]), (504, "TIMEOUT"))
+        self.assertTrue(json.loads(body)["physical_check_required"])
+        dispatch.assert_called_once()
+        self.assertEqual(fake.commands, [b"CD_STOP\n"])
+
+    def test_cli_gates(self):
+        base = ["--systemd-socket", "--nginx-uid", "33", "--https-origin",
+                "https://woodland-pi.local"]
+        for flag, name in (("--enable-cd-playback", "enable_cd_playback"),
+                           ("--enable-cd-seek", "enable_cd_seek")):
+            with self.subTest(flag=flag):
+                self.assertTrue(getattr(xs8_gateway.parse_args([flag] + base), name))
+                self.assertFalse(getattr(xs8_gateway.parse_args([]), name))
+                self.assertFalse(getattr(xs8_gateway.parse_args(["--enable-cd-track"] + base), name))
+                for options in ([flag], [flag, "--systemd-socket", "--nginx-uid", "33"],
+                                [flag] + base + ["--socket", self.socket_path],
+                                [flag, "--enable-offline-mute"] + base +
+                                ["--socket", self.socket_path]):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit):
+                            xs8_gateway.parse_args(options)
+
+
+class CdSeekGatewayTest(CdPlaybackGatewayTest):
+    """Web CD seek on one persistent, connection-owned service socket."""
+
+    def enable(self):
+        handler = self.server.RequestHandlerClass
+        handler.cd_seek_enabled = True
+        handler.https_origin = "https://woodland-pi.local"
+        self.server.proxy_peer_verified = True
+
+    def setUp(self):
+        super().setUp()
+        self.fake = None
+
+    def tearDown(self):
+        super().tearDown()
+        if self.fake is not None:
+            self.fake.close()
+
+    def service(self, **kwargs):
+        self.fake = KeyService(self.socket_path, **kwargs)
+        return self.fake
+
+    def seek(self, token, cookie, body):
+        code, raw, headers = self.post("/api/v1/cd/seek", token, cookie, json.dumps(body))
+        return code, json.loads(raw), raw, headers
+
+    def start(self, token, cookie, direction="FORWARD"):
+        self.elapse_interval()
+        return self.seek(token, cookie, {"action": "START", "direction": direction})
+
+    def hold(self):
+        return self.server.__dict__.get("cd_seek", {}).get("hold")
+
+    def hold_connection(self):
+        connections = self.fake.key_connections()
+        self.assertEqual(len(connections), 1, "exactly one owning service connection")
+        return connections[0]
+
+    def session_object(self, cookie):
+        return self.server.RequestHandlerClass.sessions[cookie.split("=", 1)[1]]
+
+    # Inherited playback tests do not apply to this class.
+    test_gate_off_and_capabilities = None
+    test_actions_dispatch_one_exact_frame_command = None
+    test_invalid_actions_never_dispatch = None
+    test_status_gating_and_shared_cd_spacing = None
+    test_uncertain_malformed_and_timeout_are_never_retried = None
+    test_cli_gates = None
+
+    def test_gate_off_and_capabilities_report_seek(self):
+        fake = self.service()
+        self.assertEqual(self.post("/api/v1/cd/seek", "x", "x", "{}")[0], 501)
+        operations = json.loads(self.request("GET", "/api/v1/capabilities")[1])["operations"]
+        self.assertFalse(operations["cd_seek"]["enabled"])
+        self.enable()
+        token, cookie = self.session()
+        code, body, _ = self.request_full("GET", "/api/v1/capabilities", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        seek = json.loads(body)["operations"]["cd_seek"]
+        self.assertEqual((seek["enabled"], seek["available_directions"], seek["heartbeat_ms"],
+                          seek["lease_ms"], seek["max_hold_ms"]),
+                         (True, ["FORWARD", "BACKWARD"], 500, 1200, 10000))
+        self.assertEqual(fake.lines(), [])
+
+    def test_persistent_connection_lifecycle(self):
+        """START: one KEY_DOWN on a new socket that stays open. HEARTBEAT: the same
+        KEY_DOWN on that socket (no new press). RELEASE: KEY_UP, then close."""
+        self.enable()
+        logged = []
+        self.server.RequestHandlerClass.log_message = (
+            lambda handler, fmt, *args: logged.append(fmt % args))
+        for direction, action, press in (("FORWARD", "SEEK_FORWARD", "0x7A"),
+                                         ("BACKWARD", "SEEK_BACKWARD", "0x6A")):
+            with self.subTest(direction=direction):
+                fake = self.service()
+                token, cookie = self.session()
+                code, payload, raw, headers = self.start(token, cookie, direction)
+                self.assertEqual(code, 200)
+                self.assertEqual((payload["result"], payload["direction"], payload["gpio_tx"],
+                                  payload["waveform"], payload["receiver_execution"]),
+                                 ("SEEK_STARTED", direction, "TX_OK", "MATCH", "UNVERIFIED"))
+                self.assertNotIn(b"hold_token", raw)
+                hold_id = payload["hold_id"]
+                owner = self.hold_connection()
+                # Kept referenced so only an explicit close (not garbage
+                # collection) can end the service connection.
+                connection = self.hold()["connection"]
+                self.assertFalse(connection.closed)
+                self.assertEqual(self.post("/api/v1/cd/seek", token, cookie, "{}")[0], 403)
+                token = payload["csrf_token"]
+                for _ in range(3):
+                    code, payload, _, _ = self.seek(token, cookie,
+                                                    {"action": "HEARTBEAT", "hold_id": hold_id})
+                    self.assertEqual((code, payload["result"]), (200, "LEASE_RENEWED"))
+                    token = payload["csrf_token"]
+                self.assertEqual(fake.tx, [press], "heartbeats never press again")
+                code, payload, _, _ = self.seek(token, cookie,
+                                                {"action": "RELEASE", "hold_id": hold_id})
+                self.assertEqual((code, payload["result"], payload["waveform"]),
+                                 (200, "RELEASED", "MATCH"))
+                fake.wait(lambda: (owner, "CLOSE") in fake.events)
+                self.assertTrue(connection.closed)
+                self.assertEqual(fake.lines(owner), [f"KEY_DOWN {action}"] * 4 +
+                                 [f"KEY_UP {action}", "CLOSE"])
+                self.assertEqual(fake.tx, [press, "0x72"])
+                self.assertEqual(fake.key_connections(), [owner], "never reconnected")
+                self.assertIsNone(self.hold())
+                fake.close()
+                self.fake = None
+        log = "\n".join(logged)
+        self.assertIn("CD_SEEK action=START code=200 result=SEEK_STARTED", log)
+        self.assertNotIn(hold_id, log)
+
+    def test_lost_start_response_release_needs_no_hold_id(self):
+        self.enable()
+        fake = self.service()
+        token, cookie = self.session()
+        self.assertEqual(self.start(token, cookie)[0], 200)  # Response discarded.
+        owner = self.hold_connection()
+        connection = self.hold()["connection"]  # Only an explicit close may end it.
+        code, payload, _, _ = self.seek(self.fresh_token(cookie), cookie, {"action": "RELEASE"})
+        self.assertEqual((code, payload["result"]), (200, "RELEASED"))
+        fake.wait(lambda: (owner, "CLOSE") in fake.events)
+        self.assertTrue(connection.closed)
+        code, payload, _, _ = self.seek(payload["csrf_token"], cookie, {"action": "RELEASE"})
+        self.assertEqual((code, payload["result"]), (200, "NOT_ACTIVE"))
+        self.assertEqual(fake.lines(owner), ["KEY_DOWN SEEK_FORWARD", "KEY_UP SEEK_FORWARD", "CLOSE"])
+        self.assertEqual(fake.tx, ["0x7A", "0x72"])
+
+    def test_undelivered_start_response_closes_the_connection(self):
+        self.enable()
+        fake = self.service()
+        token, cookie = self.session()
+        original = xs8_gateway.GatewayHandler.send_json
+
+        def broken(handler, code, payload, headers=None):
+            if payload.get("result") == "SEEK_STARTED":
+                raise BrokenPipeError("browser went away")
+            return original(handler, code, payload, headers)
+
+        with mock.patch.object(xs8_gateway.GatewayHandler, "send_json", broken):
+            self.elapse_interval()
+            with self.assertRaises(Exception):
+                self.seek(token, cookie, {"action": "START", "direction": "FORWARD"})
+        owner = self.hold_connection()
+        fake.wait(lambda: (owner, "CLOSE") in fake.events)
+        self.assertEqual(fake.tx, ["0x7A", "0x72"], "released by closing the socket")
+        self.assertEqual(fake.last, "CLIENT_DISCONNECT")
+        self.assertIsNone(self.hold())
+
+    def test_connection_loss_during_hold_is_never_reconnected(self):
+        self.enable()
+        fake = self.service()
+        token, cookie = self.session()
+        _, payload, _, _ = self.start(token, cookie)
+        hold_id = payload["hold_id"]
+        owner = self.hold_connection()
+        fake.drop(owner)
+        fake.wait(lambda: (owner, "CLOSE") in fake.events)
+        self.assertEqual(fake.tx, ["0x7A", "0x72"])
+        code, payload, _, _ = self.seek(payload["csrf_token"], cookie,
+                                        {"action": "HEARTBEAT", "hold_id": hold_id})
+        self.assertEqual((code, payload["result"]), (502, "DISCONNECTED"))
+        self.assertTrue(payload["physical_check_required"])
+        self.assertIsNone(self.hold())
+        code, payload, _, _ = self.seek(payload["csrf_token"], cookie, {"action": "RELEASE"})
+        self.assertEqual((code, payload["result"]), (200, "NOT_ACTIVE"))
+        self.assertEqual(fake.key_connections(), [owner], "no new connection")
+        self.assertEqual(sum(line.startswith("KEY_DOWN") for line in fake.lines()), 1)
+        self.assertEqual(fake.tx, ["0x7A", "0x72"])
+
+    def test_browser_inactivity_closes_the_connection(self):
+        self.enable()
+        fake = self.service()
+        token, cookie = self.session()
+        _, payload, _, _ = self.start(token, cookie)
+        owner = self.hold_connection()
+        started = time.monotonic()
+        fake.wait(lambda: (owner, "CLOSE") in fake.events)
+        self.assertGreaterEqual(time.monotonic() - started, 1.2)
+        self.assertEqual(fake.tx, ["0x7A", "0x72"])
+        self.assertIsNone(self.hold())
+        code, payload, _, _ = self.seek(payload["csrf_token"], cookie,
+                                        {"action": "HEARTBEAT", "hold_id": payload["hold_id"]})
+        self.assertEqual((code, payload["result"]), (409, "NOT_ACTIVE"))
+        self.assertEqual(fake.lines(owner), ["KEY_DOWN SEEK_FORWARD", "CLOSE"])
+
+    def test_session_expiry_or_invalidation_closes_the_connection(self):
+        self.enable()
+        for invalidate in ("expire", "remove"):
+            with self.subTest(invalidate=invalidate):
+                fake = self.service()
+                token, cookie = self.session()
+                self.start(token, cookie)
+                owner = self.hold_connection()
+                if invalidate == "expire":
+                    self.session_object(cookie)["expires"] = 0
+                else:
+                    del self.server.RequestHandlerClass.sessions[cookie.split("=", 1)[1]]
+                fake.wait(lambda: (owner, "CLOSE") in fake.events, timeout=1.4)
+                self.assertEqual(fake.tx, ["0x7A", "0x72"])
+                self.assertIsNone(self.hold())
+                fake.close()
+                self.fake = None
+
+    def test_absolute_max_hold_closes_the_connection(self):
+        self.enable()
+        fake = self.service()
+        token, cookie = self.session()
+        _, payload, _, _ = self.start(token, cookie)
+        owner = self.hold_connection()
+        # A heartbeat at the maximum is not forwarded; the connection closes.
+        self.hold()["started"] -= 10.0
+        code, payload, _, _ = self.seek(payload["csrf_token"], cookie,
+                                        {"action": "HEARTBEAT", "hold_id": payload["hold_id"]})
+        self.assertEqual((code, payload["result"], payload["reason"]),
+                         (409, "NOT_ACTIVE", "MAX_HOLD"))
+        fake.wait(lambda: (owner, "CLOSE") in fake.events)
+        self.assertEqual(fake.lines(owner), ["KEY_DOWN SEEK_FORWARD", "CLOSE"])
+        # The cleanup loop enforces the maximum even while heartbeats continue.
+        self.fake.close()
+        fake = self.service()
+        _, payload, _, _ = self.start(payload["csrf_token"], cookie)
+        second = self.hold_connection()
+        self.hold()["started"] -= 10.0
+        self.hold()["browser_seen"] = time.monotonic() + 60
+        fake.wait(lambda: (second, "CLOSE") in fake.events, timeout=1.4)
+        self.assertEqual(fake.tx, ["0x7A", "0x72"])
+
+    def test_late_heartbeat_after_service_expiry_never_restarts(self):
+        self.enable()
+        fake = self.service()
+        token, cookie = self.session()
+        _, payload, _, _ = self.start(token, cookie)
+        owner = self.hold_connection()
+        fake.expire("INACTIVITY")
+        code, payload, _, _ = self.seek(payload["csrf_token"], cookie,
+                                        {"action": "HEARTBEAT", "hold_id": payload["hold_id"]})
+        self.assertEqual((code, payload["result"], payload["cd_last_result"]),
+                         (409, "NOT_ACTIVE", "INACTIVITY"))
+        fake.wait(lambda: (owner, "CLOSE") in fake.events)
+        self.assertEqual(fake.tx, ["0x7A", "0x72"], "no second press")
+        self.assertEqual(fake.lines(owner), ["KEY_DOWN SEEK_FORWARD", "KEY_DOWN SEEK_FORWARD",
+                                             "CLOSE"])
+        self.assertIsNone(self.hold())
+
+    def test_stale_hold_ids_and_other_sessions_never_touch_the_socket(self):
+        self.enable()
+        fake = self.service()
+        token, cookie = self.session()
+        _, payload, _, _ = self.start(token, cookie)
+        hold_id, mine = payload["hold_id"], payload["csrf_token"]
+        owner = self.hold_connection()
+        other_token, other_cookie = self.session()
+        for body in ({"action": "HEARTBEAT", "hold_id": hold_id},
+                     {"action": "RELEASE", "hold_id": hold_id}, {"action": "RELEASE"}):
+            code, payload, _, _ = self.seek(other_token, other_cookie, body)
+            other_token = payload["csrf_token"]
+            self.assertIn((code, payload["result"]), ((409, "NOT_ACTIVE"), (200, "NOT_ACTIVE")))
+        code, payload, _, _ = self.seek(mine, cookie, {"action": "HEARTBEAT",
+                                                       "hold_id": "stale-hold"})
+        self.assertEqual((code, payload["result"]), (409, "NOT_ACTIVE"))
+        code, payload, _, _ = self.seek(payload["csrf_token"], cookie,
+                                        {"action": "RELEASE", "hold_id": "stale-hold"})
+        self.assertEqual((code, payload["result"]), (409, "NOT_OWNER"))
+        self.assertEqual(fake.lines(owner), ["KEY_DOWN SEEK_FORWARD"])
+        self.assertIsNotNone(self.hold())
+        code, payload, _, _ = self.seek(payload["csrf_token"], cookie,
+                                        {"action": "RELEASE", "hold_id": hold_id})
+        self.assertEqual(payload["result"], "RELEASED")
+        # The finished hold's id cannot release a newer hold.
+        _, payload, _, _ = self.start(payload["csrf_token"], cookie)
+        code, payload, _, _ = self.seek(payload["csrf_token"], cookie,
+                                        {"action": "RELEASE", "hold_id": hold_id})
+        self.assertEqual((code, payload["result"]), (409, "NOT_OWNER"))
+        self.assertIsNotNone(self.hold())
+        self.assertEqual(fake.tx, ["0x7A", "0x72", "0x7A"])
+
+    def test_gateway_shutdown_closes_the_connection(self):
+        self.enable()
+        fake = self.service()
+        token, cookie = self.session()
+        self.start(token, cookie)
+        owner = self.hold_connection()
+        self.server.shutdown()
+        self.server.server_close()
+        fake.wait(lambda: (owner, "CLOSE") in fake.events)
+        self.assertEqual(fake.tx, ["0x7A", "0x72"])
+        self.assertEqual(fake.last, "CLIENT_DISCONNECT")
+
+    def test_mutual_exclusion_with_other_cd_actions(self):
+        self.enable()
+        handler = self.server.RequestHandlerClass
+        handler.cd_track_enabled = True
+        handler.cd_playback_enabled = True
+        fake = self.service()
+        token, cookie = self.session()
+        _, payload, _, _ = self.start(token, cookie)
+        token = payload["csrf_token"]
+        for path, body in (("/api/v1/cd/track", {"action": "NEXT"}),
+                           ("/api/v1/cd/playback", {"action": "STOP"})):
+            self.elapse_interval()
+            code, raw, _ = self.post(path, token, cookie, json.dumps(body))
+            self.assertEqual((code, json.loads(raw)["result"]), (409, "CD_BUSY"))
+            token = self.fresh_token(cookie)
+        code, payload, _, _ = self.start(token, cookie, "BACKWARD")
+        self.assertEqual((code, payload["result"]), (409, "CD_BUSY"))
+        self.assertEqual(fake.lines(), ["KEY_DOWN SEEK_FORWARD"])
+        # If the service ended the hold on its own, the dead connection is
+        # closed and a new START is allowed.
+        fake.expire("INACTIVITY")
+        first = self.hold_connection()
+        code, payload, _, _ = self.start(payload["csrf_token"], cookie, "BACKWARD")
+        self.assertEqual(code, 200)
+        fake.wait(lambda: (first, "CLOSE") in fake.events)
+        self.assertEqual(fake.tx, ["0x7A", "0x72", "0x6A"])
+
+    def test_start_failures_close_the_connection_and_never_retry(self):
+        self.enable()
+        uncertain = (b"ERR KEY_DOWN_UNCERTAIN action=SEEK_FORWARD gpio_tx=TX_OK "
+                     b"waveform=MISSING release_gpio_tx=TX_OK release_waveform=MATCH "
+                     b"receiver_execution=UNVERIFIED\n")
+        ok = (b"OK KEY_DOWN_TX action=SEEK_FORWARD gpio_tx=TX_OK waveform=MATCH "
+              b"receiver_execution=UNVERIFIED\n")
+        for reply, code, result, check in (
+                (uncertain, 502, "SERVICE_UNCERTAIN", True),
+                (ok.replace(b"waveform=MATCH", b"waveform=MISSING"), 502, "INVALID_REPLY", True),
+                (ok.replace(b"SEEK_FORWARD", b"SEEK_BACKWARD"), 502, "INVALID_REPLY", True),
+                (ok.replace(b"\n", b"\nOK EXTRA\n"), 502, "INVALID_REPLY", True),
+                (b"ERR KEY_BUSY\n", 409, "REJECTED", False),
+                (b"ERR KEY_EXPIRED last=INACTIVITY\n", 409, "REJECTED", False),
+                (b"ERR CD_FAULT_LATCHED\n", 409, "CD_FAULT_LATCHED", True),
+                (None, 502, "DISCONNECTED", True)):
+            with self.subTest(reply=reply):
+                fake = self.service()
+                fake.script["KEY_DOWN"] = [reply]
+                token, cookie = self.session()
+                status, payload, _, _ = self.start(token, cookie)
+                self.assertEqual((status, payload["result"]), (code, result))
+                self.assertIs(payload["physical_check_required"], check)
+                self.assertEqual(payload["receiver_execution"], "UNVERIFIED")
+                self.assertIn("csrf_token", payload)
+                self.assertIsNone(self.hold())
+                owner = self.hold_connection()
+                fake.wait(lambda: (owner, "CLOSE") in fake.events)
+                self.assertEqual(fake.lines(owner), ["KEY_DOWN SEEK_FORWARD", "CLOSE"])
+                fake.close()
+                self.fake = None
+        # Reply timeout: closed (the service releases any press), not retried.
+        fake = self.service()
+        ok_line = ok
+        fake.script["KEY_DOWN"] = [("delay", 0.5, ok_line)]
+        original = xs8_gateway.ServiceConnection.exchange
+        token, cookie = self.session()
+        with mock.patch.object(xs8_gateway.ServiceConnection, "exchange",
+                               lambda conn, line, timeout, max_reply=512:
+                               original(conn, line, 0.1, max_reply)):
+            status, payload, _, _ = self.start(token, cookie)
+        self.assertEqual((status, payload["result"]), (504, "TIMEOUT"))
+        self.assertTrue(payload["physical_check_required"])
+        owner = self.hold_connection()
+        fake.wait(lambda: (owner, "CLOSE") in fake.events)
+        self.assertEqual(fake.lines(owner), ["KEY_DOWN SEEK_FORWARD", "CLOSE"])
+        fake.close()
+        self.fake = None
+        # No service at all.
+        token, cookie = self.session()
+        self.elapse_interval()
+        with mock.patch.object(xs8_gateway, "read_status", return_value={
+                "state": "IDLE", "monitor": "HEALTHY", "stop_owed": "0",
+                "context_may_be_open": "0", "cd_state": "IDLE", "cd_release_owed": "0"}):
+            status, payload, _, _ = self.start(token, cookie)
+        self.assertEqual((status, payload["result"]), (503, "UNAVAILABLE"))
+        self.assertFalse(payload["physical_check_required"])
+
+    def test_release_and_heartbeat_faults_close_the_connection(self):
+        self.enable()
+        uncertain = (b"ERR KEY_UP_UNCERTAIN action=SEEK_FORWARD gpio_tx=TX_OK "
+                     b"waveform=MISSING receiver_execution=UNVERIFIED\n")
+        for verb, reply, code, result in (
+                ("KEY_UP", uncertain, 502, "SERVICE_UNCERTAIN"),
+                ("KEY_UP", b"OK KEY_UP_TX action=SEEK_FORWARD\n", 502, "INVALID_REPLY"),
+                ("KEY_UP", None, 502, "DISCONNECTED"),
+                ("HEARTBEAT", b"OK KEY_ALIVE action=SEEK_BACKWARD\n", 502, "INVALID_REPLY"),
+                ("HEARTBEAT", b"ERR KEY_BUSY\n", 502, "INVALID_REPLY"),
+                ("HEARTBEAT", None, 502, "DISCONNECTED")):
+            with self.subTest(verb=verb, reply=reply):
+                fake = self.service()
+                token, cookie = self.session()
+                _, payload, _, _ = self.start(token, cookie)
+                owner = self.hold_connection()
+                fake.script["KEY_UP" if verb == "KEY_UP" else "KEY_DOWN"] = [reply]
+                body = ({"action": "RELEASE", "hold_id": payload["hold_id"]} if verb == "KEY_UP"
+                        else {"action": "HEARTBEAT", "hold_id": payload["hold_id"]})
+                status, payload, _, _ = self.seek(payload["csrf_token"], cookie, body)
+                self.assertEqual((status, payload["result"]), (code, result))
+                self.assertTrue(payload["physical_check_required"])
+                self.assertIsNone(self.hold())
+                fake.wait(lambda: (owner, "CLOSE") in fake.events)
+                # Closing released whatever the scripted reply left held; nothing resent.
+                self.assertEqual(sum(l.startswith("KEY_UP") for l in fake.lines()),
+                                 1 if verb == "KEY_UP" else 0)
+                self.assertEqual(fake.key_connections(), [owner])
+                self.assertIsNone(fake.hold)
+                fake.close()
+                self.fake = None
+
+    def test_invalid_bodies_never_contact_the_service(self):
+        self.enable()
+        fake = self.service()
+        token, cookie = self.session()
+        for body in ('{"action":"START"}', '{"action":"START","direction":"UP"}',
+                     '{"action":"START","direction":"FORWARD","x":"1"}',
+                     '{"action":"HEARTBEAT"}', '{"action":"HEARTBEAT","hold_id":""}',
+                     '{"action":"HEARTBEAT","hold_id":"a b"}', '{"action":"HEARTBEAT","hold_id":1}',
+                     '{"action":"RELEASE","action":"RELEASE"}', '{"action":"STOP"}', '{}', '[]',
+                     '"RELEASE"', 'x'):
+            with self.subTest(body=body):
+                self.assertEqual(self.post("/api/v1/cd/seek", token, cookie, body)[0], 400)
+        # A 400 is rejected before the token is consumed.
+        self.assertEqual(self.seek(token, cookie, {"action": "RELEASE"})[0], 200)
+        self.assertEqual(fake.lines(), [])
+
+
+class RealServiceSeekTest(CdSeekGatewayTest):
+    """The Gateway against the real XS8 Service socket loop (fake GPIO backend)."""
+
+    BINARY = Path(__file__).resolve().parent.parent / ".build" / "xs8_service_socket_test"
+
+    def setUp(self):
+        if not self.BINARY.exists():
+            self.skipTest("run make test first to build the service socket test binary")
+        super().setUp()
+        self.log_path = Path(self.temp.name) / "service.log"
+        self.log = self.log_path.open("w")
+        self.process = subprocess.Popen(
+            [str(self.BINARY), "--socket", self.socket_path, "--allow-unrecovered-start"],
+            stdout=subprocess.DEVNULL, stderr=self.log)
+        deadline = time.monotonic() + 3
+        while not Path(self.socket_path).exists():
+            self.assertLess(time.monotonic(), deadline, "service did not start")
+            time.sleep(0.01)
+
+    def tearDown(self):
+        super().tearDown()
+        if self.process.poll() is None:
+            self.process.terminate()
+            self.process.wait(timeout=3)
+        self.log.close()
+
+    def transmitted(self):
+        return re.findall(r"^FAKE_TX (0x[0-9A-F]{2})$", self.log_path.read_text(), re.M)
+
+    def wait_tx(self, expected, timeout=3):
+        deadline = time.monotonic() + timeout
+        while self.transmitted() != expected:
+            self.assertLess(time.monotonic(), deadline, self.transmitted())
+            time.sleep(0.02)
+
+    # Fake-specific tests do not apply.
+    for _name in [n for n in dir(CdSeekGatewayTest) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name
+
+    def test_real_service_start_keepalive_release(self):
+        self.enable()
+        token, cookie = self.session()
+        code, payload, _, _ = self.start(token, cookie, "BACKWARD")
+        self.assertEqual((code, payload["result"]), (200, "SEEK_STARTED"), payload)
+        hold_id = payload["hold_id"]
+        for _ in range(3):
+            time.sleep(0.4)
+            code, payload, _, _ = self.seek(payload["csrf_token"], cookie,
+                                            {"action": "HEARTBEAT", "hold_id": hold_id})
+            self.assertEqual((code, payload["result"]), (200, "LEASE_RENEWED"), payload)
+        self.assertEqual(self.transmitted(), ["0x6A"])
+        code, payload, _, _ = self.seek(payload["csrf_token"], cookie,
+                                        {"action": "RELEASE", "hold_id": hold_id})
+        self.assertEqual((code, payload["result"], payload["waveform"]),
+                         (200, "RELEASED", "MATCH"), payload)
+        self.assertEqual(self.transmitted(), ["0x6A", "0x72"])
+        self.assertIn("cd_last_result=CLIENT_RELEASE", self.service_status())
+
+    def service_status(self):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(1)
+            client.connect(self.socket_path)
+            client.sendall(b"STATUS\n")
+            reply = b""
+            while not reply.endswith(b"\n"):
+                reply += client.recv(1024)
+            return reply.decode()
+
+    def test_real_service_releases_on_gateway_shutdown_and_expiry(self):
+        self.enable()
+        token, cookie = self.session()
+        code, payload, _, _ = self.start(token, cookie)
+        self.assertEqual(code, 200, payload)
+        self.server.shutdown()
+        self.server.server_close()
+        self.wait_tx(["0x7A", "0x72"])
+        self.assertIn("cd_last_result=CLIENT_DISCONNECT", self.service_status())
+
+    def test_real_service_inactivity_then_late_heartbeat(self):
+        self.enable()
+        token, cookie = self.session()
+        _, payload, _, _ = self.start(token, cookie)
+        # Hold the Gateway's own cleanup off so the service's 1200 ms
+        # inactivity limit acts first, then send a late heartbeat.
+        self.hold()["browser_seen"] = time.monotonic() + 60
+        self.wait_tx(["0x7A", "0x72"])
+        self.assertIn("cd_last_result=INACTIVITY", self.service_status())
+        code, payload, _, _ = self.seek(payload["csrf_token"], cookie,
+                                        {"action": "HEARTBEAT", "hold_id": payload["hold_id"]})
+        self.assertEqual((code, payload["result"], payload["cd_last_result"]),
+                         (409, "NOT_ACTIVE", "INACTIVITY"))
+        time.sleep(0.3)
+        self.assertEqual(self.transmitted(), ["0x7A", "0x72"], "never a second press")
+        self.assertIsNone(self.hold())
+
+
 class BindingTest(unittest.TestCase):
     def parse_error(self, *args):
         with contextlib.redirect_stderr(io.StringIO()) as output:
@@ -1924,7 +2795,7 @@ class BindingTest(unittest.TestCase):
 
     def test_lan_startup_uses_requested_address_and_warns(self):
         server = mock.Mock(server_port=8080)
-        with mock.patch.object(xs8_gateway, "HTTPServer", return_value=server) as factory:
+        with mock.patch.object(xs8_gateway, "GatewayHTTPServer", return_value=server) as factory:
             with contextlib.redirect_stderr(io.StringIO()) as warning:
                 with contextlib.redirect_stdout(io.StringIO()):
                     xs8_gateway.main([
@@ -2282,7 +3153,7 @@ class ActivatedGatewayTest(unittest.TestCase):
         server = mock.Mock()
         with mock.patch.object(xs8_gateway, "systemd_listener") as inherited, \
              mock.patch.object(xs8_gateway, "ActivatedUnixServer", return_value=server), \
-             mock.patch.object(xs8_gateway, "HTTPServer") as tcp:
+             mock.patch.object(xs8_gateway, "GatewayHTTPServer") as tcp:
             with contextlib.redirect_stdout(io.StringIO()):
                 xs8_gateway.main(["--systemd-socket", "--nginx-uid", "33"])
         inherited.assert_called_once()
@@ -2294,7 +3165,7 @@ class ActivatedGatewayTest(unittest.TestCase):
         server = mock.Mock()
         with mock.patch.object(xs8_gateway, "systemd_listener") as inherited, \
              mock.patch.object(xs8_gateway, "ActivatedUnixServer", return_value=server) as unix, \
-             mock.patch.object(xs8_gateway, "HTTPServer") as tcp:
+             mock.patch.object(xs8_gateway, "GatewayHTTPServer") as tcp:
             with contextlib.redirect_stdout(io.StringIO()):
                 xs8_gateway.main(["--systemd-socket", "--nginx-uid", "33",
                                   "--enable-offline-mute", "--https-origin",

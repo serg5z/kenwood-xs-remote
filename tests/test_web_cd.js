@@ -5,7 +5,10 @@ const vm = require('node:vm');
 const html = fs.readFileSync('web/index.html', 'utf8');
 assert.match(html, /id="cd-previous" disabled type="button" data-cd-action="PREVIOUS"/);
 assert.match(html, /id="cd-next" disabled type="button" data-cd-action="NEXT"/);
-assert.doesNotMatch(html, /PLAY \/ PAUSE|aria-label="Stop"|aria-label="Play or pause"/);
+// PLAY/PAUSE, STOP and FF/REW have their own data attributes and endpoints;
+// only PREV/NEXT use the CD track path.
+assert.match(html, /id="cd-play-pause" disabled type="button" data-cd-playback="PLAY_PAUSE"/);
+assert.match(html, /id="cd-stop" disabled type="button" data-cd-playback="STOP"/);
 assert.equal((html.match(/data-cd-action=/g) || []).length, 2);
 
 const posts = [];
