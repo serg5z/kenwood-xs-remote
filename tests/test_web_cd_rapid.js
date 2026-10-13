@@ -59,19 +59,20 @@ async function settle() { for (let i = 0; i < 8; i += 1) await new Promise(setIm
 const actions = (env) => env.posts.map((post) => post.body.action);
 const tokensDistinct = (env) => new Set(env.posts.map((post) => post.token)).size === env.posts.length;
 
-async function twoPreviousTaps() {
+async function twoTapsAfterInterval() {
+  // Generic spacing; a quick PREV pair is a double-PREV gesture (test_web_cd_prev_gesture.js).
   const env = load(250);
   await settle();
-  const prev = env.cd['cd-previous'];
-  await prev.click();
+  const next = env.cd['cd-next'];
+  await next.click();
   assert.equal(env.posts.length, 1);
-  assert.equal(prev.disabled, false, 'fresh token restores the control');
+  assert.equal(next.disabled, false, 'fresh token restores the control');
   env.now += 249;
-  await prev.click();
+  await next.click();
   assert.equal(env.posts.length, 1, 'tap inside the completion interval is dropped');
   env.now += 1;
-  await prev.click();
-  assert.deepEqual(actions(env), ['PREVIOUS', 'PREVIOUS'], 'two separate PREVIOUS requests');
+  await next.click();
+  assert.deepEqual(actions(env), ['NEXT', 'NEXT'], 'two separate NEXT requests');
   assert.deepEqual(env.posts.map((post) => post.token), ['token-1', 'token-2']);
   env.now += 10000;
   await settle();
@@ -136,7 +137,7 @@ async function invalidIntervalFallsBackToOneSecond() {
 }
 
 async function main() {
-  await twoPreviousTaps();
+  await twoTapsAfterInterval();
   await intervalCountsFromCompletion();
   await serverTooFastIsReportedAndTokenRotates();
   await invalidIntervalFallsBackToOneSecond();

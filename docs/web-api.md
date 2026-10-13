@@ -92,7 +92,26 @@ Before dispatch the Gateway reads a fresh STATUS. It requires `state=IDLE`, a he
 
 The CD transport section shows only PREV and NEXT; PLAY/PAUSE and STOP were removed. Both buttons stay disabled unless the session reports `cd_track_available`, capabilities list the action, and the latest STATUS shows `cd_state=IDLE` with no owed RELEASE. Each click consumes the one-use CSRF token. Buttons stay disabled while a request is in flight and until the follow-up refresh delivers a fresh token; taps in that window are dropped, never queued. The client also ignores taps less than `min_interval_ms` after its previous CD request completed, using the value from capabilities; a missing or out-of-range value falls back to 1000 ms. Results read `NEXT TX VERIFIED · TRACK CHANGE UNVERIFIED`; failures say `CHECK CHANGER` when `physical_check_required` is set and `NOTHING SENT` otherwise; a network error reads `CD RESULT UNKNOWN · CHECK CHANGER`. While STATUS reports a CD fault, the status line shows `CD FAULT LATCHED · STOP AND INSPECT CHANGER` in place of other results. Connection details include the CD state, last CD result and an owed-RELEASE marker. PREVIOUS may restart the current track rather than move back, as observed in the validated setup.
 
-**One PREVIOUS tap vs two.** Each tap sends exactly one separate `CD_TRACK_PREVIOUS` pair (`0xEC → 100 ms → 0x72`). In the validated setup, a single pair restarted the current track. In one research trial, a second, separate pair sent shortly after the first moved to the preceding track. Moving back therefore takes **two intentional taps**, the second soon after the first. Whether the second tap restarts the track again or moves back is decided by the changer, probably from its playback position after the restart. That threshold has not been measured, so the Web Remote cannot guarantee it. The UI never turns one tap into two. It also has no double-press, hold-to-repeat or SEEK behavior, and every result remains `TRACK CHANGE UNVERIFIED`.
+**One PREVIOUS tap vs two.** Each command is one separate `CD_TRACK_PREVIOUS` pair (`0xEC → 100 ms → 0x72`). In attended validation, a single PREVIOUS restarted the current track and two successive PREVIOUS commands moved to the preceding track. The changer decides between restart and moving back, so every result remains `TRACK CHANGE UNVERIFIED`.
+
+**Double-PREV gesture.** A natural double tap is shorter than one command (about 331 ms of XS8 time; Web readiness was measured at 634 ms). So the browser accepts **one** explicit second PREV tap made within **800 ms** of the first PREV tap while that first operation is still running, cooling down or refreshing its token. During that time PREV stays clickable rather than `disabled`, so the tap reaches the page. The button gets a pending outline and the status line reads `PREV ×2 · SECOND PREV PENDING`. The browser sends the pending PREV once, through the normal request path, and only when all of these hold:
+
+- the first PREV returned 200 `SERVICE_TX_OK`;
+- at least `min_interval_ms` (250) has passed since it completed;
+- a refresh delivered a fresh CSRF token;
+- STATUS and capabilities still allow PREVIOUS;
+- the observed source has not changed since the first tap.
+
+The Gateway still runs all of its own checks (authorization, CSRF, a fresh STATUS read, its interval and the global lock) on that request.
+
+The pending tap is **cancelled, never retried**, if any of these happens:
+
+- the first PREV fails, is refused (409, 429), is uncertain (502), times out (504) or loses its connection. A timeout or network error still reads `CHECK CHANGER`, never "nothing sent";
+- STATUS, eligibility, connection or the observed source changes;
+- another control is used;
+- the page is hidden or unloaded.
+
+The pending tap exists only in page memory, so nothing replays after a reload or reconnect. A third or later tap during the gesture never adds a command; the status line shows `EXTRA TAP IGNORED`. After the second PREV finishes, whether it succeeded or failed, the gesture ends only after **800 ms with no further tap**. PREV stays clickable and NEXT stays disabled until then, and the second PREV's result stays visible. A continuing burst therefore never starts a third command. Without a second tap, a tap more than 800 ms after the first is a separate action. NEXT is never queued, and there is no automatic double-press, hold-to-repeat or SEEK. The CD timing row adds `prev queued · extra · cancelled` counts once a gesture has been used.
 
 ### CD track spacing (experimental)
 
@@ -109,7 +128,7 @@ The value is an experimental setting for attended testing. It is not an establis
 
 Not performed by this change. Follow the [source-selection rollout pattern](source-selection.md): review `systemctl cat kenwood-xs-gateway.service`, add **only** `--enable-cd-track` (and, for the attended spacing trial, optionally an explicit `--cd-track-interval-ms`) to the existing Gateway drop-in while preserving `--systemd-socket`, `--nginx-uid`, `--https-origin` and any existing gates, run `systemd-analyze verify`, and stop only the Gateway so the next authenticated request activates it. The deployed XS8 Service must be a build that implements `CD_TRACK_*` and the CD STATUS fields. Attend the first trials with the changer visible and physical recovery available. For rollback, remove the flag and confirm `/api/v1/cd/track` returns 501 and PREV/NEXT are disabled.
 
-Offline tests: `python3 -m unittest tests.test_gateway` (class `CdTrackGatewayTest`), `node tests/test_web_cd.js`, `node tests/test_web_cd_sequence.js` (consecutive fresh-token actions and duplicate browser events) and `node tests/test_web_cd_rapid.js` (two quick PREVIOUS taps, completion-based spacing, overlap and interval fallback). They use fake services and establish Gateway routing, parsing and refusal behavior only.
+Offline tests: `python3 -m unittest tests.test_gateway` (class `CdTrackGatewayTest`), `node tests/test_web_cd.js`, `node tests/test_web_cd_sequence.js` (consecutive fresh-token actions and duplicate browser events) `node tests/test_web_cd_rapid.js` (completion-based spacing, overlap and interval fallback), `node tests/test_web_cd_timing.js` and `node tests/test_web_cd_prev_gesture.js` (double-PREV gesture, cooldown, cancellation and no retry). They use fake services and establish Gateway routing, parsing and refusal behavior only.
 
 ## Future control API design (not implemented)
 

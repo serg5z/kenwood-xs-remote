@@ -91,9 +91,9 @@ async function main() {
   pending = null;
   assert.equal(posts[2].token, 'token-3');
 
-  // 3. Same-tick double click dispatches once.
+  // 3. Same-tick double click dispatches once (NEXT; PREV pairs are a gesture).
   now += 1000;
-  await Promise.all([cd['cd-previous'].click(), cd['cd-previous'].click()]);
+  await Promise.all([cd['cd-next'].click(), cd['cd-next'].click()]);
   assert.equal(posts.length, 4);
   assert.equal(posts[3].token, 'token-4');
 

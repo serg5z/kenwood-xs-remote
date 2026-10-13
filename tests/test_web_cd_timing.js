@@ -71,15 +71,15 @@ async function slowRefreshDominates() {
 async function fastRefreshWaitsForInterval() {
   const env = load({ postMs: 400, statusMs: 30, sessionMs: 30, capabilitiesMs: 30, intervalMs: 250 });
   await settle();
-  await env.cd['cd-previous'].click();
+  await env.cd['cd-next'].click();
   // Enabled 90 ms after completion; the 250 ms interval still blocks 160 ms more.
   assert.match(timing(env), /token 90 \(30\/30\/30\) · wait 160 · ready \+650 ms/);
-  await env.cd['cd-previous'].click();
+  await env.cd['cd-next'].click();
   assert.equal(env.posts, 1);
   assert.match(timing(env), /dropped busy 0 · interval 1 · disabled 0$/,
     'an enabled-looking button silently drops taps inside the interval');
   env.now += 160;
-  await env.cd['cd-previous'].click();
+  await env.cd['cd-next'].click();
   assert.equal(env.posts, 2);
 }
 
@@ -88,13 +88,13 @@ async function inFlightTapsAreCounted() {
   await settle();
   let release;
   env.gate = new Promise((done) => { release = done; });
-  const first = env.cd['cd-previous'].click();
+  const first = env.cd['cd-next'].click();
   await settle();
   assert.match(timing(env), /^POST … \(xs8 — · status —\)/);
-  env.cd['cd-previous'].disabled = false; // A click the browser still delivers.
-  await env.cd['cd-previous'].click();
-  env.cd['cd-previous'].disabled = true;
-  await env.cd['cd-previous'].click();
+  env.cd['cd-next'].disabled = false; // A click the browser still delivers.
+  await env.cd['cd-next'].click();
+  env.cd['cd-next'].disabled = true;
+  await env.cd['cd-next'].click();
   release();
   await first;
   assert.equal(env.posts, 1);

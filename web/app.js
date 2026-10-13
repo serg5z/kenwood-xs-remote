@@ -21,6 +21,15 @@ let lastCdCompleted = -Infinity;
 // Diagnostics only: the last CD tap's timeline and taps dropped by the guards.
 let cdTiming = null;
 const cdDropped = { busy: 0, interval: 0, disabled: 0 };
+const prevCounts = { queued: 0, extra: 0, cancelled: 0 };
+// Double PREV: the first PREV restarts the track; a second one moves back. One
+// explicit second tap within this window of the first may wait for the first
+// to complete, cool down and refresh its token. A later tap is a separate action.
+const PREV_DOUBLE_TAP_WINDOW_MS = 800;
+// { firstTap, lastTap, source, phase: 'first' | 'done' | 'second' | 'closing',
+//   pending, extra, timer, renderTimer }
+let prevGesture = null;
+let prevNote = null;
 let controlResult = null;
 let refreshController = null;
 let refreshVersion = 0;
@@ -33,17 +42,25 @@ function updateControls() {
     button.disabled = controlBusy || !csrfToken || !serviceReady || !sourceReady ||
       !enabledSources.includes(button.dataset.source);
   }
+  const gesture = prevGestureActive();
   for (const button of cdButtons) {
-    button.disabled = controlBusy || !csrfToken || !serviceReady || !cdReady ||
-      !enabledCdActions.includes(button.dataset.cdAction);
+    const receptive = gesture && button.dataset.cdAction === 'PREVIOUS';
+    // During a PREV gesture the PREV button stays clickable so a second tap reaches
+    // the handler; the handler, not the button state, decides whether to send.
+    button.disabled = !receptive && (controlBusy || !csrfToken || !serviceReady || !cdReady ||
+      !enabledCdActions.includes(button.dataset.cdAction) || !!gesture);
+    if (receptive && gesture.pending) button.dataset.pending = 'true';
+    else delete button.dataset.pending;
   }
   const available = !controlBusy && serviceReady && csrfToken &&
     (muteReady || sourceReady || queryReady || cdReady);
   // A latched CD fault needs physical attention; never hide it behind a result.
   text('availability-text', cdFault && !controlBusy
     ? 'CD FAULT LATCHED · STOP AND INSPECT CHANGER'
+    : gesture && prevNote && gesture.phase !== 'closing'
+    ? `PREV ×2 · ${prevNote}`
     : controlResult
-    ? `${controlResult}${available ? '' : ' · CONTROLS UNAVAILABLE'}`
+    ? `${controlResult}${prevNote ? ` · ${prevNote}` : ''}${available ? '' : ' · CONTROLS UNAVAILABLE'}`
     : (available ? 'CONTROLS READY · RECEIVER ACTION UNVERIFIED'
       : 'CONTROLS UNAVAILABLE · SERVICE OR AUTHORIZATION NOT READY'));
 }
@@ -116,6 +133,10 @@ function applyRefresh(statusData, sessionData, capabilitiesData) {
   queryReady = !!csrfToken && sessionData.receiver_query_available === true &&
     !!query && query.enabled === true;
   renderStatus(statusData);
+  if (prevGesture && prevGesture.pending && prevGesture.phase === 'done') {
+    const reason = prevBlocked(statusData);
+    if (reason) cancelPrev(reason);
+  }
   updateControls();
 }
 
@@ -139,8 +160,11 @@ function serverTiming(header) {
 
 function renderCdTiming() {
   const t = cdTiming;
+  const prev = prevCounts.queued || prevCounts.extra || prevCounts.cancelled
+    ? ` · prev queued ${prevCounts.queued} · extra ${prevCounts.extra}` +
+      ` · cancelled ${prevCounts.cancelled}` : '';
   const dropped = `dropped busy ${cdDropped.busy} · interval ${cdDropped.interval}` +
-    ` · disabled ${cdDropped.disabled}`;
+    ` · disabled ${cdDropped.disabled}${prev}`;
   if (!t) { text('cd-timing', dropped); return; }
   const parts = [`POST ${t.postMs ?? '…'} (xs8 ${t.server.xs8cd ?? '—'} · status ${t.server.xs8status ?? '—'})`];
   if (t.refresh) {
@@ -226,7 +250,9 @@ function recordCdRefresh(steps, total) {
   }
 }
 
-async function sendControl(url, body, success, failure) {
+async function sendControl(url, body, success, failure, pendingPrev = false) {
+  if (!pendingPrev && prevGesture && prevGesture.pending) cancelPrev('OTHER CONTROL');
+  let succeeded = false;
   controlBusy = true;
   ++refreshVersion;
   if (refreshController) {
@@ -249,6 +275,7 @@ async function sendControl(url, body, success, failure) {
       cdTiming.postMs = response.ms;
       cdTiming.server = serverTiming(response.timing);
     }
+    succeeded = response.ok;
     controlResult = response.ok ? success : failure(response.data);
   } catch (_) {
     controlResult = url.endsWith('/mute') ? 'MUTE RESULT UNKNOWN · CHECK RECEIVER'
@@ -265,6 +292,7 @@ async function sendControl(url, body, success, failure) {
     updateControls();
     await refresh();
   }
+  return succeeded;
 }
 
 muteButton.addEventListener('click', async () => {
@@ -300,9 +328,165 @@ function cdFailure(label, data) {
   return `${label} ${result} · NOTHING SENT`;
 }
 
+function observedSource() {
+  return lastReceiver && lastReceiver.source && lastReceiver.source.value || 'UNKNOWN';
+}
+
+// Why the pending PREV must not be sent now, or null if it may be.
+function prevBlocked(statusData) {
+  if (statusData !== undefined &&
+      !(statusData && statusData.xs8_service === 'connected')) return 'CONNECTION LOST';
+  if (cdFault) return 'CD FAULT';
+  if (!csrfToken || !serviceReady || !cdReady || !enabledCdActions.includes('PREVIOUS')) {
+    return 'NOT ELIGIBLE';
+  }
+  if (observedSource() !== prevGesture.source) return 'SOURCE CHANGED';
+  return null;
+}
+
+// The gesture lasts while its first PREV runs and while a second tap is pending
+// or sent. Without a second tap it ends when the recognition window closes. After
+// the second PREV it ends only after a full window with no further tap, so a
+// continuing burst can never start a third command.
+function prevGestureActive() {
+  const gesture = prevGesture;
+  const now = Date.now();
+  if (gesture && ((gesture.phase === 'done' && !gesture.pending &&
+      now - gesture.firstTap > PREV_DOUBLE_TAP_WINDOW_MS) ||
+      (gesture.phase === 'closing' && now - gesture.lastTap > PREV_DOUBLE_TAP_WINDOW_MS))) {
+    endPrevGesture();
+    return null;
+  }
+  return prevGesture;
+}
+
+// Re-render when the gesture may end; expiry itself is checked against the clock.
+function renderPrevGestureAt(gesture, at) {
+  clearTimeout(gesture.renderTimer);
+  gesture.renderTimer = setTimeout(() => {
+    if (prevGesture === gesture) updateControls();
+  }, Math.max(0, at - Date.now()) + 1);
+}
+
+function endPrevGesture() {
+  if (prevGesture) {
+    clearTimeout(prevGesture.timer);
+    clearTimeout(prevGesture.renderTimer);
+  }
+  prevGesture = null;
+  updateControls();
+}
+
+function cancelPrev(reason) {
+  if (!prevGesture) return;
+  if (prevGesture.pending) {
+    prevCounts.cancelled += 1;
+    prevNote = `SECOND PREV CANCELLED (${reason})`;
+  }
+  endPrevGesture();
+  renderCdTiming();
+}
+
+// Sends the queued second PREV once, only when every condition holds; otherwise
+// waits for the cooldown or drops it. It is never retried.
+function tryPendingPrev() {
+  const gesture = prevGesture;
+  if (!gesture || !gesture.pending || gesture.phase !== 'done' || controlBusy) return;
+  const reason = prevBlocked();
+  if (reason) { cancelPrev(reason); return; }
+  const wait = lastCdCompleted + cdIntervalMs - Date.now();
+  if (wait > 0) {
+    clearTimeout(gesture.timer);
+    gesture.timer = setTimeout(tryPendingPrev, wait);
+    return;
+  }
+  clearTimeout(gesture.timer);
+  gesture.phase = 'second';
+  gesture.pending = false;
+  prevNote = null;
+  dispatchCd('PREVIOUS', true).finally(() => {
+    if (prevGesture !== gesture) return;
+    // Success or failure, never a retry: absorb the rest of the burst.
+    gesture.phase = 'closing';
+    prevNote = gesture.extra ? 'EXTRA TAP IGNORED' : null;
+    renderPrevGestureAt(gesture, gesture.lastTap + PREV_DOUBLE_TAP_WINDOW_MS);
+    updateControls();
+  });
+}
+
+function onPrevGestureTap() {
+  const gesture = prevGesture;
+  if (gesture.pending || gesture.phase === 'second' || gesture.phase === 'closing') {
+    // Third and later taps never add commands; say so instead of dropping silently.
+    prevCounts.extra += 1;
+    gesture.extra = true;
+    gesture.lastTap = Date.now();
+    prevNote = gesture.pending ? 'SECOND PREV PENDING · EXTRA TAP IGNORED'
+      : gesture.phase === 'second' ? 'SECOND PREV SENT · EXTRA TAP IGNORED'
+      : 'EXTRA TAP IGNORED';
+    if (gesture.phase === 'closing') {
+      renderPrevGestureAt(gesture, gesture.lastTap + PREV_DOUBLE_TAP_WINDOW_MS);
+    }
+  } else if (Date.now() - gesture.firstTap > PREV_DOUBLE_TAP_WINDOW_MS) {
+    cdDropped.busy += 1;
+  } else {
+    prevCounts.queued += 1;
+    gesture.lastTap = Date.now();
+    gesture.pending = true;
+    prevNote = 'SECOND PREV PENDING';
+    tryPendingPrev();
+  }
+  updateControls();
+  renderCdTiming();
+}
+
+async function dispatchCd(action, pendingPrev = false) {
+  cdTiming = { click: Date.now(), postMs: null, server: {}, refresh: null,
+    awaitingRefresh: false, enabledAt: null, readyAt: null, renderMs: null };
+  renderCdTiming();
+  const label = action === 'NEXT' ? 'NEXT' : 'PREV';
+  return sendControl('/api/v1/cd/track', JSON.stringify({ action }),
+    `${label} TX VERIFIED · TRACK CHANGE UNVERIFIED`,
+    (data) => cdFailure(label, data), pendingPrev);
+}
+
+async function firstPrev() {
+  const now = Date.now();
+  const gesture = { firstTap: now, lastTap: now, source: observedSource(), phase: 'first',
+    pending: false, extra: false, timer: null, renderTimer: null };
+  prevGesture = gesture;
+  prevNote = null;
+  renderPrevGestureAt(gesture, now + PREV_DOUBLE_TAP_WINDOW_MS);
+  const ok = await dispatchCd('PREVIOUS');
+  if (prevGesture !== gesture) return;
+  if (!ok) {
+    // Failure, refusal, timeout or uncertainty: never follow it with another PREV.
+    cancelPrev('FIRST PREV NOT CONFIRMED');
+    return;
+  }
+  gesture.phase = 'done';
+  if (gesture.pending) tryPendingPrev();
+  else updateControls();
+}
+
+// Leaving the page drops a pending tap; nothing is stored, so nothing replays.
+function cancelOnHide() {
+  if (typeof document.hidden !== 'boolean' || document.hidden) cancelPrev('PAGE HIDDEN');
+}
+if (typeof document.addEventListener === 'function') {
+  document.addEventListener('visibilitychange', cancelOnHide);
+}
+if (typeof globalThis.addEventListener === 'function') {
+  globalThis.addEventListener('pagehide', () => cancelPrev('PAGE HIDDEN'));
+}
+
 for (const button of cdButtons) {
   button.addEventListener('click', async () => {
-    // Taps while a request or its token refresh is pending are dropped, never queued.
+    if (prevGestureActive() && button.dataset.cdAction === 'PREVIOUS') {
+      onPrevGestureTap();
+      return;
+    }
+    // Other taps while a request or its token refresh is pending are dropped.
     const dropped = button.disabled ? 'disabled' : controlBusy ? 'busy'
       : Date.now() - lastCdCompleted < cdIntervalMs ? 'interval' : null;
     if (dropped) {
@@ -310,13 +494,9 @@ for (const button of cdButtons) {
       renderCdTiming();
       return;
     }
-    cdTiming = { click: Date.now(), postMs: null, server: {}, refresh: null,
-      awaitingRefresh: false, enabledAt: null, readyAt: null, renderMs: null };
-    renderCdTiming();
-    const label = button.dataset.cdAction === 'NEXT' ? 'NEXT' : 'PREV';
-    await sendControl('/api/v1/cd/track', JSON.stringify({ action: button.dataset.cdAction }),
-      `${label} TX VERIFIED · TRACK CHANGE UNVERIFIED`,
-      (data) => cdFailure(label, data));
+    prevNote = null;
+    if (button.dataset.cdAction === 'PREVIOUS') await firstPrev();
+    else await dispatchCd(button.dataset.cdAction);
   });
 }
 
