@@ -34,7 +34,8 @@ public:
                    bool operator_authorized, std::function<bool()> stopping = {},
                    std::function<Time()> now = Clock::now,
                    std::function<void(Time)> wait_until = {},
-                   VolumeControl::Ms cd_lease = VolumeControl::Ms(2000));
+                   VolumeControl::Ms cd_lease = VolumeControl::Ms(2000),
+                   VolumeControl::Ms cd_max_hold = kCdMaxHold);
     void connected(uint64_t client_id = 0);
     std::string command(const std::string& line, Time received, Time now,
                         uint64_t client_id = 0);
@@ -60,6 +61,9 @@ public:
     bool research_context_open() const { return context_open_; }
     static constexpr VolumeControl::Ms kContextLease{3000};
     static constexpr VolumeControl::Ms kContextMaxLifetime{300000};
+    // Absolute limit on one explicit CD hold, measured from the successful
+    // CD_PRESS request; heartbeats renew only the lease, never this limit.
+    static constexpr VolumeControl::Ms kCdMaxHold{10000};
 private:
     std::string context_command(const std::string& line, Time now,
                                 uint64_t client_id);
@@ -75,12 +79,14 @@ private:
     VolumeControl volume_;
     std::function<void(Time)> wait_until_;
     VolumeControl::Ms cd_lease_;
+    VolumeControl::Ms cd_max_hold_;
     std::unordered_set<uint64_t> clients_;
     uint64_t volume_owner_client_ = 0;
     bool volume_owner_set_ = false;
     bool monitor_fault_handled_ = false;
     bool cd_active_ = false;
     bool cd_hold_ = false;
+    Time cd_hold_started_{};
     Time cd_lease_renewed_{};
     uint64_t cd_hold_token_ = 0;
     uint64_t cd_last_token_ = 0;

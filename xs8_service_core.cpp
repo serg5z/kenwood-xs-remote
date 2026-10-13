@@ -88,13 +88,14 @@ bool new_cd_token(uint64_t previous, uint64_t& token)
 Xs8ServiceCore::Xs8ServiceCore(ServiceTransmitter& tx,
     VolumeControl::Ms max_hold, bool operator_authorized,
     std::function<bool()> stopping, std::function<Time()> now,
-    std::function<void(Time)> wait_until, VolumeControl::Ms cd_lease)
+    std::function<void(Time)> wait_until, VolumeControl::Ms cd_lease,
+    VolumeControl::Ms cd_max_hold)
     : tx_(tx), volume_(tx, VolumeControl::Ms(1200), max_hold,
                        std::move(stopping), std::move(now)),
       wait_until_(wait_until ? std::move(wait_until) :
           std::function<void(Time)>([](Time deadline) {
               std::this_thread::sleep_until(deadline);
-          })), cd_lease_(cd_lease)
+          })), cd_lease_(cd_lease), cd_max_hold_(cd_max_hold)
 {
     // This sends no command. No automatic recovery is available in phase 1.
     volume_.startup(false, operator_authorized);
@@ -209,7 +210,7 @@ std::string Xs8ServiceCore::cd_press(uint8_t press_byte, const char *action,
             " release_waveform=" + waveform_name(cd_release_evidence_.waveform) +
             " receiver_execution=UNVERIFIED\n";
     }
-    cd_lease_renewed_ = now;
+    cd_hold_started_ = cd_lease_renewed_ = now;
     cd_hold_token_ = token;
     cd_last_token_ = token;
     cd_hold_ = true;
@@ -491,9 +492,18 @@ void Xs8ServiceCore::tick(Time now)
     if (cd_hold_ && !tx_.monitor_healthy()) {
         cd_release("MONITOR_FAILED");
         cd_fault_ = true;
-    } else if (cd_hold_ && now - cd_lease_renewed_ >= cd_lease_) {
-        cd_release("LEASE_EXPIRED");
-        cd_lease_expired_ = true;
+    } else if (cd_hold_) {
+        // Whichever deadline passed first names the release. Both use the
+        // single cd_release() path, which clears the hold, so a late
+        // heartbeat finds no hold to renew.
+        const Time lease_end = cd_lease_renewed_ + cd_lease_;
+        const Time max_end = cd_hold_started_ + cd_max_hold_;
+        if (now >= max_end && max_end <= lease_end) {
+            cd_release("MAX_HOLD");
+        } else if (now >= lease_end) {
+            cd_release("LEASE_EXPIRED");
+            cd_lease_expired_ = true;
+        }
     }
     if (!tx_.monitor_healthy()) {
         if (!monitor_fault_handled_ &&

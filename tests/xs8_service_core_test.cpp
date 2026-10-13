@@ -1022,6 +1022,150 @@ static void test_context_monitor_failure_and_shutdown()
     assert(!stopping.context_may_be_open());
 }
 
+static bool status_has(Xs8ServiceCore& core, int time, const char *field)
+{
+    return core.command("STATUS", at(time), at(time)).find(field) !=
+        std::string::npos;
+}
+
+static void test_cd_hold_max_hold()
+{
+    using Bytes = std::vector<uint8_t>;
+    static_assert(Xs8ServiceCore::kCdMaxHold == Ms(10000));
+
+    // Continuous heartbeats never extend the hold past the maximum.
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+    core.connected();
+    const auto token = hold_token(core.command(
+        "CD_PRESS SEEK_FORWARD", at(10), at(10)));
+    for (int time = 510; time <= 9510; time += 500) {
+        core.tick(at(time));
+        assert(core.command("CD_HEARTBEAT " + token, at(time), at(time)) ==
+               "OK CD_LEASE_RENEWED\n");
+    }
+    core.tick(at(10009));
+    assert(tx.sent == (Bytes{0x7A}) && core.cd_release_owed());
+    core.tick(at(10010));
+    assert(tx.sent == (Bytes{0x7A, 0x72}));
+    assert(!core.cd_fault() && !core.cd_release_owed());
+    assert(status_has(core, 10010, " cd_state=IDLE "));
+    assert(status_has(core, 10010, " cd_last_result=MAX_HOLD "));
+    assert(status_has(core, 10010, " cd_lease_expired=0 "));
+    assert(status_has(core, 10010, " state=IDLE "));
+    assert(status_has(core, 10010, " receiver_execution=UNVERIFIED "));
+    // A late heartbeat or release neither renews nor transmits.
+    assert(core.command("CD_HEARTBEAT " + token, at(10011), at(10011)) ==
+           "ERR CD_NOT_ACTIVE\n");
+    assert(core.command("CD_RELEASE " + token, at(10012), at(10012)) ==
+           "ERR CD_NOT_ACTIVE\n");
+    for (int time = 10020; time <= 30000; time += 20) core.tick(at(time));
+    assert(tx.sent == (Bytes{0x7A, 0x72}));
+
+    // A new hold gets a fresh token and its own maximum; the expired token
+    // cannot renew or release it.
+    const auto fresh = hold_token(core.command(
+        "CD_PRESS SEEK_BACKWARD", at(30000), at(30000)));
+    assert(fresh != token);
+    assert(status_has(core, 30000, " cd_last_result=HOLDING "));
+    assert(core.command("CD_HEARTBEAT " + token, at(30001), at(30001)) ==
+           "ERR CD_NOT_OWNER\n");
+    assert(core.command("CD_RELEASE " + token, at(30001), at(30001)) ==
+           "ERR CD_NOT_OWNER\n");
+    for (int time = 30500; time <= 39500; time += 500)
+        assert(core.command("CD_HEARTBEAT " + fresh, at(time), at(time)) ==
+               "OK CD_LEASE_RENEWED\n");
+    assert(tx.sent == (Bytes{0x7A, 0x72, 0x6A}));
+    core.tick(at(40000));
+    assert(tx.sent == (Bytes{0x7A, 0x72, 0x6A, 0x72}));
+
+    // A heartbeat that reaches the service after the maximum, before any
+    // control-loop tick, is refused after the single expiry RELEASE.
+    FakeTx late_tx;
+    Xs8ServiceCore late(late_tx, Ms(2000), true, {}, [] { return at(0); });
+    late.connected();
+    const auto late_token = hold_token(late.command(
+        "CD_PRESS SEEK_FORWARD", at(10), at(10)));
+    for (int time = 1010; time <= 9010; time += 1000)
+        late.command("CD_HEARTBEAT " + late_token, at(time), at(time));
+    assert(late.command("CD_HEARTBEAT " + late_token, at(9990), at(10010)) ==
+           "ERR CD_NOT_ACTIVE\n");
+    assert(late_tx.sent == (Bytes{0x7A, 0x72}));
+    assert(status_has(late, 10010, " cd_last_result=MAX_HOLD "));
+    late.tick(at(12010));
+    assert(late_tx.sent == (Bytes{0x7A, 0x72}));
+
+    // Normal release before the maximum leaves nothing for expiry to do.
+    FakeTx early_tx;
+    Xs8ServiceCore early(early_tx, Ms(2000), true, {}, [] { return at(0); });
+    early.connected();
+    const auto early_token = hold_token(early.command(
+        "CD_PRESS SEEK_FORWARD", at(10), at(10)));
+    early.command("CD_HEARTBEAT " + early_token, at(1500), at(1500));
+    assert(early.command("CD_RELEASE " + early_token, at(3000), at(3000)).find(
+           "OK CD_RELEASE_TX reason=CLIENT_RELEASE") == 0);
+    for (int time = 3020; time <= 20000; time += 20) early.tick(at(time));
+    assert(early_tx.sent == (Bytes{0x7A, 0x72}));
+    assert(status_has(early, 20000, " cd_last_result=CLIENT_RELEASE "));
+
+    // Lease expiry before the maximum keeps its own reason, even when the
+    // control loop only notices after the maximum has also passed.
+    FakeTx lease_tx;
+    Xs8ServiceCore lease(lease_tx, Ms(2000), true, {}, [] { return at(0); });
+    lease.connected();
+    const auto lease_token = hold_token(lease.command(
+        "CD_PRESS SEEK_BACKWARD", at(10), at(10)));
+    lease.command("CD_HEARTBEAT " + lease_token, at(7000), at(7000));
+    lease.tick(at(12000));
+    assert(lease_tx.sent == (Bytes{0x6A, 0x72}));
+    assert(status_has(lease, 12000, " cd_last_result=LEASE_EXPIRED "));
+    assert(status_has(lease, 12000, " cd_lease_expired=1 "));
+    lease.tick(at(20000));
+    assert(lease_tx.sent == (Bytes{0x6A, 0x72}));
+
+    // A renewed lease that would outlast the maximum is cut at the maximum.
+    FakeTx cut_tx;
+    Xs8ServiceCore cut(cut_tx, Ms(2000), true, {}, [] { return at(0); },
+                       {}, Ms(2000), Ms(1000));
+    cut.connected();
+    const auto cut_token = hold_token(cut.command(
+        "CD_PRESS SEEK_FORWARD", at(10), at(10)));
+    cut.command("CD_HEARTBEAT " + cut_token, at(900), at(900));
+    cut.tick(at(1009));
+    assert(cut_tx.sent == (Bytes{0x7A}));
+    cut.tick(at(1010));
+    assert(cut_tx.sent == (Bytes{0x7A, 0x72}));
+    assert(status_has(cut, 1010, " cd_last_result=MAX_HOLD "));
+    assert(status_has(cut, 1010, " cd_lease_expired=0 "));
+
+    // An unconfirmed expiry RELEASE latches the fault and keeps the
+    // obligation; only graceful shutdown makes its one extra attempt.
+    FakeTx fail_tx;
+    Xs8ServiceCore fail(fail_tx, Ms(2000), true, {}, [] { return at(0); });
+    fail.connected();
+    const auto fail_token = hold_token(fail.command(
+        "CD_PRESS SEEK_FORWARD", at(10), at(10)));
+    for (int time = 1010; time <= 9010; time += 1000)
+        fail.command("CD_HEARTBEAT " + fail_token, at(time), at(time));
+    fail_tx.fail_release = true;
+    fail.tick(at(10010));
+    assert(fail_tx.sent == (Bytes{0x7A, 0x72}));
+    assert(fail.cd_fault() && fail.cd_release_owed());
+    assert(status_has(fail, 10010, " state=FAULT_LATCHED "));
+    assert(status_has(fail, 10010, " cd_state=FAULT_LATCHED "));
+    assert(status_has(fail, 10010, " cd_last_result=RELEASE_UNCERTAIN "));
+    assert(fail.command("CD_HEARTBEAT " + fail_token, at(10011), at(10011)) ==
+           "ERR CD_NOT_ACTIVE\n");
+    assert(fail.command("CD_PRESS SEEK_FORWARD", at(10012), at(10012)) ==
+           "ERR CD_FAULT_LATCHED\n");
+    for (int time = 10020; time <= 20000; time += 20) fail.tick(at(time));
+    assert(fail_tx.sent == (Bytes{0x7A, 0x72}));
+    assert(!fail.shutdown(at(20001)));
+    assert(fail_tx.sent == (Bytes{0x7A, 0x72, 0x72}));
+    assert(!fail.shutdown(at(20002)));
+    assert(fail_tx.sent == (Bytes{0x7A, 0x72, 0x72}));
+}
+
 int main()
 {
     test_startup_and_parsing();
@@ -1043,6 +1187,7 @@ int main()
     test_cd_lease_renewal_stale_token_and_recovery();
     test_cd_hold_uncertain_and_volume_exclusion();
     test_cd_hold_interleaved_clients_and_volume_owner();
+    test_cd_hold_max_hold();
     test_context_gates_and_authorization();
     test_context_send_exit_and_token_ownership();
     test_context_excludes_every_other_transmission();
