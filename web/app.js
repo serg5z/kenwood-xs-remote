@@ -3,6 +3,7 @@ const muteButton = document.getElementById('mute-button');
 const syncButton = document.getElementById('sync-button');
 const sourceButtons = [...document.querySelectorAll('.source-grid button[data-source]')];
 const cdButtons = [document.getElementById('cd-previous'), document.getElementById('cd-next')];
+const volumeButtons = [document.getElementById('volume-up'), document.getElementById('volume-down')];
 let csrfToken = null;
 let serviceReady = false;
 let muteReady = false;
@@ -10,6 +11,11 @@ let sourceReady = false;
 let queryReady = false;
 let cdReady = false;
 let cdFault = false;
+let volumeReady = false;
+let enabledVolumeDirections = [];
+// Phase 1: single taps only. Spacing guards duplicate taps; the Gateway enforces it too.
+let volumeIntervalMs = 250;
+let lastVolumeCompleted = -Infinity;
 let enabledSources = [];
 let enabledCdActions = [];
 let controlBusy = false;
@@ -53,8 +59,12 @@ function updateControls() {
     if (receptive && gesture.pending) button.dataset.pending = 'true';
     else delete button.dataset.pending;
   }
+  for (const button of volumeButtons) {
+    button.disabled = controlBusy || !csrfToken || !serviceReady || !volumeReady ||
+      !enabledVolumeDirections.includes(button.dataset.volumeDirection);
+  }
   const available = !controlBusy && serviceReady && csrfToken &&
-    (muteReady || sourceReady || queryReady || cdReady);
+    (muteReady || sourceReady || queryReady || cdReady || volumeReady);
   // A latched CD fault needs physical attention; never hide it behind a result.
   text('availability-text', cdFault && !controlBusy
     ? 'CD FAULT LATCHED · STOP AND INSPECT CHANGER'
@@ -129,6 +139,14 @@ function applyRefresh(statusData, sessionData, capabilitiesData) {
   enabledCdActions = cdReady ? cd.available_actions : [];
   cdIntervalMs = cd && Number.isInteger(cd.min_interval_ms) && (cd.min_interval_ms === 0 ||
     (cd.min_interval_ms >= 200 && cd.min_interval_ms <= 1000)) ? cd.min_interval_ms : 1000;
+  const volume = capabilitiesData && capabilitiesData.operations &&
+    capabilitiesData.operations.volume_step;
+  volumeReady = !!csrfToken && sessionData.volume_step_available === true &&
+    !!status && status.cd_state === 'IDLE' && status.cd_release_owed === '0' &&
+    !!volume && volume.enabled === true && Array.isArray(volume.available_directions);
+  enabledVolumeDirections = volumeReady ? volume.available_directions : [];
+  volumeIntervalMs = volume && Number.isInteger(volume.min_interval_ms) &&
+    volume.min_interval_ms >= 250 && volume.min_interval_ms <= 1000 ? volume.min_interval_ms : 250;
   const query = capabilitiesData && capabilitiesData.operations &&
     capabilitiesData.operations.receiver_query;
   queryReady = !!csrfToken && sessionData.receiver_query_available === true &&
@@ -208,7 +226,8 @@ async function refresh() {
           sessionData = session.data;
           if (session.data.source_available === true ||
               session.data.receiver_query_available === true ||
-              session.data.cd_track_available === true) {
+              session.data.cd_track_available === true ||
+              session.data.volume_step_available === true) {
             try {
               const capabilities = await fetchJson('/api/v1/capabilities', {
                 cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
@@ -266,7 +285,7 @@ async function sendControl(url, body, success, failure, options = {}) {
   }
   const token = tokenOverride || csrfToken;
   csrfToken = null; muteReady = false; sourceReady = false; queryReady = false;
-  cdReady = false;
+  cdReady = false; volumeReady = false;
   updateControls();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 6000);
@@ -287,9 +306,11 @@ async function sendControl(url, body, success, failure, options = {}) {
     controlResult = url.endsWith('/mute') ? 'MUTE RESULT UNKNOWN · CHECK RECEIVER'
       : url.endsWith('/query') ? 'SYNC RESULT UNKNOWN · CHECK RECEIVER'
       : url.endsWith('/cd/track') ? 'CD RESULT UNKNOWN · CHECK CHANGER'
+      : url.endsWith('/volume/step') ? 'VOLUME RESULT UNKNOWN · CHECK RECEIVER'
       : 'SOURCE RESULT UNKNOWN · CHECK RECEIVER';
   } finally {
     clearTimeout(timeout);
+    if (url.endsWith('/volume/step')) lastVolumeCompleted = Date.now();
     if (url.endsWith('/cd/track')) {
       lastCdCompleted = Date.now();
       if (cdTiming) { cdTiming.completed = lastCdCompleted; cdTiming.awaitingRefresh = true; }
@@ -325,6 +346,28 @@ for (const button of sourceButtons) {
     await sendControl('/api/v1/source', JSON.stringify({ source: button.dataset.source }),
       `${button.dataset.source} TX REPORTED · SELECTION UNVERIFIED`,
       (data) => `SOURCE ${data.result || 'FAILED'} · SELECTION UNVERIFIED`);
+  });
+}
+
+function volumeFailure(label, data) {
+  const result = data && data.result || 'FAILED';
+  if (result === 'FAULT_LATCHED' || result === 'CD_FAULT_LATCHED') {
+    return `${label} ${result} · CHECK RECEIVER · RESTART REQUIRED`;
+  }
+  if (data && data.physical_check_required === true) return `${label} ${result} · CHECK RECEIVER`;
+  return `${label} ${result} · NOTHING SENT`;
+}
+
+// One click, one POST. No hold, key repeat or retry: a failure is shown and left.
+for (const button of volumeButtons) {
+  button.addEventListener('click', async () => {
+    if (button.disabled || controlBusy ||
+        Date.now() - lastVolumeCompleted < volumeIntervalMs) return;
+    const direction = button.dataset.volumeDirection;
+    const label = direction === 'UP' ? 'VOL+' : 'VOL−';
+    await sendControl('/api/v1/volume/step', JSON.stringify({ direction }),
+      `${label} TX VERIFIED · VOLUME CHANGE UNVERIFIED`,
+      (data) => volumeFailure(label, data));
   });
 }
 

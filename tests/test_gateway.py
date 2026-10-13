@@ -40,6 +40,10 @@ CD_OK = (b"OK CD_TRACK_TX action=NEXT press_gpio_tx=TX_OK press_waveform=MATCH "
 CD_UNCERTAIN = (b"ERR CD_TRACK_UNCERTAIN action=NEXT press_gpio_tx=TX_OK "
                 b"press_waveform=MATCH release_gpio_tx=TX_OK release_waveform=MISSING "
                 b"cd_result=RELEASE_UNCERTAIN receiver_execution=UNVERIFIED\n")
+VOLUME_OK = (b"OK VOLUME_STEP_TX direction=UP state=IDLE stop_owed=0 "
+             b"context_may_be_open=0 receiver_execution=UNVERIFIED\n")
+VOLUME_UNCERTAIN = (b"ERR VOLUME_STEP_UNCERTAIN direction=UP state=FAULT_LATCHED "
+                    b"stop_owed=1 context_may_be_open=1 receiver_execution=UNVERIFIED\n")
 QUERY_REPLY = (b"OK QUERY_STATUS reason=NONE gpio_tx=TX_OK waveform=MATCH "
                b"bytes=lsb/legacy@start_ns-end_ns:validity "
                b"tx=0x13/0x37@1-2:VALID rx1=0x47/0x1D@3-4:VALID "
@@ -1303,6 +1307,498 @@ class CdTrackGatewayTest(GatewayTest):
                         ("--enable-cd-track", "--enable-offline-mute", "--systemd-socket",
                          "--nginx-uid", "33", "--https-origin", "https://woodland-pi.local",
                          "--socket", self.socket_path)):
+            with self.subTest(options=options):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        xs8_gateway.parse_args(list(options))
+
+
+class VolumeStepGatewayTest(GatewayTest):
+    def enable_volume(self):
+        handler = self.server.RequestHandlerClass
+        handler.volume_step_enabled = True
+        handler.https_origin = "https://woodland-pi.local"
+        self.server.proxy_peer_verified = True
+
+    def step(self, token, cookie, direction="UP", **overrides):
+        headers = {"Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+                   "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": token,
+                   "Cookie": cookie, "Content-Type": "application/json"}
+        headers.update(overrides.pop("headers", {}))
+        return self.request_full("POST", "/api/v1/volume/step",
+                                 body=overrides.pop("body", json.dumps({"direction": direction})),
+                                 headers=headers)
+
+    def dispatched(self, fake):
+        return [c for c in fake.commands if c.startswith(b"VOLUME_")]
+
+    def elapse_interval(self):
+        state = getattr(self.server, "volume_step", None)
+        if state:
+            state["completed"] = float("-inf")
+
+    def fresh_token(self, cookie):
+        code, body, _ = self.request_full("GET", "/api/v1/session", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        self.assertEqual(code, 200)
+        return json.loads(body)["csrf_token"]
+
+    def eligible(self):
+        return mock.patch.object(xs8_gateway, "read_status", return_value={
+            "state": "IDLE", "monitor": "HEALTHY", "stop_owed": "0",
+            "context_may_be_open": "0", "cd_state": "IDLE", "cd_release_owed": "0"})
+
+    def test_gate_off_returns_501_and_capability_disabled(self):
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=VOLUME_OK)
+        self.assertEqual(self.step("x", "x")[0], 501)
+        # Other gates do not open this one.
+        self.server.RequestHandlerClass.cd_track_enabled = True
+        self.server.RequestHandlerClass.https_origin = "https://woodland-pi.local"
+        self.server.proxy_peer_verified = True
+        token, cookie = self.session()
+        self.assertEqual(self.step(token, cookie)[0], 501)
+        code, body, _ = self.request_full("GET", "/api/v1/session", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        self.assertFalse(json.loads(body)["volume_step_available"])
+        code, body, _ = self.request_full("GET", "/api/v1/capabilities", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        fake.close()
+        volume = json.loads(body)["operations"]["volume_step"]
+        self.assertFalse(volume["enabled"])
+        self.assertEqual(volume["available_directions"], ["UP", "DOWN"])
+        self.assertEqual(volume["min_interval_ms"], 250)
+        self.assertEqual(self.dispatched(fake), [])
+
+    def test_session_and_capabilities_report_availability(self):
+        self.enable_volume()
+        for status, available in ((CD_IDLE_STATUS, True), (STATUS, False),
+                                  (CD_IDLE_STATUS.replace(b"OK state=IDLE",
+                                                          b"OK state=BOOT_INHIBIT"), False),
+                                  (CD_HOLD_STATUS, False), (CD_FAULT_STATUS, False)):
+            with self.subTest(status=status[-40:]):
+                fake = RecordingService(self.socket_path, status=status, mute_reply=VOLUME_OK)
+                code, body, headers = self.request_full(
+                    "GET", "/api/v1/session",
+                    headers={"X-Kenwood-Authenticated-User": "remote"})
+                self.assertEqual(code, 200)
+                session = json.loads(body)
+                self.assertIs(session["volume_step_available"], available)
+                self.assertFalse(session["cd_track_available"])
+                cookie = headers["Set-Cookie"].split(";", 1)[0]
+                code, body, _ = self.request_full("GET", "/api/v1/capabilities", headers={
+                    "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+                # Without a session, capabilities never report an enabled control.
+                anonymous = json.loads(self.request("GET", "/api/v1/capabilities")[1])
+                fake.close()
+                volume = json.loads(body)["operations"]["volume_step"]
+                self.assertIs(volume["enabled"], available)
+                self.assertEqual(volume["classification"], "unverified")
+                self.assertFalse(anonymous["operations"]["volume_step"]["enabled"])
+                self.assertEqual(self.dispatched(fake), [])
+
+    def test_up_and_down_dispatch_once_and_token_is_single_use(self):
+        self.enable_volume()
+        for direction in ("UP", "DOWN"):
+            with self.subTest(direction=direction):
+                token, cookie = self.session()
+                self.elapse_interval()
+                fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                        mute_reply=VOLUME_OK.replace(b"UP", direction.encode()))
+                code, body, _ = self.step(token, cookie, direction)
+                replay = self.step(token, cookie, direction)[0]
+                fake.close()
+                self.assertEqual(code, 200)
+                payload = json.loads(body)
+                self.assertEqual(payload["result"], "SERVICE_TX_OK")
+                self.assertEqual(payload["direction"], direction)
+                self.assertEqual(payload["volume_result"], "TX_VERIFIED")
+                self.assertEqual(payload["receiver_execution"], "UNVERIFIED")
+                self.assertEqual(self.dispatched(fake), [f"VOLUME_STEP {direction}\n".encode()])
+                # STATUS preflight precedes the single dispatch.
+                self.assertEqual(fake.commands, [b"STATUS\n",
+                                                 f"VOLUME_STEP {direction}\n".encode()])
+                self.assertEqual(replay, 403)
+
+    def test_success_returns_single_use_successor_token_never_logged(self):
+        self.enable_volume()
+        logged = []
+        self.server.RequestHandlerClass.log_message = (
+            lambda handler, fmt, *args: logged.append(fmt % args))
+        token, cookie = self.session()
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=VOLUME_OK)
+        try:
+            code, body, headers = self.step(token, cookie)
+            self.assertEqual(code, 200)
+            returned = json.loads(body)["csrf_token"]
+            self.assertNotEqual(returned, token)
+            self.assertEqual(returned, self.fresh_token(cookie))
+            self.assertNotIn(returned, json.dumps(dict(headers)))
+            self.elapse_interval()
+            self.assertEqual(self.step(returned, cookie)[0], 200)
+            self.elapse_interval()
+            self.assertEqual(self.step(returned, cookie)[0], 403)
+        finally:
+            fake.close()
+        self.assertEqual(self.dispatched(fake), [b"VOLUME_STEP UP\n"] * 2)
+        log = "\n".join(logged)
+        self.assertIn("VOLUME_STEP direction=UP code=200 result=SERVICE_TX_OK", log)
+        self.assertIn("xs8volume_ms=", log)
+        self.assertNotIn(token, log)
+        self.assertNotIn(returned, log)
+
+    def test_invalid_directions_and_bodies_never_dispatch(self):
+        self.enable_volume()
+        token, cookie = self.session()
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=VOLUME_OK)
+        bodies = ('{"direction":"up"}', '{"direction":"LEFT"}', '{"direction":""}',
+                  '{"direction":null}', '{"direction":1}', '{"direction":["UP"]}',
+                  '{}', '{"direction":"UP","extra":1}',
+                  '{"direction":"UP","direction":"UP"}', '{"action":"UP"}',
+                  '["UP"]', '"UP"', 'UP', '{"direction":"UP"', '')
+        try:
+            for body in bodies:
+                with self.subTest(body=body):
+                    code, _, _ = self.step(token, cookie, body=body)
+                    self.assertEqual(code, 400)
+                    token = self.fresh_token(cookie)
+            code, _, _ = self.step(token, cookie, body=json.dumps({"direction": "U" * 80}))
+            self.assertEqual(code, 400)
+        finally:
+            fake.close()
+        self.assertEqual(self.dispatched(fake), [])
+
+    def test_authentication_csrf_and_origin_never_dispatch(self):
+        self.enable_volume()
+        token, cookie = self.session()
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=VOLUME_OK)
+        try:
+            cases = (
+                ({"X-CSRF-Token": "wrong"}, 403),
+                ({"Cookie": "xs8_session=missing"}, 401),
+                ({"X-Kenwood-Authenticated-User": "other"}, 401),
+                ({"Origin": "https://evil.example"}, 403),
+                ({"X-Forwarded-Proto": "http"}, 403),
+                ({"Content-Type": "text/plain"}, 400),
+            )
+            for headers, expected in cases:
+                with self.subTest(headers=headers):
+                    self.assertEqual(self.step(token, cookie, headers=headers)[0], expected)
+            # Without a verified proxy peer the endpoint stays inert.
+            self.server.proxy_peer_verified = False
+            self.assertEqual(self.step(token, cookie)[0], 501)
+            self.server.proxy_peer_verified = True
+            code, _, _ = self.step(self.fresh_token(cookie), cookie)
+            self.assertEqual(code, 200)
+        finally:
+            fake.close()
+        self.assertEqual(self.dispatched(fake), [b"VOLUME_STEP UP\n"])
+
+    def test_status_gating_never_dispatches(self):
+        self.enable_volume()
+        cases = {
+            "boot_inhibit": (CD_IDLE_STATUS.replace(b"OK state=IDLE", b"OK state=BOOT_INHIBIT"),
+                             "NOT_ELIGIBLE", None),
+            "cec_hold": (CD_IDLE_STATUS.replace(b"OK state=IDLE", b"OK state=HOLDING_UP"),
+                         "VOLUME_BUSY", None),
+            "stop_owed": (CD_IDLE_STATUS.replace(b"stop_owed=0", b"stop_owed=1"),
+                          "NOT_ELIGIBLE", None),
+            "context": (CD_IDLE_STATUS.replace(b"context_may_be_open=0",
+                                               b"context_may_be_open=1"), "NOT_ELIGIBLE", None),
+            "monitor": (CD_IDLE_STATUS.replace(b"monitor=HEALTHY", b"monitor=FAILED"),
+                        "NOT_ELIGIBLE", None),
+            "cd_hold": (CD_HOLD_STATUS, "CD_BUSY", None),
+            "cd_fault": (CD_FAULT_STATUS, "CD_FAULT_LATCHED", True),
+            "volume_fault": (CD_IDLE_STATUS.replace(b"OK state=IDLE", b"OK state=FAULT_LATCHED"),
+                             "FAULT_LATCHED", True),
+            "no_cd_fields": (STATUS, "NOT_ELIGIBLE", None),
+        }
+        for name, (status, result, check) in cases.items():
+            with self.subTest(case=name):
+                token, cookie = self.session()
+                fake = RecordingService(self.socket_path, status=status, mute_reply=VOLUME_OK)
+                code, body, _ = self.step(token, cookie)
+                replay = self.step(token, cookie)[0]
+                fake.close()
+                self.assertEqual(code, 409)
+                payload = json.loads(body)
+                self.assertEqual(payload["result"], result)
+                self.assertEqual(payload["receiver_execution"], "UNVERIFIED")
+                self.assertIs(payload.get("physical_check_required"), check)
+                self.assertNotIn("csrf_token", payload)
+                self.assertEqual(replay, 403, "the token was consumed")
+                self.assertEqual(self.dispatched(fake), [])
+        token, cookie = self.session()
+        code, body, _ = self.step(token, cookie)
+        self.assertEqual((code, json.loads(body)["result"]), (503, "UNAVAILABLE"))
+
+    def test_service_replies_are_classified_and_never_retried(self):
+        self.enable_volume()
+        cases = (
+            (VOLUME_UNCERTAIN, 502, "SERVICE_UNCERTAIN", True),
+            (VOLUME_UNCERTAIN.replace(b"UNCERTAIN direction", b"CANCELLED direction")
+             .replace(b"FAULT_LATCHED", b"IDLE").replace(b"=1", b"=0"),
+             502, "SERVICE_UNCERTAIN", True),
+            (b"ERR FAULT_LATCHED\n", 409, "FAULT_LATCHED", True),
+            (b"ERR CD_FAULT_LATCHED\n", 409, "CD_FAULT_LATCHED", True),
+            (b"ERR VOLUME_BUSY\n", 409, "REJECTED", False),
+            (b"ERR CD_TRACK_BUSY\n", 409, "REJECTED", False),
+            (b"ERR UNKNOWN_COMMAND\n", 409, "REJECTED", False),
+            (b"ERR SHUTDOWN\n", 409, "REJECTED", False),
+        )
+        for reply, code, result, check in cases:
+            with self.subTest(reply=reply):
+                token, cookie = self.session()
+                self.elapse_interval()
+                fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                        mute_reply=reply)
+                status, body, _ = self.step(token, cookie)
+                fake.close()
+                self.assertEqual(status, code)
+                payload = json.loads(body)
+                self.assertEqual(payload["result"], result)
+                self.assertEqual(payload["direction"], "UP")
+                self.assertIs(payload["physical_check_required"], check)
+                self.assertEqual(payload["receiver_execution"], "UNVERIFIED")
+                self.assertNotIn("csrf_token", payload)
+                self.assertEqual(self.dispatched(fake), [b"VOLUME_STEP UP\n"])
+        token, cookie = self.session()
+        self.elapse_interval()
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                mute_reply=VOLUME_UNCERTAIN)
+        _, body, _ = self.step(token, cookie)
+        fake.close()
+        payload = json.loads(body)
+        self.assertEqual((payload["volume_result"], payload["state"], payload["stop_owed"],
+                          payload["context_may_be_open"]),
+                         ("UNCERTAIN", "FAULT_LATCHED", "1", "1"))
+
+    def test_malformed_tx_reports_are_uncertain_not_refusals(self):
+        self.enable_volume()
+        replies = (
+            VOLUME_OK.replace(b"direction=UP", b"direction=DOWN"),
+            VOLUME_OK.replace(b"stop_owed=0", b"stop_owed=1"),
+            VOLUME_OK.replace(b"context_may_be_open=0", b"context_may_be_open=1"),
+            VOLUME_OK.replace(b"state=IDLE", b"state=FAULT_LATCHED"),
+            VOLUME_OK.replace(b" receiver_execution=UNVERIFIED", b""),
+            VOLUME_OK.replace(b"receiver_execution=UNVERIFIED", b"receiver_execution=VERIFIED"),
+            VOLUME_OK.replace(b"\n", b" extra=1\n"),
+            VOLUME_UNCERTAIN.replace(b"stop_owed=1", b"stop_owed=2"),
+            VOLUME_UNCERTAIN.replace(b" context_may_be_open=1", b""),
+            b"ERR VOLUME_STEP_UNCERTAIN\n", b"OK MUTE_TX\n", b"OK\n", b"\n",
+            CD_OK)
+        for reply in replies:
+            with self.subTest(reply=reply):
+                token, cookie = self.session()
+                self.elapse_interval()
+                fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                        mute_reply=reply)
+                code, body, _ = self.step(token, cookie)
+                fake.close()
+                self.assertEqual(code, 502)
+                payload = json.loads(body)
+                self.assertEqual(payload["result"], "INVALID_REPLY")
+                self.assertTrue(payload["physical_check_required"])
+                self.assertEqual(self.dispatched(fake), [b"VOLUME_STEP UP\n"])
+
+    def test_timeout_and_disconnect_are_uncertain_without_retry(self):
+        self.enable_volume()
+        token, cookie = self.session()
+        with self.eligible():
+            fake = FakeService(self.socket_path, VOLUME_OK, delay=0.3)
+            original = xs8_gateway.send_volume_step
+            with mock.patch.object(xs8_gateway, "send_volume_step",
+                                   side_effect=lambda path, direction: original(
+                                       path, direction, timeout=0.1)) as dispatch:
+                code, body, _ = self.step(token, cookie)
+            fake.close()
+            self.assertEqual(code, 504)
+            payload = json.loads(body)
+            self.assertEqual(payload["result"], "TIMEOUT")
+            self.assertTrue(payload["physical_check_required"])
+            self.assertNotIn("csrf_token", payload)
+            dispatch.assert_called_once()
+            self.assertEqual(fake.commands, [b"VOLUME_STEP UP\n"])
+            token = self.fresh_token(cookie)
+            self.elapse_interval()
+            fake = FakeService(self.socket_path, None)
+            code, body, _ = self.step(token, cookie)
+            fake.close()
+            self.assertEqual(code, 502)
+            self.assertEqual(json.loads(body)["result"], "DISCONNECTED")
+            self.assertTrue(json.loads(body)["physical_check_required"])
+            self.assertEqual(fake.commands, [b"VOLUME_STEP UP\n"])
+            token = self.fresh_token(cookie)
+            self.elapse_interval()
+            code, body, _ = self.step(token, cookie)
+            self.assertEqual(code, 503)
+            self.assertEqual(json.loads(body)["result"], "UNAVAILABLE")
+            self.assertFalse(json.loads(body)["physical_check_required"])
+
+    def test_duplicate_submissions_of_one_token_dispatch_once(self):
+        self.enable_volume()
+        token, cookie = self.session()
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=VOLUME_OK)
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(
+            self.step(token, cookie)[0])) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        fake.close()
+        self.assertEqual(sorted(results), [200, 403, 403, 403])
+        self.assertEqual(self.dispatched(fake), [b"VOLUME_STEP UP\n"])
+
+    def test_browser_disconnect_after_post_dispatches_once_without_retry(self):
+        self.enable_volume()
+        token, cookie = self.session()
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=VOLUME_OK)
+        try:
+            body = json.dumps({"direction": "DOWN"})
+            request = (f"POST /api/v1/volume/step HTTP/1.1\r\nHost: x\r\n"
+                       f"Origin: https://woodland-pi.local\r\nX-Forwarded-Proto: https\r\n"
+                       f"X-Kenwood-Authenticated-User: remote\r\nX-CSRF-Token: {token}\r\n"
+                       f"Cookie: {cookie}\r\nContent-Type: application/json\r\n"
+                       f"Content-Length: {len(body)}\r\n\r\n{body}")
+            with socket.create_connection(("127.0.0.1", self.server.server_port)) as client:
+                client.sendall(request.encode())
+            # The Gateway still serves the next request; the abandoned one is not replayed.
+            deadline = time.monotonic() + 2
+            while not self.dispatched(fake) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(self.step(token, cookie)[0], 403)
+            self.elapse_interval()
+            self.assertEqual(self.step(self.fresh_token(cookie), cookie, "UP")[0], 200)
+        finally:
+            fake.close()
+        self.assertEqual(self.dispatched(fake), [b"VOLUME_STEP DOWN\n", b"VOLUME_STEP UP\n"])
+
+    def test_overlap_and_interval_are_server_wide_and_rotate_token(self):
+        self.enable_volume()
+        token, cookie = self.session()
+        state = self.server.__dict__.setdefault(
+            "volume_step", {"lock": threading.Lock(), "completed": float("-inf")})
+        with mock.patch.object(xs8_gateway, "send_volume_step") as dispatch, self.eligible():
+            with state["lock"]:
+                code, body, _ = self.step(token, cookie)
+            self.assertEqual((code, json.loads(body)["result"]), (409, "VOLUME_BUSY"))
+            self.assertEqual(self.step(token, cookie)[0], 403, "busy refusal consumed the token")
+            state["completed"] = time.monotonic()
+            code, body, _ = self.step(self.fresh_token(cookie), cookie, "DOWN")
+            payload = json.loads(body)
+            self.assertEqual((code, payload["result"]), (429, "TOO_FAST"))
+            self.assertEqual(payload["min_interval_ms"], 250)
+            self.assertNotIn("csrf_token", payload)
+            dispatch.assert_not_called()
+
+    def test_interval_counts_from_completion_including_failed_dispatch(self):
+        self.enable_volume()
+        token, cookie = self.session()
+        with mock.patch.object(xs8_gateway, "send_volume_step", side_effect=(
+                xs8_gateway.MuteServiceError("TIMEOUT", "no reply"))) as dispatch, \
+                self.eligible():
+            self.assertEqual(self.step(token, cookie)[0], 504)
+            self.assertEqual(self.step(self.fresh_token(cookie), cookie)[0], 429)
+            self.assertEqual(dispatch.call_count, 1)
+        # CD spacing is separate from volume spacing.
+        self.assertNotIn("cd_track", self.server.__dict__)
+
+    def test_every_failure_leaves_a_recoverable_token_without_dispatch(self):
+        """Each failure consumes the POSTed token; GET /api/v1/session supplies its
+        successor and never dispatches. The successor authorizes exactly one step."""
+        self.enable_volume()
+        state = self.server.__dict__.setdefault(
+            "volume_step", {"lock": threading.Lock(), "completed": float("-inf")})
+        hold_status = CD_IDLE_STATUS.replace(b"OK state=IDLE", b"OK state=HOLDING_UP")
+        cases = (
+            ("VOLUME_BUSY lock", 409, None, None),
+            ("VOLUME_BUSY hold", 409, hold_status, VOLUME_OK),
+            ("REJECTED", 409, CD_IDLE_STATUS, b"ERR VOLUME_BUSY\n"),
+            ("SERVICE_UNCERTAIN", 502, CD_IDLE_STATUS, VOLUME_UNCERTAIN),
+            ("INVALID_REPLY", 502, CD_IDLE_STATUS, b"OK\n"),
+            ("TIMEOUT", 504, None, None),
+            ("DISCONNECTED", 502, CD_IDLE_STATUS, None),
+            ("TOO_FAST", 429, None, None),
+        )
+        for name, code, status, reply in cases:
+            with self.subTest(case=name):
+                token, cookie = self.session()
+                self.elapse_interval()
+                if status is not None:
+                    fake = RecordingService(self.socket_path, status=status, mute_reply=reply)
+                    try:
+                        self.assertEqual(self.step(token, cookie)[0], code)
+                        failed = len(self.dispatched(fake))
+                        self.assertEqual(self.step(token, cookie)[0], 403, "consumed")
+                        successor = self.fresh_token(cookie)
+                        self.assertEqual(self.fresh_token(cookie), successor, "GET is stable")
+                        self.assertEqual(len(self.dispatched(fake)), failed,
+                                         "replay and recovery never dispatch")
+                        fake.status, fake.mute_reply = CD_IDLE_STATUS, VOLUME_OK
+                        self.elapse_interval()
+                        self.assertEqual(self.step(successor, cookie)[0], 200)
+                        self.assertEqual(len(self.dispatched(fake)), failed + 1)
+                        self.elapse_interval()
+                        self.assertEqual(self.step(successor, cookie)[0], 403)
+                    finally:
+                        fake.close()
+                    self.assertEqual(len(self.dispatched(fake)), failed + 1)
+                else:
+                    effect = (xs8_gateway.MuteServiceError("TIMEOUT", "no reply")
+                              if name == "TIMEOUT" else None)
+                    with mock.patch.object(xs8_gateway, "send_volume_step",
+                                           side_effect=effect) as dispatch, self.eligible():
+                        if name == "VOLUME_BUSY lock":
+                            with state["lock"]:
+                                self.assertEqual(self.step(token, cookie)[0], code)
+                        else:
+                            if name == "TOO_FAST":
+                                state["completed"] = time.monotonic()
+                            self.assertEqual(self.step(token, cookie)[0], code)
+                        failed = dispatch.call_count
+                        self.assertEqual(self.step(token, cookie)[0], 403, "consumed")
+                        successor = self.fresh_token(cookie)
+                        self.assertNotEqual(successor, token)
+                        self.assertEqual(dispatch.call_count, failed)
+                        dispatch.side_effect = None
+                        dispatch.return_value = {"volume_result": "TX_VERIFIED",
+                                                 "receiver_execution": "UNVERIFIED"}
+                        self.elapse_interval()
+                        self.assertEqual(self.step(successor, cookie)[0], 200)
+                        self.assertEqual(dispatch.call_count, failed + 1)
+                        self.assertEqual(self.step(successor, cookie)[0], 403)
+                    self.assertEqual(failed, 1 if name == "TIMEOUT" else 0)
+                self.assertNotEqual(successor, token)
+
+    def test_default_timeout_and_allowlist(self):
+        with mock.patch.object(xs8_gateway, "_send_control",
+                               return_value=VOLUME_OK.decode().strip()) as control:
+            self.assertEqual(xs8_gateway.send_volume_step("/unused", "UP"), {
+                "state": "IDLE", "stop_owed": "0", "context_may_be_open": "0",
+                "receiver_execution": "UNVERIFIED", "volume_result": "TX_VERIFIED"})
+        self.assertEqual(control.call_args.args[1], b"VOLUME_STEP UP\n")
+        self.assertGreaterEqual(control.call_args.args[2], 3.0)
+        self.assertFalse(control.call_args.kwargs["fake_only"])
+        for direction in ("up", "LEFT", "UP\nMUTE", ""):
+            with self.subTest(direction=direction):
+                with mock.patch.object(xs8_gateway, "_send_control") as control:
+                    with self.assertRaises(xs8_gateway.MuteServiceError):
+                        xs8_gateway.send_volume_step("/unused", direction)
+                control.assert_not_called()
+
+    def test_cli_gate_requires_secure_socket(self):
+        base = ["--systemd-socket", "--nginx-uid", "33",
+                "--https-origin", "https://woodland-pi.local"]
+        args = xs8_gateway.parse_args(["--enable-volume"] + base)
+        self.assertTrue(args.enable_volume)
+        self.assertFalse(xs8_gateway.parse_args([]).enable_volume)
+        self.assertFalse(xs8_gateway.parse_args(["--enable-cd-track"] + base).enable_volume)
+        for options in (("--enable-volume",),
+                        ("--enable-volume", "--systemd-socket", "--nginx-uid", "33"),
+                        ("--enable-volume", "--https-origin", "https://woodland-pi.local"),
+                        tuple(["--enable-volume"] + base + ["--socket", self.socket_path]),
+                        tuple(["--enable-volume", "--enable-offline-mute"] + base +
+                              ["--socket", self.socket_path])):
             with self.subTest(options=options):
                 with contextlib.redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit):

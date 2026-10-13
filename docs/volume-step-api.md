@@ -1,6 +1,6 @@
 # XS8 Service atomic volume step (phase 1)
 
-`VOLUME_STEP UP\n` and `VOLUME_STEP DOWN\n` ask the single-owner XS8 Service for **one bounded volume movement**. This is phase 1 of [Web Volume](web-api.md#future-control-api-design-not-implemented): the Gateway endpoint and Web controls do not exist yet, and `POST /api/v1/volume/step` still returns 501. The CEC client is unchanged and keeps using `VOLUME_PRESS` / `VOLUME_RELEASE`.
+`VOLUME_STEP UP\n` and `VOLUME_STEP DOWN\n` ask the single-owner XS8 Service for **one bounded volume movement**. The Gateway exposes it as [`POST /api/v1/volume/step`](web-api.md#volume-step-phase-1) behind the default-off `--enable-volume`, for single taps only. The CEC client is unchanged and keeps using `VOLUME_PRESS` / `VOLUME_RELEASE`.
 
 ## Sequence
 
@@ -32,4 +32,4 @@ The step does not set or clear the CEC re-arm block: after a CEC hold is stopped
 
 ## Validation status
 
-Offline tests only (`make test`: `volume_control_test`, `xs8_service_core_test`, `tests/test_xs8_service_socket.py`). No attended hardware trial has been run. Before any Gateway or Web exposure, an attended trial must establish the change per step, that every step stops, and the per-frame failure rate over repeated steps.
+Offline tests: `make test` (`volume_control_test`, `xs8_service_core_test`, `tests/test_xs8_service_socket.py`). The operator reported that initial attended tests of both directions on the KR-V6070 passed (2026-10-13); the trial details, the change per step and a per-frame failure rate over repeated steps are not recorded here. Hold-to-repeat should wait for that failure-rate evidence.

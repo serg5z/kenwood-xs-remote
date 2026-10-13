@@ -46,6 +46,10 @@ CD_TRACK_INTERVAL_RANGE_MS = (200, 1000)
 # Experimental: 0 removes the cooldown. Serialization, STATUS, CSRF and reply
 # checks still apply, and each XS8 pair still completes before the next starts.
 CD_TRACK_INTERVAL_OFF = 0
+VOLUME_DIRECTIONS = ("UP", "DOWN")
+# Server-wide spacing from one completed VOLUME_STEP dispatch to the next. Phase 1
+# exposes single taps only; this guards against duplicate submissions, not hold.
+VOLUME_STEP_INTERVAL_MS = 250
 
 
 class ServiceError(Exception):
@@ -190,6 +194,48 @@ def send_cd_track(socket_path, action, timeout=3.0):
     raise MuteServiceError("INVALID_REPLY", "Invalid XS8 CD track reply")
 
 
+def send_volume_step(socket_path, direction, timeout=3.0):
+    """One atomic VOLUME_STEP; the service owns STOP, ROOT exit and fault latching."""
+    if direction not in VOLUME_DIRECTIONS:
+        raise MuteServiceError("REJECTED", "Volume direction is not allowlisted")
+    line = _send_control(socket_path, f"VOLUME_STEP {direction}\n".encode("ascii"),
+                         timeout, fake_only=False, max_reply=512)
+    parts = line.split()
+    if len(parts) == 7 and parts[2] == f"direction={direction}" and \
+            parts[6] == "receiver_execution=UNVERIFIED":
+        keys = ("state", "stop_owed", "context_may_be_open")
+        evidence = {}
+        for key, part in zip(keys, parts[3:6]):
+            name, _, value = part.partition("=")
+            if name != key:
+                break
+            evidence[key] = value
+        valid = (len(evidence) == 3 and evidence["state"] and
+                 evidence["stop_owed"] in ("0", "1") and
+                 evidence["context_may_be_open"] in ("0", "1"))
+        if valid:
+            evidence["receiver_execution"] = "UNVERIFIED"
+            if parts[:2] == ["OK", "VOLUME_STEP_TX"] and evidence == {
+                    "state": "IDLE", "stop_owed": "0", "context_may_be_open": "0",
+                    "receiver_execution": "UNVERIFIED"}:
+                evidence["volume_result"] = "TX_VERIFIED"
+                return evidence
+            if parts[:2] in (["ERR", "VOLUME_STEP_UNCERTAIN"],
+                             ["ERR", "VOLUME_STEP_CANCELLED"]):
+                evidence["volume_result"] = ("CANCELLED" if parts[1].endswith("CANCELLED")
+                                             else "UNCERTAIN")
+                raise MuteServiceError("SERVICE_UNCERTAIN", line, evidence)
+    if line == "ERR CD_FAULT_LATCHED":
+        raise MuteServiceError("CD_FAULT_LATCHED", line)
+    if line == "ERR FAULT_LATCHED":
+        raise MuteServiceError("FAULT_LATCHED", line)
+    # A malformed TX report is uncertain, never a clean pre-TX refusal.
+    if (line.startswith("ERR ") and len(parts) >= 2 and
+            not parts[1].startswith("VOLUME_STEP")):
+        raise MuteServiceError("REJECTED", line)
+    raise MuteServiceError("INVALID_REPLY", "Invalid XS8 volume step reply")
+
+
 def send_receiver_query(socket_path):
     line = _send_control(socket_path, b"QUERY_STATUS\n", timeout=3.0,
                          fake_only=False, max_reply=2048)
@@ -290,7 +336,8 @@ def receiver_state(status):
 
 
 def capabilities(mute_available=False, source_available=False, query_available=False,
-                 cd_track_available=False, cd_track_interval_ms=CD_TRACK_INTERVAL_MS):
+                 cd_track_available=False, cd_track_interval_ms=CD_TRACK_INTERVAL_MS,
+                 volume_step_available=False):
     return {
         "api_version": "v0.1",
         "operations": {
@@ -301,8 +348,10 @@ def capabilities(mute_available=False, source_available=False, query_available=F
                 "reason": "Receiver execution is unverified",
             },
             "volume_step": {
-                "classification": "unsupported", "enabled": False,
-                "reason": "Bounded atomic VOLUME_STEP is not implemented",
+                "classification": "unverified", "enabled": volume_step_available,
+                "available_directions": list(VOLUME_DIRECTIONS),
+                "min_interval_ms": VOLUME_STEP_INTERVAL_MS,
+                "reason": "TX and waveform do not confirm a volume change; hold and repeat are not exposed",
             },
             "source": {
                 "classification": "unverified", "enabled": source_available,
@@ -329,6 +378,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
     receiver_query_enabled = False
     cd_track_enabled = False
     cd_track_interval_ms = CD_TRACK_INTERVAL_MS
+    volume_step_enabled = False
     https_origin = None
     sessions = None
 
@@ -337,7 +387,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def control_enabled(self):
         return (self.mute_enabled() or self.production_source_enabled or
-                self.receiver_query_enabled or self.cd_track_enabled)
+                self.receiver_query_enabled or self.cd_track_enabled or
+                self.volume_step_enabled)
 
     def authenticated_user(self):
         # nginx overwrites this header with $remote_user after Basic Auth.
@@ -396,6 +447,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
         # A service without CD STATUS fields cannot report a latched CD fault.
         return "cd_state" in status and cls.status_allows_mute(status)
 
+    @classmethod
+    def status_allows_volume_step(cls, status):
+        # Like CD: only a service reporting CD fields can report a latched CD fault.
+        return "cd_state" in status and cls.status_allows_mute(status)
+
     @staticmethod
     def cd_fault(status):
         # An active pair or hold legitimately owes RELEASE; an idle one does not.
@@ -409,7 +465,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "source": self.production_source_enabled and ready,
                 "query": self.receiver_query_enabled and ready,
                 "cd_track": (self.cd_track_enabled and status is not None and
-                             self.status_allows_cd_track(status))}
+                             self.status_allows_cd_track(status)),
+                "volume_step": (self.volume_step_enabled and status is not None and
+                                self.status_allows_volume_step(status))}
 
     def send_body(self, code, body, content_type, headers=None):
         self.response_code = code
@@ -453,7 +511,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             available = self.availability(status)
             self.send_json(200, capabilities(available["mute"], available["source"],
                                               available["query"], available["cd_track"],
-                                              self.cd_track_interval_ms))
+                                              self.cd_track_interval_ms,
+                                              available["volume_step"]))
             return
         if path == "/api/v1/session" and self.control_enabled():
             user = self.authenticated_user()
@@ -474,7 +533,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                  "mute_available": available["mute"],
                                  "source_available": available["source"],
                                  "receiver_query_available": available["query"],
-                                 "cd_track_available": available["cd_track"]}, headers)
+                                 "cd_track_available": available["cd_track"],
+                                 "volume_step_available": available["volume_step"]}, headers)
             return
         assets = {
             "/": ("index.html", "text/html; charset=utf-8"),
@@ -501,15 +561,37 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.cd_track_state()["completed"] = time.monotonic()
             self.add_timing("xs8cd", started)
 
+    def volume_step_state(self):
+        # Server-wide, like CD: one receiver, whichever session sends.
+        return self.server.__dict__.setdefault(
+            "volume_step", {"lock": threading.Lock(), "completed": float("-inf")})
+
+    def dispatch_volume_step(self, direction):
+        started = time.monotonic()
+        try:
+            return send_volume_step(self.socket_path, direction)
+        finally:
+            # Any dispatch outcome, including timeout, starts the interval.
+            self.volume_step_state()["completed"] = time.monotonic()
+            self.add_timing("xs8volume", started)
+
     def do_POST(self):
         self.start_timing()
-        self.held_cd_lock = None
+        self.held_lock = None
         self.cd_action = None
+        self.volume_direction = None
         try:
             self.handle_post()
         finally:
-            if self.held_cd_lock is not None:
-                self.held_cd_lock.release()
+            if self.held_lock is not None:
+                self.held_lock.release()
+            if self.volume_direction is not None:
+                self.log_message("VOLUME_STEP direction=%s code=%s result=%s %s",
+                                 self.volume_direction,
+                                 getattr(self, "response_code", "-"),
+                                 getattr(self, "response_result", None) or "-",
+                                 " ".join(f"{name}_ms={duration:.1f}"
+                                          for name, duration in self.timings))
             if self.cd_action is not None:
                 # One journal line per CD request for attended timing analysis.
                 self.log_message("CD_TRACK action=%s code=%s result=%s %s", self.cd_action,
@@ -524,7 +606,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         is_source = path == "/api/v1/source" and self.production_source_enabled
         is_query = path == "/api/v1/receiver/query" and self.receiver_query_enabled
         is_cd = path == "/api/v1/cd/track" and self.cd_track_enabled
-        if (not (is_mute or is_source or is_query or is_cd) or
+        is_volume = path == "/api/v1/volume/step" and self.volume_step_enabled
+        if (not (is_mute or is_source or is_query or is_cd or is_volume) or
                 not getattr(self.server, "proxy_peer_verified", False)):
             length = self.headers.get("Content-Length", "")
             if len(length) <= 4 and length.isdecimal() and 0 < int(length) <= 4096:
@@ -584,12 +667,36 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 session["csrf"] = secrets.token_urlsafe(32)
                 self.send_json(409, {"result": "CD_BUSY", "receiver_execution": "UNVERIFIED"})
                 return
-            self.held_cd_lock = state["lock"]
+            self.held_lock = state["lock"]
             if (self.cd_track_interval_ms != CD_TRACK_INTERVAL_OFF and
                     (time.monotonic() - state["completed"]) * 1000 < self.cd_track_interval_ms):
                 session["csrf"] = secrets.token_urlsafe(32)
                 self.send_json(429, {"result": "TOO_FAST",
                                      "min_interval_ms": self.cd_track_interval_ms,
+                                     "receiver_execution": "UNVERIFIED"})
+                return
+        elif is_volume:
+            try:
+                pairs = json.loads(body, object_pairs_hook=list)
+                direction = (pairs[0][1] if isinstance(pairs, list) and
+                             len(pairs) == 1 and isinstance(pairs[0], tuple) and
+                             pairs[0][0] == "direction" else None)
+            except (UnicodeError, ValueError, TypeError, IndexError):
+                direction = None
+            if not isinstance(direction, str) or direction not in VOLUME_DIRECTIONS:
+                self.send_json(400, {"error": "Expected one allowlisted volume direction"})
+                return
+            self.volume_direction = direction
+            state = self.volume_step_state()
+            if not state["lock"].acquire(blocking=False):
+                session["csrf"] = secrets.token_urlsafe(32)
+                self.send_json(409, {"result": "VOLUME_BUSY", "receiver_execution": "UNVERIFIED"})
+                return
+            self.held_lock = state["lock"]
+            if (time.monotonic() - state["completed"]) * 1000 < VOLUME_STEP_INTERVAL_MS:
+                session["csrf"] = secrets.token_urlsafe(32)
+                self.send_json(429, {"result": "TOO_FAST",
+                                     "min_interval_ms": VOLUME_STEP_INTERVAL_MS,
                                      "receiver_execution": "UNVERIFIED"})
                 return
         else:
@@ -624,7 +731,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             session["last_query_request"] = now
         # Single use: a repeated request with the same token cannot dispatch again.
         session["csrf"] = secrets.token_urlsafe(32)
-        if (is_source or is_query or is_cd or self.production_mute_enabled):
+        if (is_source or is_query or is_cd or is_volume or self.production_mute_enabled):
             try:
                 status = self.read_service_status()
             except ServiceError:
@@ -638,7 +745,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if is_cd and status.get("cd_state") in ("ACTIVE", "HOLDING"):
                 self.send_json(409, {"result": "CD_BUSY", "receiver_execution": "UNVERIFIED"})
                 return
+            if is_volume:
+                refusal = ("CD_FAULT_LATCHED" if self.cd_fault(status) else
+                           "FAULT_LATCHED" if status.get("state") == "FAULT_LATCHED" else
+                           "CD_BUSY" if status.get("cd_state") in ("ACTIVE", "HOLDING") else
+                           "VOLUME_BUSY" if status.get("state") in ("HOLDING_UP", "HOLDING_DOWN")
+                           else None)
+                if refusal:
+                    payload = {"result": refusal, "receiver_execution": "UNVERIFIED"}
+                    if refusal.endswith("FAULT_LATCHED"):
+                        payload["physical_check_required"] = True
+                    self.send_json(409, payload)
+                    return
             if not (self.status_allows_cd_track(status) if is_cd
+                    else self.status_allows_volume_step(status) if is_volume
                     else self.status_allows_mute(status)):
                 self.send_json(409, {"result": "NOT_ELIGIBLE", "receiver_execution": "UNVERIFIED"})
                 return
@@ -646,14 +766,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
             reply = (send_mute(self.socket_path, fake_only=not self.production_mute_enabled)
                      if is_mute else send_receiver_query(self.socket_path) if is_query
                      else self.dispatch_cd_track(action) if is_cd
+                     else self.dispatch_volume_step(direction) if is_volume
                      else send_source(self.socket_path, source))
         except MuteServiceError as exc:
             code = {"UNAVAILABLE": 503, "REJECTED": 409, "CD_FAULT_LATCHED": 409,
-                    "TIMEOUT": 504}.get(exc.result, 502)
+                    "FAULT_LATCHED": 409, "TIMEOUT": 504}.get(exc.result, 502)
             payload = {"result": exc.result, "error": str(exc),
                        "receiver_execution": "UNVERIFIED"}
-            if (is_source or is_cd) and exc.evidence:
+            if (is_source or is_cd or is_volume) and exc.evidence:
                 payload.update(exc.evidence)
+            if is_volume:
+                payload["direction"] = direction
+                # Never retried here or in the browser; only a clean refusal sent nothing.
+                payload["physical_check_required"] = exc.result not in (
+                    "UNAVAILABLE", "REJECTED")
             if is_cd:
                 payload["action"] = action
                 # Anything but a clean refusal may have moved the changer.
@@ -662,7 +788,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.send_json(code, payload)
             return
         payload = {"result": "SERVICE_TX_OK", "receiver_execution": "UNVERIFIED"}
-        if is_cd:
+        if is_volume:
+            payload["direction"] = direction
+            payload.update(reply)
+            # Same single-use successor as CD track; GET /api/v1/session grants it too.
+            payload["csrf_token"] = session["csrf"]
+        elif is_cd:
             payload["action"] = action
             payload.update(reply)
             # The token rotated before dispatch, so the one just used is already
@@ -733,6 +864,8 @@ def parse_args(argv=None):
                         help="enable one explicit authenticated receiver status query")
     parser.add_argument("--enable-cd-track", action="store_true",
                         help="enable discrete CD NEXT/PREVIOUS through the real local XS8 Service")
+    parser.add_argument("--enable-volume", action="store_true",
+                        help="enable single atomic VOLUME_STEP taps through the real local XS8 Service")
     parser.add_argument("--cd-track-interval-ms", type=int,
                         help="experimental minimum ms from one completed CD track "
                              f"command to the next (default {CD_TRACK_INTERVAL_MS}, "
@@ -758,10 +891,11 @@ def parse_args(argv=None):
     else:
         args.cd_track_interval_ms = CD_TRACK_INTERVAL_MS
     if args.enable_offline_mute and (args.enable_mute or args.enable_source or
-                                    args.enable_receiver_query or args.enable_cd_track):
+                                    args.enable_receiver_query or args.enable_cd_track or
+                                    args.enable_volume):
         parser.error("offline and production MUTE modes are mutually exclusive")
     if (args.enable_offline_mute or args.enable_mute or args.enable_source or
-            args.enable_receiver_query or args.enable_cd_track):
+            args.enable_receiver_query or args.enable_cd_track or args.enable_volume):
         if not args.systemd_socket or not args.https_origin:
             parser.error("active controls require --systemd-socket and --https-origin")
         try:
@@ -821,6 +955,7 @@ def main(argv=None):
                     "receiver_query_enabled": args.enable_receiver_query,
                     "cd_track_enabled": args.enable_cd_track,
                     "cd_track_interval_ms": args.cd_track_interval_ms,
+                    "volume_step_enabled": args.enable_volume,
                     "https_origin": args.https_origin, "sessions": {}})
     if args.systemd_socket:
         try:
@@ -833,7 +968,8 @@ def main(argv=None):
                     ("PRODUCTION MUTE", args.enable_mute),
                     ("PRODUCTION SOURCE", args.enable_source),
                     ("RECEIVER QUERY", args.enable_receiver_query),
-                    (f"CD TRACK {args.cd_track_interval_ms} ms", args.enable_cd_track))
+                    (f"CD TRACK {args.cd_track_interval_ms} ms", args.enable_cd_track),
+                    ("VOLUME STEP", args.enable_volume))
                     if enabled) or "read-only")
         print(f"XS8 gateway listening on {GATEWAY_SOCKET} ({mode})")
     else:

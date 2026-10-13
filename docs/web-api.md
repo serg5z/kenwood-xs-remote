@@ -1,6 +1,6 @@
 # Web Remote and HTTP API v0.1
 
-The Gateway remains **read-only by default**. Explicit production `--enable-mute` and `--enable-source` options independently gate MUTE and the four evidenced source commands through authenticated HTTPS and the systemd Unix socket. TV1, TV2 and TAPE2 remain blocked pending controlled TX validation; volume remains disabled. A separate default-off `--enable-cd-track` option gates discrete CD NEXT/PREVIOUS ([below](#cd-track-nextprevious-phase-a)); CD PLAY/PAUSE, STOP and held SEEK are not exposed. The checked-in systemd unit enables no control. See [MUTE deployment](mute-control.md) and [source selection evidence and rollout](source-selection.md) before opting in.
+The Gateway remains **read-only by default**. Explicit production `--enable-mute` and `--enable-source` options independently gate MUTE and the four evidenced source commands through authenticated HTTPS and the systemd Unix socket. TV1, TV2 and TAPE2 remain blocked pending controlled TX validation. A separate default-off `--enable-volume` option gates single-tap VOL+/VOL− steps ([below](#volume-step-phase-1)); hold and repeat are not exposed. A separate default-off `--enable-cd-track` option gates discrete CD NEXT/PREVIOUS ([below](#cd-track-nextprevious-phase-a)); CD PLAY/PAUSE, STOP and held SEEK are not exposed. The checked-in systemd unit enables no control. See [MUTE deployment](mute-control.md) and [source selection evidence and rollout](source-selection.md) before opting in.
 
 An independent default-off `--enable-receiver-query` gate permits one explicit authenticated `POST /api/v1/receiver/query` for live source/MONITOR synchronization. GET status and background polling remain passive. See [live receiver status](receiver-status.md) for the cache fields, uncertainty model, and manual rollout.
 
@@ -40,10 +40,11 @@ python3 -m unittest discover -s tests -p 'test_gateway.py'
 | --- | --- |
 | `GET /api/v1/status` | JSON with `gateway`, `xs8_service`, and parsed service `status`. Returns HTTP 503 when the service is unavailable or its reply is invalid. |
 | `GET /api/v1/capabilities` | JSON classifications and enabled flags. MUTE and evidenced sources require their own gates, a session, and XS8 eligibility. |
-| `GET /api/v1/session` | Returns 404 when every control gate is disabled; otherwise issues a secure session cookie and one-use CSRF token, plus per-control `*_available` flags including `cd_track_available`. |
+| `GET /api/v1/session` | Returns 404 when every control gate is disabled; otherwise issues a secure session cookie and one-use CSRF token, plus per-control `*_available` flags including `cd_track_available` and `volume_step_available`. |
 | `POST /api/v1/mute` | Returns 501 with MUTE disabled. With the production gate, a valid request checks fresh XS8 eligibility and sends one `MUTE` to the local service. |
 | `POST /api/v1/source` | Returns 501 with source disabled. With the production gate, accepts one allowlisted `{ "source": "CD" }` style JSON body, checks fresh XS8 eligibility, and dispatches at most one command. TV1, TV2 and TAPE2 return 409 without dispatch. |
 | `POST /api/v1/cd/track` | Returns 501 with the CD gate disabled. With `--enable-cd-track`, accepts exactly `{ "action": "NEXT" }` or `{ "action": "PREVIOUS" }`, checks fresh XS8 and CD eligibility, and dispatches at most one discrete `CD_TRACK_*` pair. |
+| `POST /api/v1/volume/step` | Returns 501 with the volume gate disabled. With `--enable-volume`, accepts exactly `{ "direction": "UP" }` or `{ "direction": "DOWN" }`, checks fresh XS8 eligibility, and dispatches at most one atomic `VOLUME_STEP`. |
 
 `status` preserves the service's `last_gpio_tx`, `last_waveform`, and `receiver_execution` fields. `TX_OK` and `MATCH` do not prove that the Kenwood executed a command. The gateway opens one short-lived Unix socket connection per status request. It does not modify XS8 state.
 
@@ -146,13 +147,46 @@ Not performed by this change. Follow the [source-selection rollout pattern](sour
 
 Offline tests: `python3 -m unittest tests.test_gateway` (class `CdTrackGatewayTest`), `node tests/test_web_cd.js`, `node tests/test_web_cd_sequence.js` (consecutive fresh-token actions and duplicate browser events) `node tests/test_web_cd_rapid.js` (completion-based spacing, overlap and interval fallback), `node tests/test_web_cd_timing.js` and `node tests/test_web_cd_prev_gesture.js` (double-PREV gesture, cooldown, cancellation and no retry). They use fake services and establish Gateway routing, parsing and refusal behavior only.
 
+## Volume step (phase 1)
+
+`POST /api/v1/volume/step` exposes the service's [atomic `VOLUME_STEP`](volume-step-api.md): one request is one bounded `0x17 → 0xF9/0xE9 → 0x09 → 0x07` movement, with STOP, ROOT exit and fault latching owned by the XS8 Service. The Gateway adds no frame, timing or STOP logic and never sends `VOLUME_PRESS` or `VOLUME_RELEASE`, so it never holds volume and cannot take a hold from the CEC client.
+
+`--enable-volume` is default-off and independent of the other gates, with the same startup requirements as `--enable-cd-track`: `--systemd-socket`, a verified `--nginx-uid`, an exact `--https-origin` and the default real XS8 Service socket. It cannot be combined with the offline fake MUTE mode, and the Gateway prints `VOLUME STEP` in its startup mode.
+
+Requests follow the CD track conventions: Origin, `X-Forwarded-Proto`, authenticated session and a single-use CSRF token, rotated before dispatch. The Gateway then reads a fresh STATUS and requires `state=IDLE`, a healthy monitor, `stop_owed=0`, `context_may_be_open=0` and the CD STATUS fields with `cd_state=IDLE` and `cd_release_owed=0`. Refusals before dispatch return 409 without contacting the service further:
+
+| `result` | Cause | `physical_check_required` |
+| --- | --- | --- |
+| `VOLUME_BUSY` | a volume hold (CEC) is active, or another volume request is in flight | — |
+| `CD_BUSY` | a CD pair or hold is active | — |
+| `FAULT_LATCHED` / `CD_FAULT_LATCHED` | a latched fault | `true` |
+| `NOT_ELIGIBLE` | any other ineligible STATUS, including a service without CD fields | — |
+
+A step less than **250 ms** (`min_interval_ms`) after the previous volume dispatch **completed**, whatever its outcome, returns 429 `TOO_FAST`. The spacing is server-wide and separate from CD spacing. One socket connection carries one `VOLUME_STEP` with a 3 s reply timeout; **no request is ever retried**.
+
+Responses keep `receiver_execution=UNVERIFIED`:
+- **200 `SERVICE_TX_OK`:** `direction`, `volume_result=TX_VERIFIED`, the service's `state`, `stop_owed` and `context_may_be_open`, and a single-use successor `csrf_token`, as for CD track.
+- **502 `SERVICE_UNCERTAIN`:** `volume_result` is `UNCERTAIN` (a frame or cleanup was unverified and the service latched a fault) or `CANCELLED` (shutdown during the step), with the service's state fields.
+- **409 `REJECTED`:** a clean service refusal such as `ERR VOLUME_BUSY`; nothing was sent.
+- **504 `TIMEOUT`, 502 `DISCONNECTED` or `INVALID_REPLY`:** delivery or outcome is unknown.
+- **503 `UNAVAILABLE`:** the service could not be reached.
+
+Every dispatch failure carries `direction` and `physical_check_required`, which is `false` only for `REJECTED` and `UNAVAILABLE`. No failure or refusal returns a token. The Gateway journals one `VOLUME_STEP direction=… code=… result=…` line per request, with timings and without tokens.
+
+### Web Remote behavior
+
+The existing rocker's `+` and `−` buttons are enabled only when the session reports `volume_step_available`, capabilities list the direction under `volume_step.available_directions`, and the latest STATUS is IDLE with an idle CD. Each click sends exactly one request; both buttons, like every other control, stay disabled while it is in flight and until the follow-up refresh supplies a fresh token. Clicks in that window, or within `min_interval_ms` of the previous completed step, are dropped, never queued. There is no pointer hold, key repeat or automatic repeat. Results read `VOL+ TX VERIFIED · VOLUME CHANGE UNVERIFIED`; failures read `CHECK RECEIVER` when `physical_check_required` is set (`· RESTART REQUIRED` for a latched fault) and `NOTHING SENT` otherwise; a network error reads `VOLUME RESULT UNKNOWN · CHECK RECEIVER`. Nothing is retried.
+
+Offline tests: `python3 -m unittest tests.test_gateway` (class `VolumeStepGatewayTest`) and `node tests/test_web_volume.js`. They use fake services and establish Gateway routing, parsing and refusal behavior only.
+
+Rollout follows the [CD track pattern](#rollout-and-rollback) with `--enable-volume` in place of `--enable-cd-track`; the XS8 Service must be a build with `VOLUME_STEP`. For rollback, remove the flag and confirm `/api/v1/volume/step` returns 501 and the rocker is disabled.
+
 ## Future control API design (not implemented)
 
 The following paths return HTTP 501 and do not access the XS8 service:
 
 | Endpoint | Proposed request | Safety condition before implementation |
 | --- | --- | --- |
-| `POST /api/v1/volume/step` | `{ "direction": "UP" }` or `DOWN` | The service-side [`VOLUME_STEP`](volume-step-api.md) exists (phase 1, offline-tested only). The Gateway endpoint still needs attended step calibration first. STOP obligation and failure handling stay server-side; browser release events cannot be the sole stop mechanism. |
 | `POST /api/v1/cd/transport` | None; superseded by `/api/v1/cd/track` | PLAY/PAUSE and STOP have no service API and no validated Web profile; ROOT `0x9C` is a STOP/CANCEL, not a KEY UP. Held SEEK (Phase B) needs a separately reviewed server-side token and heartbeat design. |
 
 No new XS8 byte values are assigned by this API design. Future iOS clients can use the same versioned JSON endpoints and show capabilities before presenting enabled controls.
