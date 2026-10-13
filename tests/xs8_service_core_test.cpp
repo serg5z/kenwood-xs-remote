@@ -1431,6 +1431,240 @@ static void test_cd_transport_keys()
     assert(shut_tx.sent.empty());
 }
 
+static void test_cd_key_holds()
+{
+    using Bytes = std::vector<uint8_t>;
+    const std::string ok_up = " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n";
+    // Exact frames; keepalives never retransmit; owner KEY_UP sends 0x72.
+    for (const auto& trial : {std::pair<const char*, uint8_t>{"SEEK_FORWARD", 0x7A},
+                              {"SEEK_BACKWARD", 0x6A}}) {
+        const std::string action = trial.first;
+        FakeTx tx;
+        Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+        core.connected(1);
+        assert(core.command("KEY_DOWN " + action, at(10), at(10), 1) ==
+               "OK KEY_DOWN_TX action=" + action + ok_up);
+        for (int time = 400; time <= 3600; time += 400) {
+            core.tick(at(time));
+            assert(core.command("KEY_DOWN " + action, at(time), at(time), 1) ==
+                   "OK KEY_ALIVE action=" + action + "\n");
+        }
+        assert(tx.sent == (Bytes{trial.second}));
+        assert(status_has(core, 3601, (" cd_state=HOLDING cd_action=" + action + " ").c_str()));
+        assert(core.cd_release_owed());
+        assert(core.command("KEY_UP " + action, at(3700), at(3700), 1) ==
+               "OK KEY_UP_TX action=" + action + ok_up);
+        assert(tx.sent == (Bytes{trial.second, 0x72}));
+        assert(!core.cd_release_owed() && !core.cd_fault());
+        assert(status_has(core, 3701, " cd_last_result=CLIENT_RELEASE "));
+        // Late KEY_UP and repeated KEY_UP transmit nothing.
+        assert(core.command("KEY_UP " + action, at(3800), at(3800), 1) ==
+               "OK KEY_UP_NONE last=CLIENT_RELEASE\n");
+        core.tick(at(20000));
+        assert(tx.sent.size() == 2);
+        // A normal KEY_UP leaves no re-arm block: the owner may press again.
+        assert(core.command("KEY_DOWN " + action, at(20001), at(20001), 1).rfind(
+               "OK KEY_DOWN_TX", 0) == 0);
+    }
+    for (const char *line : {"KEY_DOWN TRACK_NEXT", "KEY_DOWN seek_forward", "KEY_UP ",
+                             "KEY_DOWN SEEK_FORWARD ", "KEY_UP VOLUME_UP"}) {
+        FakeTx tx;
+        Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+        core.connected(1);
+        assert(core.command(line, at(1), at(1), 1) == "ERR KEY_UNKNOWN_ACTION\n");
+        assert(tx.sent.empty());
+    }
+
+    // Non-owners cannot touch the hold; the owner's disconnect releases at once.
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+    core.connected(1);
+    core.connected(2);
+    core.command("KEY_DOWN SEEK_FORWARD", at(10), at(10), 1);
+    assert(core.command("KEY_UP SEEK_FORWARD", at(20), at(20), 2) == "ERR KEY_NOT_OWNER\n");
+    assert(core.command("KEY_DOWN SEEK_FORWARD", at(20), at(20), 2) == "ERR KEY_BUSY\n");
+    assert(core.command("KEY_DOWN SEEK_BACKWARD", at(20), at(20), 1) == "ERR KEY_BUSY\n");
+    assert(core.command("KEY_UP SEEK_BACKWARD", at(20), at(20), 1) ==
+           "ERR KEY_ACTION_MISMATCH\n");
+    core.disconnected(at(30), 2);
+    assert(tx.sent == (Bytes{0x7A}) && core.cd_release_owed());
+    core.disconnected(at(40), 1);
+    assert(tx.sent == (Bytes{0x7A, 0x72}));
+    assert(!core.cd_release_owed() && !core.cd_fault());
+    assert(status_has(core, 41, " cd_state=IDLE "));
+    assert(status_has(core, 41, " cd_last_result=CLIENT_DISCONNECT "));
+
+    // Token and connection holds never release each other.
+    core.connected(3);
+    const auto token = hold_token(core.command("CD_PRESS SEEK_BACKWARD", at(50), at(50), 3));
+    assert(core.command("KEY_UP SEEK_BACKWARD", at(60), at(60), 3) == "ERR KEY_NOT_OWNER\n");
+    assert(core.command("KEY_DOWN SEEK_BACKWARD", at(60), at(60), 3) == "ERR KEY_BUSY\n");
+    core.disconnected(at(70), 3);
+    core.tick(at(1500)); // Token holds keep the 2000 ms lease, not 1200 ms.
+    assert(tx.sent == (Bytes{0x7A, 0x72, 0x6A}));
+    core.connected(4);
+    assert(core.command("CD_RELEASE " + token, at(1600), at(1600), 4).rfind(
+           "OK CD_RELEASE_TX", 0) == 0);
+    const auto reply = core.command("KEY_DOWN SEEK_FORWARD", at(1700), at(1700), 4);
+    assert(reply.find("hold_token") == std::string::npos);
+    for (const std::string& guess : {std::string("1"), std::string("999999"), token})
+        for (const char *verb : {"CD_RELEASE ", "CD_HEARTBEAT "})
+            assert(core.command(verb + guess, at(1800), at(1800), 4) == "ERR CD_NOT_OWNER\n");
+    assert(tx.sent == (Bytes{0x7A, 0x72, 0x6A, 0x72, 0x7A}));
+    assert(core.command("KEY_UP SEEK_FORWARD", at(1900), at(1900), 4).rfind("OK KEY_UP_TX", 0) == 0);
+
+    // Inactivity: 1200 ms after the last KEY_DOWN; a late keepalive is refused
+    // (never a new press) until the owner sends KEY_UP or disconnects.
+    FakeTx idle_tx;
+    Xs8ServiceCore idle(idle_tx, Ms(2000), true, {}, [] { return at(0); });
+    idle.connected(1);
+    idle.connected(2);
+    idle.command("KEY_DOWN SEEK_FORWARD", at(10), at(10), 1);
+    idle.command("KEY_DOWN SEEK_FORWARD", at(1000), at(1000), 1);
+    idle.tick(at(2199));
+    assert(idle_tx.sent == (Bytes{0x7A}));
+    assert(idle.command("KEY_DOWN SEEK_FORWARD", at(2250), at(2250), 1) ==
+           "ERR KEY_EXPIRED last=INACTIVITY\n");
+    assert(idle_tx.sent == (Bytes{0x7A, 0x72}));
+    assert(status_has(idle, 2251, " cd_lease_expired=1 cd_last_result=INACTIVITY "));
+    assert(!idle.cd_fault() && !idle.cd_release_owed());
+    assert(idle.command("KEY_DOWN SEEK_BACKWARD", at(2260), at(2260), 1) ==
+           "ERR KEY_EXPIRED last=INACTIVITY\n");
+    // Another client is not blocked.
+    assert(idle.command("KEY_DOWN SEEK_BACKWARD", at(2300), at(2300), 2).rfind(
+           "OK KEY_DOWN_TX", 0) == 0);
+    assert(idle.command("KEY_UP SEEK_FORWARD", at(2310), at(2310), 1) == "ERR KEY_NOT_OWNER\n");
+    assert(idle.command("KEY_UP SEEK_BACKWARD", at(2320), at(2320), 2).rfind("OK KEY_UP_TX", 0) == 0);
+    assert(idle.command("KEY_UP SEEK_FORWARD", at(2330), at(2330), 1) ==
+           "OK KEY_UP_NONE last=CLIENT_RELEASE\n");
+    assert(idle.command("KEY_DOWN SEEK_FORWARD", at(2400), at(2400), 1).rfind(
+           "OK KEY_DOWN_TX", 0) == 0);
+    assert(idle_tx.sent == (Bytes{0x7A, 0x72, 0x6A, 0x72, 0x7A}));
+    idle.tick(at(3600));
+    assert(idle_tx.sent.size() == 6);
+    idle.disconnected(at(3700), 1); // Disconnect also clears the block.
+    idle.connected(1);
+    assert(idle.command("KEY_DOWN SEEK_FORWARD", at(3800), at(3800), 1).rfind(
+           "OK KEY_DOWN_TX", 0) == 0);
+
+    // MAX_HOLD: 10 s from the press, regardless of keepalives.
+    FakeTx max_tx;
+    Xs8ServiceCore longest(max_tx, Ms(2000), true, {}, [] { return at(0); });
+    longest.connected(1);
+    longest.command("KEY_DOWN SEEK_BACKWARD", at(10), at(10), 1);
+    for (int time = 500; time <= 10000; time += 500)
+        assert(longest.command("KEY_DOWN SEEK_BACKWARD", at(time), at(time), 1) ==
+               "OK KEY_ALIVE action=SEEK_BACKWARD\n");
+    assert(max_tx.sent == (Bytes{0x6A}));
+    assert(longest.command("KEY_DOWN SEEK_BACKWARD", at(10010), at(10010), 1) ==
+           "ERR KEY_EXPIRED last=MAX_HOLD\n");
+    assert(max_tx.sent == (Bytes{0x6A, 0x72}));
+    assert(status_has(longest, 10011, " cd_lease_expired=0 cd_last_result=MAX_HOLD "));
+    assert(longest.command("KEY_UP SEEK_BACKWARD", at(10020), at(10020), 1) ==
+           "OK KEY_UP_NONE last=MAX_HOLD\n");
+    longest.tick(at(30000));
+    assert(max_tx.sent.size() == 2);
+
+    // Uncertain press, KEY_UP, disconnect and inactivity releases latch faults
+    // and keep the obligation; nothing is retried before shutdown.
+    FakeTx press_tx;
+    Xs8ServiceCore press(press_tx, Ms(2000), true, {}, [] { return at(0); });
+    press.connected(1);
+    press_tx.fail_next = true;
+    assert(press.command("KEY_DOWN SEEK_FORWARD", at(1), at(1), 1).rfind(
+           "ERR KEY_DOWN_UNCERTAIN action=SEEK_FORWARD gpio_tx=TX_OK waveform=MISSING", 0) == 0);
+    assert(press_tx.sent == (Bytes{0x7A, 0x72}));
+    assert(press.cd_fault() && !press.cd_release_owed());
+    assert(press.command("KEY_DOWN SEEK_FORWARD", at(2), at(2), 1) == "ERR CD_FAULT_LATCHED\n");
+    assert(press.command("KEY_UP SEEK_FORWARD", at(3), at(3), 1) ==
+           "OK KEY_UP_NONE last=PRESS_UNCERTAIN\n");
+    assert(press_tx.sent.size() == 2);
+    for (int path = 0; path < 3; ++path) {
+        FakeTx fail_tx;
+        Xs8ServiceCore fail(fail_tx, Ms(2000), true, {}, [] { return at(0); });
+        fail.connected(1);
+        fail.command("KEY_DOWN SEEK_FORWARD", at(10), at(10), 1);
+        fail_tx.fail_release = true;
+        if (path == 0)
+            assert(fail.command("KEY_UP SEEK_FORWARD", at(20), at(20), 1) ==
+                   "ERR KEY_UP_UNCERTAIN action=SEEK_FORWARD gpio_tx=TX_OK waveform=MISSING"
+                   " receiver_execution=UNVERIFIED\n");
+        else if (path == 1) fail.disconnected(at(20), 1);
+        else fail.tick(at(1300));
+        assert(fail_tx.sent == (Bytes{0x7A, 0x72}));
+        assert(fail.cd_fault() && fail.cd_release_owed());
+        assert(status_has(fail, 1400, " cd_state=FAULT_LATCHED "));
+        assert(status_has(fail, 1400, " cd_last_result=RELEASE_UNCERTAIN "));
+        fail.connected(2);
+        assert(fail.command("KEY_DOWN SEEK_BACKWARD", at(1400), at(1400), 2) ==
+               "ERR CD_FAULT_LATCHED\n");
+        assert(fail.command("KEY_UP SEEK_FORWARD", at(1400), at(1400), 2) ==
+               "OK KEY_UP_NONE last=RELEASE_UNCERTAIN\n");
+        fail.tick(at(20000));
+        assert(fail_tx.sent.size() == 2);
+        assert(!fail.shutdown(at(20001)));
+        assert(fail_tx.sent == (Bytes{0x7A, 0x72, 0x72}));
+    }
+
+    // Mutual exclusion with volume, CONTEXT and the other CD actions.
+    FakeTx busy_tx;
+    Xs8ServiceCore busy(busy_tx, Ms(2000), true, {}, [] { return at(0); });
+    busy.connected(1);
+    busy.connected(2);
+    busy.command("VOLUME_PRESS UP", at(1), at(1), 1);
+    assert(busy.command("KEY_DOWN SEEK_FORWARD", at(2), at(2), 2) == "ERR HOLDING_UP\n");
+    assert(busy.state() == VolumeControl::State::HOLDING_UP);
+    busy.command("VOLUME_RELEASE UP", at(3), at(3), 1);
+    assert(busy.command("KEY_DOWN SEEK_FORWARD", at(4), at(4), 2).rfind("OK KEY_DOWN_TX", 0) == 0);
+    for (const char *line : {"VOLUME_PRESS UP", "VOLUME_STEP DOWN", "MUTE", "CD_TRACK_NEXT",
+                             "CD_PRESS SEEK_BACKWARD", "CD_STOP", "CD_PLAY_PAUSE",
+                             "SELECT_SOURCE CD"})
+        assert(busy.command(line, at(5), at(5), 1) == "ERR CD_TRACK_BUSY\n");
+    busy.set_research_context_enabled(true);
+    assert(busy.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED", at(6), at(6), 1) ==
+           "ERR CONTEXT_SESSION reason=CD_BUSY\n");
+    assert(busy.command("KEY_UP SEEK_FORWARD", at(7), at(7), 2).rfind("OK KEY_UP_TX", 0) == 0);
+    assert(busy_tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x07, 0x7A, 0x72}));
+
+    FakeTx context_tx;
+    Xs8ServiceCore context(context_tx, Ms(2000), true, {}, [] { return at(0); });
+    context.connected(1);
+    context.set_research_context_enabled(true);
+    context.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED", at(1), at(1), 1);
+    assert(context.command("KEY_DOWN SEEK_FORWARD", at(2), at(2), 1) ==
+           "ERR RESEARCH_CONTEXT_ACTIVE\n");
+    assert(context.command("KEY_UP SEEK_FORWARD", at(2), at(2), 1) ==
+           "OK KEY_UP_NONE last=NONE\n");
+    assert(context_tx.sent == (Bytes{0x17}));
+
+    FakeTx boot_tx;
+    Xs8ServiceCore boot(boot_tx, Ms(2000), false, {}, [] { return at(0); });
+    boot.connected(1);
+    assert(boot.command("KEY_DOWN SEEK_FORWARD", at(1), at(1), 1) == "ERR BOOT_INHIBIT\n");
+    assert(boot.command("KEY_DOWN SEEK_FORWARD", at(1), at(1), 9) == "ERR NO_CLIENT\n");
+    assert(boot_tx.sent.empty());
+
+    // Monitor failure and shutdown keep their existing release paths.
+    FakeTx monitor_tx;
+    Xs8ServiceCore monitor(monitor_tx, Ms(2000), true, {}, [] { return at(0); });
+    monitor.connected(1);
+    monitor_tx.healthy = false;
+    assert(monitor.command("KEY_DOWN SEEK_FORWARD", at(1), at(1), 1) == "ERR MONITOR_FAILED\n");
+    monitor_tx.healthy = true;
+    monitor.command("KEY_DOWN SEEK_FORWARD", at(2), at(2), 1);
+    monitor_tx.healthy = false;
+    monitor.tick(at(3));
+    assert(monitor_tx.sent == (Bytes{0x7A, 0x72}) && monitor.cd_fault());
+
+    FakeTx shut_tx;
+    Xs8ServiceCore shut(shut_tx, Ms(2000), true, {}, [] { return at(0); });
+    shut.connected(1);
+    shut.command("KEY_DOWN SEEK_BACKWARD", at(1), at(1), 1);
+    assert(shut.shutdown(at(2)));
+    assert(shut_tx.sent == (Bytes{0x6A, 0x72}));
+    assert(shut.command("KEY_DOWN SEEK_BACKWARD", at(3), at(3), 1) == "ERR SHUTDOWN\n");
+}
+
 int main()
 {
     test_startup_and_parsing();
@@ -1455,6 +1689,7 @@ int main()
     test_cd_hold_max_hold();
     test_volume_step();
     test_cd_transport_keys();
+    test_cd_key_holds();
     test_context_gates_and_authorization();
     test_context_send_exit_and_token_ownership();
     test_context_excludes_every_other_transmission();

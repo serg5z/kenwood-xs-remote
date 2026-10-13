@@ -64,6 +64,9 @@ public:
     // Absolute limit on one explicit CD hold, measured from the successful
     // CD_PRESS request; heartbeats renew only the lease, never this limit.
     static constexpr VolumeControl::Ms kCdMaxHold{10000};
+    // Inactivity limit for a connection-owned (KEY_DOWN) hold; repeated KEY_DOWN
+    // from the owner renews it. Token holds keep the cd_lease argument.
+    static constexpr VolumeControl::Ms kCdKeyInactivity{1200};
 private:
     std::string context_command(const std::string& line, Time now,
                                 uint64_t client_id);
@@ -73,8 +76,12 @@ private:
     std::string volume_step(VolumeControl::Direction direction, Time now);
     std::string cd_track(uint8_t press_byte, const char *action);
     std::string cd_transport(uint8_t byte, const char *action);
-    std::string cd_press(uint8_t press_byte, const char *action, Time now);
-    std::string cd_release(const char *reason);
+    // owner: the socket client of a connection-owned (KEY_DOWN) hold, or null
+    // for a token hold. key_action: reply in KEY_UP form.
+    std::string cd_press(uint8_t press_byte, const char *action, Time now,
+                         const uint64_t *owner = nullptr);
+    std::string cd_release(const char *reason, const char *key_action = nullptr);
+    std::string key_command(const std::string& line, Time now, uint64_t client_id);
     std::string cd_preflight() const;
     bool attempt_cd_release();
     ServiceTransmitter& tx_;
@@ -91,6 +98,13 @@ private:
     Time cd_hold_started_{};
     Time cd_lease_renewed_{};
     uint64_t cd_hold_token_ = 0;
+    bool cd_key_owned_ = false;
+    uint64_t cd_key_owner_ = 0;
+    // After an INACTIVITY or MAX_HOLD release, the former owner's KEY_DOWN is
+    // refused until it sends KEY_UP or disconnects: a late keepalive must never
+    // start a new press.
+    bool cd_key_rearm_blocked_ = false;
+    uint64_t cd_key_blocked_client_ = 0;
     uint64_t cd_last_token_ = 0;
     bool cd_lease_expired_ = false;
     std::string cd_action_ = "NONE";

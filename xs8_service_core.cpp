@@ -167,7 +167,7 @@ std::string Xs8ServiceCore::cd_preflight() const
 }
 
 std::string Xs8ServiceCore::cd_press(uint8_t press_byte, const char *action,
-                                     Time now)
+                                     Time now, const uint64_t *owner)
 {
     const std::string denied = cd_preflight();
     if (!denied.empty()) return denied;
@@ -202,7 +202,8 @@ std::string Xs8ServiceCore::cd_press(uint8_t press_byte, const char *action,
             waveform_name(press.waveform),
             cd_release_evidence_.gpio_completed ? "TX_OK" : "TX_FAIL",
             waveform_name(cd_release_evidence_.waveform));
-        return std::string("ERR CD_PRESS_UNCERTAIN action=") + action +
+        return std::string(owner ? "ERR KEY_DOWN_UNCERTAIN action="
+                                 : "ERR CD_PRESS_UNCERTAIN action=") + action +
             " gpio_tx=" + (press.gpio_completed ? "TX_OK" : "TX_FAIL") +
             " waveform=" + waveform_name(press.waveform) +
             " release_gpio_tx=" +
@@ -211,30 +212,44 @@ std::string Xs8ServiceCore::cd_press(uint8_t press_byte, const char *action,
             " receiver_execution=UNVERIFIED\n";
     }
     cd_hold_started_ = cd_lease_renewed_ = now;
+    // A connection-owned hold still gets a fresh token, but never reveals it:
+    // token and connection holds cannot release each other.
     cd_hold_token_ = token;
     cd_last_token_ = token;
     cd_hold_ = true;
+    cd_key_owned_ = owner != nullptr;
+    cd_key_owner_ = owner ? *owner : 0;
     cd_last_result_ = "HOLDING";
-    std::fprintf(stderr, "XS8 CD_PRESS action=%s gpio_tx=TX_OK "
+    std::fprintf(stderr, "XS8 CD_PRESS action=%s owner=%s gpio_tx=TX_OK "
                          "waveform=MATCH receiver_execution=UNVERIFIED\n",
-                         action);
+                         action, owner ? "CONNECTION" : "TOKEN");
+    if (owner)
+        return std::string("OK KEY_DOWN_TX action=") + action +
+            " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n";
     return std::string("OK CD_PRESS_TX action=") + action +
         " hold_token=" + std::to_string(cd_hold_token_) +
         " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n";
 }
 
-std::string Xs8ServiceCore::cd_release(const char *reason)
+std::string Xs8ServiceCore::cd_release(const char *reason, const char *key_action)
 {
     if (!cd_hold_) return "ERR CD_NOT_ACTIVE\n";
     const bool verified = attempt_cd_release();
     cd_hold_ = false;
     cd_active_ = false;
     cd_hold_token_ = 0;
+    cd_key_owned_ = false;
     cd_last_result_ = verified ? reason : "RELEASE_UNCERTAIN";
     std::fprintf(stderr, "XS8 CD_RELEASE reason=%s gpio_tx=%s waveform=%s "
                          "receiver_execution=UNVERIFIED\n", reason,
         cd_release_evidence_.gpio_completed ? "TX_OK" : "TX_FAIL",
         waveform_name(cd_release_evidence_.waveform));
+    if (key_action)
+        return std::string(verified ? "OK KEY_UP_TX" : "ERR KEY_UP_UNCERTAIN") +
+            " action=" + key_action +
+            " gpio_tx=" + (cd_release_evidence_.gpio_completed ? "TX_OK" : "TX_FAIL") +
+            " waveform=" + waveform_name(cd_release_evidence_.waveform) +
+            " receiver_execution=UNVERIFIED\n";
     return std::string(verified ? "OK CD_RELEASE_TX" :
                        "ERR CD_RELEASE_UNCERTAIN") +
         " reason=" + reason +
@@ -326,6 +341,39 @@ std::string Xs8ServiceCore::cd_transport(uint8_t byte, const char *action)
         " receiver_execution=UNVERIFIED\n";
 }
 
+// Connection-owned CD holds. The socket client that sent KEY_DOWN owns the hold;
+// KEY_UP, its disconnect, 1200 ms without KEY_DOWN, MAX_HOLD, monitor failure or
+// shutdown release it through the same cd_release() path as token holds.
+std::string Xs8ServiceCore::key_command(const std::string& line, Time now,
+                                        uint64_t client_id)
+{
+    const bool down = line.compare(0, 9, "KEY_DOWN ") == 0;
+    const std::string action = line.substr(down ? 9 : 7);
+    uint8_t byte = 0;
+    if (action == "SEEK_FORWARD") byte = 0x7A;
+    else if (action == "SEEK_BACKWARD") byte = 0x6A;
+    else return "ERR KEY_UNKNOWN_ACTION\n";
+    const bool owner = cd_hold_ && cd_key_owned_ && cd_key_owner_ == client_id;
+    if (!down) {
+        if (owner && cd_action_ != action) return "ERR KEY_ACTION_MISMATCH\n";
+        if (owner) return cd_release("CLIENT_RELEASE", action.c_str());
+        if (cd_hold_) return "ERR KEY_NOT_OWNER\n";
+        if (cd_key_rearm_blocked_ && cd_key_blocked_client_ == client_id)
+            cd_key_rearm_blocked_ = false;
+        return "OK KEY_UP_NONE last=" + cd_last_result_ + "\n";
+    }
+    if (owner && cd_action_ == action) {
+        cd_lease_renewed_ = now; // Keepalive: no XS8 frame.
+        return "OK KEY_ALIVE action=" + action + "\n";
+    }
+    if (cd_hold_ || cd_active_) return "ERR KEY_BUSY\n";
+    if (cd_key_rearm_blocked_ && cd_key_blocked_client_ == client_id)
+        return "ERR KEY_EXPIRED last=" + cd_last_result_ + "\n";
+    if (cd_fault_) return "ERR CD_FAULT_LATCHED\n";
+    if (!tx_.monitor_healthy()) return "ERR MONITOR_FAILED\n";
+    return cd_press(byte, action.c_str(), now, &client_id);
+}
+
 std::string Xs8ServiceCore::command(const std::string& line, Time received,
                                     Time now, uint64_t client_id)
 {
@@ -334,6 +382,9 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
     if (!clients_.count(client_id)) return "ERR NO_CLIENT\n";
     if (line.compare(0, 16, "CONTEXT_SESSION_") == 0)
         return context_command(line, now, client_id);
+    // KEY_UP transmits only to end this connection's own hold, so like
+    // VOLUME_RELEASE it is answered even while research CONTEXT is open.
+    if (line.compare(0, 7, "KEY_UP ") == 0) return key_command(line, now, client_id);
     // No other XS8 transmission while research CONTEXT may be open. RELEASE
     // stays available; it transmits nothing without an active hold.
     if (context_open_) {
@@ -342,6 +393,7 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
             return "OK VOLUME_RELEASE_TX\n";
         return "ERR RESEARCH_CONTEXT_ACTIVE\n";
     }
+    if (line.compare(0, 9, "KEY_DOWN ") == 0) return key_command(line, now, client_id);
     if (line == "CD_RELEASE" || line.compare(0, 11, "CD_RELEASE ") == 0 ||
         line == "CD_HEARTBEAT" ||
         line.compare(0, 13, "CD_HEARTBEAT ") == 0) {
@@ -350,7 +402,7 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
         const bool heartbeat = line.compare(0, 13, "CD_HEARTBEAT ") == 0;
         if (!cd_token(line, heartbeat ? "CD_HEARTBEAT " : "CD_RELEASE ",
                       token)) return "ERR CD_TOKEN_REQUIRED\n";
-        if (token != cd_hold_token_) return "ERR CD_NOT_OWNER\n";
+        if (cd_key_owned_ || token != cd_hold_token_) return "ERR CD_NOT_OWNER\n";
         if (heartbeat) {
             cd_lease_renewed_ = now;
             return "OK CD_LEASE_RENEWED\n";
@@ -537,6 +589,10 @@ std::string Xs8ServiceCore::research_send(uint8_t byte, Time now,
 void Xs8ServiceCore::disconnected(Time now, uint64_t client_id)
 {
     if (!clients_.erase(client_id)) return;
+    if (cd_hold_ && cd_key_owned_ && cd_key_owner_ == client_id)
+        cd_release("CLIENT_DISCONNECT");
+    if (cd_key_rearm_blocked_ && cd_key_blocked_client_ == client_id)
+        cd_key_rearm_blocked_ = false;
     if (context_open_ && context_owner_ == client_id)
         context_close(now, "OWNER_DISCONNECTED", false);
     if (!volume_owner_set_ || volume_owner_client_ != client_id) return;
@@ -567,13 +623,21 @@ void Xs8ServiceCore::tick(Time now)
         // Whichever deadline passed first names the release. Both use the
         // single cd_release() path, which clears the hold, so a late
         // heartbeat finds no hold to renew.
-        const Time lease_end = cd_lease_renewed_ + cd_lease_;
+        const bool key_owned = cd_key_owned_;
+        const uint64_t key_owner = cd_key_owner_;
+        const Time lease_end = cd_lease_renewed_ +
+            (key_owned ? kCdKeyInactivity : cd_lease_);
         const Time max_end = cd_hold_started_ + cd_max_hold_;
-        if (now >= max_end && max_end <= lease_end) {
-            cd_release("MAX_HOLD");
-        } else if (now >= lease_end) {
-            cd_release("LEASE_EXPIRED");
-            cd_lease_expired_ = true;
+        const char *expired =
+            now >= max_end && max_end <= lease_end ? "MAX_HOLD" :
+            now >= lease_end ? (key_owned ? "INACTIVITY" : "LEASE_EXPIRED") : nullptr;
+        if (expired) {
+            cd_release(expired);
+            if (std::string(expired) != "MAX_HOLD") cd_lease_expired_ = true;
+            if (key_owned) {
+                cd_key_rearm_blocked_ = true;
+                cd_key_blocked_client_ = key_owner;
+            }
         }
     }
     if (!tx_.monitor_healthy()) {

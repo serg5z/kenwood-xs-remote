@@ -1,6 +1,6 @@
 # CD transport socket API, phase 2
 
-`xs8-service` remains the only XS8 GPIO owner. Commands use its **local Unix socket** and ROOT context. The [protocol evidence](xs8-protocol.md#cd-transport-press-and-release-in-root) is specific to the KR-V6070 and connected changer. The Web Remote exposes only the discrete `CD_TRACK_NEXT`/`CD_TRACK_PREVIOUS` requests behind a default-off Gateway gate ([Web API, Phase A](web-api.md#cd-track-nextprevious-phase-a)). The single-frame PLAY, PLAY/PAUSE and STOP keys and explicit holds are socket-only.
+`xs8-service` remains the only XS8 GPIO owner. Commands use its **local Unix socket** and ROOT context. The [protocol evidence](xs8-protocol.md#cd-transport-press-and-release-in-root) is specific to the KR-V6070 and connected changer. The Web Remote exposes only the discrete `CD_TRACK_NEXT`/`CD_TRACK_PREVIOUS` requests behind a default-off Gateway gate ([Web API, Phase A](web-api.md#cd-track-nextprevious-phase-a)). The single-frame PLAY, PLAY/PAUSE and STOP keys, token holds and connection-owned `KEY_DOWN`/`KEY_UP` holds are socket-only.
 
 | Request line | Logical ROOT frame(s) | Meaning in the tested setup |
 |---|---|---|
@@ -15,6 +15,32 @@
 | `CD_PLAY\n` | `0x41` | One PLAY key frame. |
 | `CD_PLAY_PAUSE\n` | `0xBC` | One PLAY/PAUSE toggle key frame. **Provisional mapping** (see below). |
 | `CD_STOP\n` | `0x9C` | One CD STOP/CANCEL key frame. |
+
+### Connection-owned seek: KEY_DOWN / KEY_UP
+
+`KEY_DOWN SEEK_FORWARD|SEEK_BACKWARD` and `KEY_UP SEEK_FORWARD|SEEK_BACKWARD` start and end the same held seek as `CD_PRESS`, with the same KEY DOWN (`0x7A`/`0x6A`), the same `0x72` release path, uncertainty replies and CD fault latching. The difference is **ownership**: the hold belongs to the socket connection that sent `KEY_DOWN`, not to a token. No token is revealed.
+
+| Request (on the owning connection unless noted) | Reply | XS8 TX |
+|---|---|---|
+| `KEY_DOWN A` while CD is idle | `OK KEY_DOWN_TX action=A gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED` | KEY DOWN once |
+| `KEY_DOWN A` again, same action | `OK KEY_ALIVE action=A` (renews inactivity) | none |
+| `KEY_DOWN` while any CD hold exists (other action, other connection, token hold) | `ERR KEY_BUSY` | none |
+| `KEY_UP A` | `OK KEY_UP_TX action=A …` or `ERR KEY_UP_UNCERTAIN action=A …` | `0x72` |
+| `KEY_UP` naming the other action | `ERR KEY_ACTION_MISMATCH` | none |
+| `KEY_UP` from another connection, or for a token hold | `ERR KEY_NOT_OWNER` | none |
+| `KEY_UP` with no hold (late, repeated, after expiry) | `OK KEY_UP_NONE last=<cd_last_result>` | none |
+
+An uncertain KEY DOWN replies `ERR KEY_DOWN_UNCERTAIN …`; the service has already attempted `0x72` and latched a fault, as for `CD_PRESS`. Any other action name gets `ERR KEY_UNKNOWN_ACTION`.
+
+A connection-owned hold is released by `KEY_UP`; by its **owner connection closing**, which the event loop handles immediately with reason `CLIENT_DISCONNECT`; by **1200 ms without `KEY_DOWN`** (`INACTIVITY`, which also sets `cd_lease_expired=1`); by the **10 s maximum** (`MAX_HOLD`); and by monitor failure or shutdown as before. A non-owner's `KEY_UP` or disconnect never affects it. After an `INACTIVITY` or `MAX_HOLD` release, the former owner's next `KEY_DOWN` gets `ERR KEY_EXPIRED last=<reason>` and transmits nothing until that connection sends `KEY_UP` or disconnects, so a late keepalive can never start a new press. Other connections are not blocked.
+
+Token holds are unchanged: `CD_PRESS` keeps its 2000 ms lease, `CD_HEARTBEAT`/`CD_RELEASE` keep their replies, and disconnecting does not release them. The two kinds never release each other: `KEY_UP` answers `KEY_NOT_OWNER` for a token hold, and `CD_HEARTBEAT`/`CD_RELEASE` answer `CD_NOT_OWNER` for a connection-owned hold whatever token is given. `KEY_DOWN` is subject to the same shutdown and research-uncertainty gates as `CD_PRESS`; `KEY_UP` is answered even while research CONTEXT is open, transmitting only to end the caller's own hold.
+
+**Why KEY_UP is never blocked by an exclusive mode.** The service loop's exclusive modes (a QUERY_STATUS collection, a research CONTEXT preparation, a research chain, a CONTEXT session) refuse most commands, and `KEY_UP` is not on their allowlists. That is safe because of two invariants:
+1. **None of them can start during a CD hold.** A hold always has `cd_active=1` and an owed release. `QUERY_STATUS` answers `ERR CD_TRACK_BUSY`, preparation `UNRESOLVED_CONTROL_STATE`, `RESEARCH_SEND`/`RESEARCH_CHAIN` `reason=CD_TRACK_BUSY`, and `CONTEXT_SESSION_ENTER` `reason=CD_BUSY`.
+2. **No hold can start during any of them.** Each refuses `KEY_DOWN` and `CD_PRESS`.
+
+`KEY_UP` itself is handled before the CONTEXT, fault and monitor checks, and is not subject to the shutdown or research-uncertainty gates. A fault or monitor failure has already ended any hold through `0x72`. During shutdown, the service closes every client, which releases a connection-owned hold, before its final cleanup. A non-owner's `KEY_UP` never transmits. The socket tests check both invariants.
 
 ### Single-frame keys: PLAY, PLAY/PAUSE and STOP
 

@@ -938,6 +938,7 @@ int main(int argc, char **argv)
                 if (line == "CD_TRACK_NEXT" ||
                     line == "CD_TRACK_PREVIOUS" ||
                     line.compare(0, 9, "CD_PRESS ") == 0 ||
+                    line.compare(0, 9, "KEY_DOWN ") == 0 ||
                     line == "CD_PLAY" || line == "CD_PLAY_PAUSE" || line == "CD_STOP" ||
                     line == "VOLUME_STEP UP" || line == "VOLUME_STEP DOWN") {
                     if (stopping) {

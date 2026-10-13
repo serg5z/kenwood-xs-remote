@@ -166,6 +166,77 @@ class ServiceSocketTest(unittest.TestCase):
         for field in ("cd_state=IDLE", "cd_action=STOP", "cd_last_result=TX_VERIFIED"):
             self.assertIn(field, status)
 
+    def wait_status(self, field, timeout=3):
+        deadline = time.monotonic() + timeout
+        while field not in self.request("STATUS"):
+            self.assertLess(time.monotonic(), deadline, field)
+            time.sleep(0.02)
+
+    def test_key_hold_is_owned_by_its_connection(self):
+        ok_up = " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED"
+        # One round trip per connection before opening the next: the service's
+        # listen backlog of 1 can refuse back-to-back connects (known follow-up).
+        with self.connect() as owner:
+            self.command(owner, "STATUS")
+            cec = self.connect()
+            self.addCleanup(cec.close)
+            self.assertEqual(self.command(owner, "KEY_DOWN SEEK_FORWARD"),
+                             "OK KEY_DOWN_TX action=SEEK_FORWARD" + ok_up)
+            for _ in range(4):
+                time.sleep(0.3)
+                self.assertEqual(self.command(owner, "KEY_DOWN SEEK_FORWARD"),
+                                 "OK KEY_ALIVE action=SEEK_FORWARD")
+            self.assertEqual(self.transmitted(), ["0x7A"])
+            # Other connections, including short-lived ones, cannot end it.
+            self.assertEqual(self.request("KEY_UP SEEK_FORWARD"), "ERR KEY_NOT_OWNER")
+            self.assertEqual(self.command(cec, "VOLUME_PRESS UP"), "ERR CD_TRACK_BUSY")
+            self.assertEqual(self.command(cec, "KEY_UP SEEK_FORWARD"), "ERR KEY_NOT_OWNER")
+            self.assertIn("cd_state=HOLDING cd_action=SEEK_FORWARD", self.request("STATUS"))
+            self.assertEqual(self.command(owner, "KEY_UP SEEK_FORWARD"),
+                             "OK KEY_UP_TX action=SEEK_FORWARD" + ok_up)
+            self.assertEqual(self.command(owner, "KEY_UP SEEK_FORWARD"),
+                             "OK KEY_UP_NONE last=CLIENT_RELEASE")
+        self.assertEqual(self.transmitted(), ["0x7A", "0x72"])
+
+    def test_closing_the_owner_connection_releases_immediately(self):
+        with self.connect() as other:
+            self.command(other, "STATUS")  # Accepted before the next connect.
+            with self.connect() as owner:
+                self.assertTrue(self.command(owner, "KEY_DOWN SEEK_BACKWARD").startswith(
+                    "OK KEY_DOWN_TX"))
+            closed = time.monotonic()
+            self.wait_status("cd_last_result=CLIENT_DISCONNECT")
+            # Well inside the 1200 ms inactivity limit: the event loop released it.
+            self.assertLess(time.monotonic() - closed, 0.5)
+            self.assertEqual(self.transmitted(), ["0x6A", "0x72"])
+            self.assertEqual(self.command(other, "STATUS").split()[1], "state=IDLE")
+
+    def test_silent_open_owner_is_released_by_inactivity_and_cannot_restart(self):
+        with self.connect() as owner:
+            self.assertTrue(self.command(owner, "KEY_DOWN SEEK_FORWARD").startswith(
+                "OK KEY_DOWN_TX"))
+            pressed = time.monotonic()
+            self.wait_status("cd_last_result=INACTIVITY")
+            self.assertGreaterEqual(time.monotonic() - pressed, 1.1)
+            self.assertEqual(self.command(owner, "KEY_DOWN SEEK_FORWARD"),
+                             "ERR KEY_EXPIRED last=INACTIVITY")
+            self.assertEqual(self.transmitted(), ["0x7A", "0x72"])
+            self.assertEqual(self.command(owner, "KEY_UP SEEK_FORWARD"),
+                             "OK KEY_UP_NONE last=INACTIVITY")
+            self.assertTrue(self.command(owner, "KEY_DOWN SEEK_FORWARD").startswith(
+                "OK KEY_DOWN_TX"))
+        self.wait_status("cd_last_result=CLIENT_DISCONNECT")
+        self.assertEqual(self.transmitted(), ["0x7A", "0x72", "0x7A", "0x72"])
+
+    def test_token_hold_unchanged_and_not_releasable_by_key_up(self):
+        token = self.press("SEEK_FORWARD")
+        self.assertEqual(self.request("KEY_UP SEEK_FORWARD"), "ERR KEY_NOT_OWNER")
+        self.assertEqual(self.request("KEY_DOWN SEEK_FORWARD"), "ERR KEY_BUSY")
+        time.sleep(1.4)  # Past the KEY inactivity limit, inside the 2 s token lease.
+        self.assertEqual(self.request("CD_HEARTBEAT " + token), "OK CD_LEASE_RENEWED")
+        self.assertTrue(self.request("CD_RELEASE " + token).startswith("OK CD_RELEASE_TX"))
+        self.assertEqual(self.transmitted(), ["0x7A", "0x72"])
+
     def test_listener_accepts_bursts_beside_a_persistent_client(self):
         """Normal load: one long-lived owner plus bursts of short-lived requests
         connecting back to back. None may be refused before the service accepts."""
@@ -198,6 +269,38 @@ class ServiceSocketTest(unittest.TestCase):
             for client in clients:
                 client.close()
         self.assertEqual(self.transmitted(), [])
+
+    def test_exclusive_modes_cannot_start_during_key_hold_so_key_up_is_never_gated(self):
+        """KEY_UP is not on the exclusive-mode allowlists. That is safe because
+        none of those modes can begin while a CD hold owes its release, and none
+        lets a hold begin while it is active."""
+        with self.connect() as owner:
+            self.assertTrue(self.command(owner, "KEY_DOWN SEEK_FORWARD").startswith(
+                "OK KEY_DOWN_TX"))
+            for line, refusal in (
+                    ("QUERY_STATUS", "ERR CD_TRACK_BUSY"),
+                    ("RESEARCH_CONTEXT_PREPARE MUTE CONFIRM_NO_TX",
+                     "ERR RESEARCH_CONTEXT reason=UNRESOLVED_CONTROL_STATE"),
+                    ("RESEARCH_SEND 0x84 100", "ERR RESEARCH reason=CD_TRACK_BUSY"),
+                    ("RESEARCH_CHAIN 2 200 100 0x84 0x82", "ERR RESEARCH reason=CD_TRACK_BUSY"),
+                    ("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED",
+                     "ERR CONTEXT_SESSION reason=CD_BUSY")):
+                self.assertEqual(self.request(line), refusal)
+                self.assertIn("cd_state=HOLDING", self.request("STATUS"))
+            self.assertEqual(self.request("KEY_UP SEEK_FORWARD"), "ERR KEY_NOT_OWNER")
+            self.assertEqual(self.transmitted(), ["0x7A"])
+            self.assertTrue(self.command(owner, "KEY_UP SEEK_FORWARD").startswith(
+                "OK KEY_UP_TX action=SEEK_FORWARD"))
+        self.assertEqual(self.transmitted(), ["0x7A", "0x72"])
+
+    def test_orderly_shutdown_releases_connection_owned_hold(self):
+        owner = self.connect()
+        self.addCleanup(owner.close)
+        self.assertTrue(self.command(owner, "KEY_DOWN SEEK_BACKWARD").startswith(
+            "OK KEY_DOWN_TX"))
+        self.process.terminate()
+        self.assertEqual(self.process.wait(timeout=3), 0)
+        self.assertEqual(self.transmitted(), ["0x6A", "0x72"])
 
     def test_volume_owner_disconnect_still_stops_with_other_clients(self):
         with self.connect() as cec:
