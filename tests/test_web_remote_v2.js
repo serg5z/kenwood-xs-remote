@@ -87,6 +87,7 @@ let monitorReport = { value: 'UNKNOWN', freshness: 'UNKNOWN' };
 let integrity = 'HEALTHY';
 let connected = true;
 let flags = { hold: true, power: true, monitor: true, step: true };
+let holdMaxMs = 20000;
 let hold = null;
 let holds = 0;
 let network = 'up';
@@ -150,11 +151,11 @@ const context = {
         source: { enabled: true, available_sources: ['CD', 'TUNER', 'PHONO', 'TV1', 'TV2', 'TAPE1'] },
         volume_step: { enabled: flags.step, available_directions: ['UP', 'DOWN'], min_interval_ms: 250 },
         volume_hold: { enabled: flags.hold, available_directions: ['UP', 'DOWN'], hold_delay_ms: 400,
-          heartbeat_ms: 500, lease_ms: 1200, max_hold_ms: 3000 },
+          heartbeat_ms: 500, lease_ms: 1200, max_hold_ms: holdMaxMs },
         power: { enabled: flags.power, available_actions: ['ON', 'OFF'] },
         tape2_monitor: { enabled: flags.monitor, provisional: true } } } });
     }
-    const record = { url, body: JSON.parse(options.body), token: options.headers['X-CSRF-Token'] };
+    const record = { url, body: JSON.parse(options.body), token: options.headers['X-CSRF-Token'], at: now };
     requests.push(record);
     const plan = plans.shift();
     if (plan === 'drop') {
@@ -260,20 +261,41 @@ async function main() {
   assert.equal(requests.length, 4, 'no step, no heartbeat after release');
   await idle();
 
-  // 5b. The hold ends on its own (3 s maximum) while the finger stays down for
-  //     5 s: the late release and its click still never add a step.
-  reset();
-  await up.fire('pointerdown');
-  await advance(400);
-  await advance(3600);
-  assert.equal(sent().at(-1), 'volume/hold RELEASE', 'released at the maximum');
-  const count = requests.length;
-  await advance(1000);
-  await up.fire('pointerup');
-  await up.fire('click');
-  await advance(2000);
-  assert.equal(requests.length, count, 'no step after a hold, however late the release');
-  await idle();
+  // 5b. The hold ends on its own at the 20 s maximum while the finger stays down
+  //     for 22 s: heartbeats every 500 ms keep it alive to 19,999 ms, RELEASE
+  //     comes at 20,000 ms, and the late release and its click add no step.
+  const holdUntilMaximum = async (button, label) => {
+    reset();
+    await button.fire('pointerdown');
+    await advance(400);
+    const started = now;
+    await advance(19999);
+    const beats = requests.filter((r) => r.body.action === 'HEARTBEAT');
+    assert.deepEqual(sent(), ['volume/hold START', ...beats.map(() => 'volume/hold HEARTBEAT')],
+      `${label}: no RELEASE at 19,999 ms`);
+    assert.equal(beats.length, 39);
+    beats.forEach((beat, index) => assert.equal(beat.at - started, 500 * (index + 1),
+      'one heartbeat every 500 ms, inside the 1200 ms service inactivity limit'));
+    assert.notEqual(hold, null);
+    await advance(1);
+    assert.equal(sent().at(-1), 'volume/hold RELEASE', `${label}: released at 20,000 ms`);
+    assert.equal(requests.at(-1).at - started, 20000);
+    assert.equal(hold, null);
+    const count = requests.length;
+    await advance(2000);
+    await button.fire('pointerup');
+    await button.fire('click');
+    await advance(3000);
+    assert.equal(requests.length, count, 'no step and no restart after the maximum');
+    await idle();
+  };
+  await holdUntilMaximum(up, 'max 20000');
+  // A capability above 20 s is not trusted: the browser keeps its 20 s bound.
+  holdMaxMs = 20001;
+  await advance(6000);
+  await holdUntilMaximum(down, 'max 20001');
+  holdMaxMs = 20000;
+  await advance(6000);
 
   // 6. Release before the START response: RELEASE as soon as START answers.
   reset();

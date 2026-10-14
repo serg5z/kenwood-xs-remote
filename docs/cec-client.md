@@ -31,7 +31,7 @@ The new `cec_client_core_test` exercises press/release, repeated and out-of-orde
 3. With the receiver attended, start manually from the repository root:
 
    ```sh
-   ./.build/cec-xs-client --socket /tmp/kenwood-xs8.sock --max-hold-ms 2000
+   ./.build/cec-xs-client --socket /tmp/kenwood-xs8.sock --max-hold-ms 20000
    ```
 
    Match the maximum hold to the reviewed service configuration; the service's own limit remains authoritative. No socket or XS8 command is opened at startup. Test one short volume-down press/release first, then up and MUTE separately while watching the receiver. Inspect the client and service logs for `VOLUME_RELEASE`, STOP waveform evidence, and faults. A successful socket reply or TX waveform does not prove receiver execution. Stop validation immediately if the motor continues unexpectedly.

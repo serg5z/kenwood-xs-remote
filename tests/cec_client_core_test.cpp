@@ -78,6 +78,46 @@ static void test_missing_release_stale_and_max_hold()
     assert(tx.commands.back() == "VOLUME_RELEASE DOWN");
 }
 
+// The default client maximum is the service's 20 s MAX_HOLD.
+static void test_default_max_hold_20_seconds()
+{
+    FakeTransport tx;
+    CecClientCore client(tx);
+    // TV repeats every 500 ms (inside the 1200 ms inactivity limit) to 19,999 ms.
+    for (int ms = 10; ms <= 20009; ms += ms == 19510 ? 499 : 500)
+        client.event({CecKey::UP, 0, at(ms)}, at(ms));
+    client.tick(at(20009));
+    assert(client.holding() && tx.connects == 1);
+    assert(tx.commands.size() == 41 && tx.commands.back() == "VOLUME_PRESS UP");
+    client.tick(at(20010));
+    assert(!client.holding() && client.quarantined());
+    assert(tx.commands.back() == "VOLUME_RELEASE UP" && !tx.connected);
+    // Continuing repeats never restart the hold; only a release re-arms.
+    for (int ms = 20100; ms <= 22100; ms += 500)
+        client.event({CecKey::UP, 0, at(ms)}, at(ms));
+    assert(tx.commands.size() == 42 && tx.connects == 1);
+    client.event({CecKey::UP, 3, at(22200)}, at(22200));
+    assert(!client.quarantined());
+    client.event({CecKey::UP, 0, at(22300)}, at(22300));
+    assert(client.holding() && tx.connects == 2 && tx.commands.back() == "VOLUME_PRESS UP");
+    // Missing repeats: inactivity releases well inside the maximum.
+    for (int ms = 22800; ms <= 32300; ms += 500)
+        client.event({CecKey::UP, 0, at(ms)}, at(ms));
+    client.tick(at(33499));
+    assert(client.holding());
+    client.tick(at(33500));
+    assert(!client.holding() && client.quarantined());
+    assert(tx.commands.back() == "VOLUME_RELEASE UP");
+    // A service disconnect mid-hold is never replayed.
+    client.event({CecKey::UP, 4, at(33600)}, at(33600));
+    client.event({CecKey::UP, 0, at(33700)}, at(33700));
+    assert(client.holding());
+    const size_t sent = tx.commands.size();
+    tx.available = false;
+    client.tick(at(48700));
+    assert(!client.holding() && client.quarantined() && tx.commands.size() == sent);
+}
+
 static void test_disconnect_and_uncertain_no_replay()
 {
     FakeTransport tx;
@@ -147,6 +187,7 @@ int main()
 {
     test_press_repeat_release_and_direction();
     test_missing_release_stale_and_max_hold();
+    test_default_max_hold_20_seconds();
     test_disconnect_and_uncertain_no_replay();
     test_unavailable_mute_and_duplicate_events();
     test_bounded_queue();

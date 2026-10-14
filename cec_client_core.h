@@ -41,7 +41,7 @@ public:
     using Time = CecClock::time_point;
     using Ms = std::chrono::milliseconds;
     explicit CecClientCore(CecServiceTransport& transport,
-        Ms inactivity = Ms(1200), Ms max_hold = Ms(2000));
+        Ms inactivity = Ms(1200), Ms max_hold = Ms(20000));
     void event(CecEvent event, Time now);
     void tick(Time now);
     void overflow(Time now);

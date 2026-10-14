@@ -32,7 +32,7 @@ let volumeHoldReady = false;
 let enabledVolumeHoldDirections = [];
 let volumeHoldDelayMs = 400;
 let volumeHoldHeartbeatMs = 500;
-let volumeHoldMaxMs = 3000;
+let volumeHoldMaxMs = 20000;
 // { button, timer } between a volume pointerdown and hold_delay_ms.
 let volumeGesture = null;
 // After a gesture became a hold, its click is suppressed: indefinitely while the
@@ -224,7 +224,7 @@ function applyRefresh(statusData, sessionData, capabilitiesData) {
     (Number.isInteger(value) && value >= low && value <= high ? value : fallback);
   volumeHoldDelayMs = bounded(holdOperation && holdOperation.hold_delay_ms, 200, 1000, 400);
   volumeHoldHeartbeatMs = bounded(holdOperation && holdOperation.heartbeat_ms, 200, 1000, 500);
-  volumeHoldMaxMs = bounded(holdOperation && holdOperation.max_hold_ms, 1000, 3000, 3000);
+  volumeHoldMaxMs = bounded(holdOperation && holdOperation.max_hold_ms, 1000, 20000, 20000);
   const powerOperation = operations && operations.power;
   powerReady = !!csrfToken && sessionData.power_available === true && cdIdle &&
     !!powerOperation && powerOperation.enabled === true &&

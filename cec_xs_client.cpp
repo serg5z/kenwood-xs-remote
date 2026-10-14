@@ -36,7 +36,7 @@ void on_key(void*, const cec_keypress* key)
 int main(int argc, char** argv)
 {
     std::string socket_path = "/tmp/kenwood-xs8.sock";
-    long max_hold = 2000;
+    long max_hold = 20000; // The same absolute MAX_HOLD as the service.
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--socket") == 0 && i + 1 < argc)
             socket_path = argv[++i];
@@ -44,12 +44,12 @@ int main(int argc, char** argv)
             char* end = nullptr;
             errno = 0;
             max_hold = std::strtol(argv[++i], &end, 10);
-            if (!end || *end || errno == ERANGE || max_hold < 100 || max_hold > 3000) {
-                std::fprintf(stderr, "Invalid max hold (100..3000 ms)\n");
+            if (!end || *end || errno == ERANGE || max_hold < 100 || max_hold > 20000) {
+                std::fprintf(stderr, "Invalid max hold (100..20000 ms)\n");
                 return 2;
             }
         } else {
-            std::fprintf(stderr, "Usage: %s [--socket PATH] [--max-hold-ms 100..3000]\n",
+            std::fprintf(stderr, "Usage: %s [--socket PATH] [--max-hold-ms 100..20000]\n",
                          argv[0]);
             return 2;
         }

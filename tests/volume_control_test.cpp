@@ -183,6 +183,54 @@ static void test_watchdogs_and_stale_queue() {
     CHECK(ctl3.press(Direction::DOWN, at(202), at(202)));
 }
 
+// The one absolute MAX_HOLD (20 s) shared by CEC and Web holds.
+static void test_max_hold_20_seconds() {
+    using Bytes = std::vector<uint8_t>;
+    for (bool keepalive_at_limit : {false, true}) {
+        FakeTx tx;
+        VolumeControl ctl(tx, Ms(1200), Ms(20000), {}, [] { return fake_now; });
+        CHECK(ctl.startup(false, true));
+        CHECK(ctl.press(Direction::UP, at(10), at(10)));
+        // Repeats every 500 ms stay inside the 1200 ms inactivity limit.
+        for (int ms = 510; ms <= 19510; ms += 500)
+            CHECK(ctl.press(Direction::UP, at(ms), at(ms)));
+        CHECK(ctl.press(Direction::UP, at(20009), at(20009))); // 19,999 ms.
+        ctl.tick(at(20009));
+        CHECK(ctl.state() == State::HOLDING_UP);
+        CHECK(tx.sent == (Bytes{0x17, 0xF9}) && "repeats never retransmit");
+        // 20,000 ms: STOP then exit, whether a tick or a repeat sees it first.
+        if (keepalive_at_limit) CHECK(!ctl.press(Direction::UP, at(20010), at(20010)));
+        else ctl.tick(at(20010));
+        CHECK(ctl.state() == State::IDLE && !ctl.stop_owed() && !ctl.context_may_be_open());
+        CHECK(tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x07}));
+        // No automatic restart: continuing repeats are refused until a release.
+        CHECK(ctl.rearm_blocked());
+        for (int ms = 20011; ms <= 23011; ms += 500)
+            CHECK(!ctl.press(Direction::UP, at(ms), at(ms)));
+        CHECK(tx.sent.size() == 4);
+        CHECK(ctl.release(Direction::UP, at(23100)));
+        CHECK(ctl.press(Direction::UP, at(23200), at(23200)));
+        CHECK(tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x07, 0x17, 0xF9}));
+    }
+    // Inactivity (1200 ms) still ends a hold well inside the maximum.
+    FakeTx tx;
+    VolumeControl ctl(tx, Ms(1200), Ms(20000), {}, [] { return fake_now; });
+    CHECK(ctl.startup(false, true));
+    CHECK(ctl.press(Direction::DOWN, at(10), at(10)));
+    for (int ms = 510; ms <= 10010; ms += 500)
+        CHECK(ctl.press(Direction::DOWN, at(ms), at(ms)));
+    ctl.tick(at(11209));
+    CHECK(ctl.state() == State::HOLDING_DOWN);
+    ctl.tick(at(11210));
+    CHECK(ctl.state() == State::IDLE && ctl.rearm_blocked());
+    CHECK(tx.sent == (Bytes{0x17, 0xE9, 0x09, 0x07}));
+    CHECK(!ctl.press(Direction::DOWN, at(11300), at(11300)));
+    // A single-tap step is unaffected by the hold limit.
+    CHECK(ctl.release(Direction::DOWN, at(11400)));
+    CHECK(ctl.step(Direction::UP, at(11500)) == VolumeControl::StepResult::VERIFIED);
+    CHECK(tx.sent == (Bytes{0x17, 0xE9, 0x09, 0x07, 0x17, 0xF9, 0x09, 0x07}));
+}
+
 static void test_mute_failure() {
     FakeTx tx;
     VolumeControl ctl(tx, Ms(1200), Ms(2000), {},
@@ -445,6 +493,7 @@ int main() {
     test_partial_start_and_failed_stop();
     test_exit_failure_and_context_entry_failure();
     test_watchdogs_and_stale_queue();
+    test_max_hold_20_seconds();
     test_mute_failure();
     test_startup_recovery_and_interruption();
     test_step();

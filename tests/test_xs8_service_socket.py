@@ -339,6 +339,54 @@ class ServiceSocketTest(unittest.TestCase):
             self.assertEqual(self.command(cec, "VOLUME_PRESS UP"), "OK VOLUME_PRESS_TX")
             self.assertEqual(self.command(cec, "VOLUME_RELEASE UP"), "OK VOLUME_RELEASE_TX")
 
+    def test_max_hold_option_accepts_20000_and_nothing_above(self):
+        binary = str(pathlib.Path(".build/xs8_service_socket_test").resolve())
+        for value in ("20001", "99", "3000x"):
+            result = subprocess.run([binary, "--socket", self.path + value,
+                                     "--max-hold-ms", value],
+                                    capture_output=True, text=True, timeout=3)
+            self.assertEqual(result.returncode, 2, value)
+            self.assertIn("Invalid max hold (100..20000 ms)", result.stderr)
+        path = self.path + ".20000"
+        process = subprocess.Popen([binary, "--socket", path, "--allow-unrecovered-start",
+                                    "--max-hold-ms", "20000"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 3
+            while not pathlib.Path(path).exists():
+                self.assertIsNone(process.poll(), "--max-hold-ms 20000 must be accepted")
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+        finally:
+            process.terminate()
+            process.wait(timeout=3)
+
+    def test_default_max_hold_keeps_cec_and_web_holds_past_the_old_limit(self):
+        # The default is the 20 s MAX_HOLD: keepalives every 400 ms (inside the
+        # 1200 ms inactivity limit) hold well past the former 3 s cap.
+        with self.connect() as owner:
+            self.assertTrue(self.command(owner, "KEY_DOWN VOLUME_UP").startswith(
+                "OK KEY_DOWN_TX action=VOLUME_UP"))
+            started = time.monotonic()
+            while time.monotonic() - started < 3.4:
+                time.sleep(0.4)
+                self.assertEqual(self.command(owner, "KEY_DOWN VOLUME_UP"),
+                                 "OK KEY_ALIVE action=VOLUME_UP")
+            self.assertIn("state=HOLDING_UP", self.request("STATUS"))
+            self.assertTrue(self.command(owner, "KEY_UP VOLUME_UP").startswith(
+                "OK KEY_UP_TX action=VOLUME_UP"))
+        with self.connect() as cec:
+            self.assertEqual(self.command(cec, "VOLUME_PRESS DOWN"), "OK VOLUME_PRESS_TX")
+            started = time.monotonic()
+            while time.monotonic() - started < 3.4:
+                time.sleep(0.4)
+                self.assertEqual(self.command(cec, "VOLUME_PRESS DOWN"), "OK VOLUME_PRESS_TX")
+            self.assertIn("state=HOLDING_DOWN", self.request("STATUS"))
+            self.assertEqual(self.command(cec, "VOLUME_RELEASE DOWN"), "OK VOLUME_RELEASE_TX")
+        self.assertEqual(self.transmitted(), ["0x17", "0xF9", "0x09", "0x07",
+                                              "0x17", "0xE9", "0x09", "0x07"])
+        self.assertNotIn("MAX_HOLD", self.log_path.read_text())
+
     def test_volume_owner_disconnect_still_stops_with_other_clients(self):
         with self.connect() as cec:
             self.assertEqual(self.command(cec, "VOLUME_PRESS DOWN"),

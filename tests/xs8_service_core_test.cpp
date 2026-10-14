@@ -1819,6 +1819,89 @@ static void test_power_commands()
     assert(boot_tx.sent.empty() && shut_tx.sent.empty() && context_tx.sent == (Bytes{0x17}));
 }
 
+// One absolute 20 s MAX_HOLD for CEC (VOLUME_PRESS) and Web (KEY_DOWN) holds.
+static void test_volume_max_hold_20_seconds()
+{
+    using Bytes = std::vector<uint8_t>;
+    const std::string ok = " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n";
+
+    // Web: keepalives every 500 ms hold to 19,999 ms; 20,000 ms stops; late
+    // keepalives get KEY_EXPIRED and never press again until KEY_UP.
+    FakeTx web_tx;
+    Xs8ServiceCore web(web_tx, Ms(20000), true, {}, [] { return at(0); });
+    web.connected(1);
+    web.connected(2);
+    assert(web.command("KEY_DOWN VOLUME_UP", at(10), at(10), 1) ==
+           "OK KEY_DOWN_TX action=VOLUME_UP" + ok);
+    for (int time = 510; time <= 20009; time += time == 19510 ? 499 : 500)
+        assert(web.command("KEY_DOWN VOLUME_UP", at(time), at(time), 1) ==
+               "OK KEY_ALIVE action=VOLUME_UP\n");
+    web.tick(at(20009));
+    assert(web.state() == VolumeControl::State::HOLDING_UP);
+    assert(web_tx.sent == (Bytes{0x17, 0xF9}));
+    web.tick(at(20010));
+    assert(web.state() == VolumeControl::State::IDLE && !web.stop_owed());
+    assert(web_tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x07}));
+    for (int time = 20100; time <= 22100; time += 500)
+        assert(web.command("KEY_DOWN VOLUME_UP", at(time), at(time), 1) ==
+               "ERR KEY_EXPIRED last=VOLUME_WATCHDOG\n");
+    assert(web_tx.sent.size() == 4 && "no automatic restart");
+    // A single tap still works from another connection after the expiry.
+    assert(web.command("VOLUME_STEP DOWN", at(22200), at(22200), 2).rfind(
+           "OK VOLUME_STEP_TX direction=DOWN", 0) == 0);
+    // Only a fresh gesture (KEY_UP, then KEY_DOWN) presses again.
+    assert(web.command("KEY_UP VOLUME_UP", at(22500), at(22500), 1) ==
+           "OK KEY_UP_NONE last=IDLE\n");
+    assert(web.command("KEY_DOWN VOLUME_UP", at(22600), at(22600), 1) ==
+           "OK KEY_DOWN_TX action=VOLUME_UP" + ok);
+    // Owner disconnect at 15 s: STOP then exit at once, no re-arm block left.
+    for (int time = 23100; time <= 37600; time += 500)
+        assert(web.command("KEY_DOWN VOLUME_UP", at(time), at(time), 1) ==
+               "OK KEY_ALIVE action=VOLUME_UP\n");
+    web.disconnected(at(37600), 1);
+    assert(web.state() == VolumeControl::State::IDLE && !web.stop_owed());
+    assert(web_tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x07, 0x17, 0xE9, 0x09, 0x07,
+                                 0x17, 0xF9, 0x09, 0x07}));
+    assert(web.command("KEY_DOWN VOLUME_DOWN", at(37700), at(37700), 2) ==
+           "OK KEY_DOWN_TX action=VOLUME_DOWN" + ok);
+    // Inactivity (1200 ms) ends a Web hold well inside the maximum.
+    web.tick(at(38899));
+    assert(web.state() == VolumeControl::State::HOLDING_DOWN);
+    web.tick(at(38900));
+    assert(web.state() == VolumeControl::State::IDLE);
+    assert(web.command("KEY_DOWN VOLUME_DOWN", at(39000), at(39000), 2) ==
+           "ERR KEY_EXPIRED last=VOLUME_WATCHDOG\n");
+    assert(web_tx.sent.size() == 16);
+
+    // CEC: repeats every 500 ms hold to 19,999 ms; 20,000 ms stops; continuing
+    // repeats transmit nothing until VOLUME_RELEASE.
+    FakeTx cec_tx;
+    Xs8ServiceCore cec(cec_tx, Ms(20000), true, {}, [] { return at(0); });
+    cec.connected(1);
+    for (int time = 10; time <= 20009; time += time == 19510 ? 499 : 500)
+        assert(cec.command("VOLUME_PRESS DOWN", at(time), at(time), 1) ==
+               "OK VOLUME_PRESS_TX\n");
+    cec.tick(at(20009));
+    assert(cec.state() == VolumeControl::State::HOLDING_DOWN);
+    assert(cec_tx.sent == (Bytes{0x17, 0xE9}));
+    // The repeat arriving exactly at 20,000 ms is the one that sees the limit.
+    assert(cec.command("VOLUME_PRESS DOWN", at(20010), at(20010), 1) == "ERR IDLE\n");
+    assert(cec_tx.sent == (Bytes{0x17, 0xE9, 0x09, 0x07}));
+    for (int time = 20500; time <= 22500; time += 500)
+        assert(cec.command("VOLUME_PRESS DOWN", at(time), at(time), 1) == "ERR IDLE\n");
+    assert(cec_tx.sent.size() == 4 && "no automatic restart");
+    assert(cec.command("VOLUME_RELEASE DOWN", at(22600), at(22600), 1) ==
+           "OK VOLUME_RELEASE_TX\n");
+    assert(cec.command("VOLUME_PRESS DOWN", at(22700), at(22700), 1) == "OK VOLUME_PRESS_TX\n");
+    // CEC release and disconnect mid-hold stop immediately, as before.
+    for (int time = 23200; time <= 37700; time += 500)
+        assert(cec.command("VOLUME_PRESS DOWN", at(time), at(time), 1) ==
+               "OK VOLUME_PRESS_TX\n");
+    cec.disconnected(at(37700), 1);
+    assert(cec.state() == VolumeControl::State::IDLE && !cec.stop_owed());
+    assert(cec_tx.sent == (Bytes{0x17, 0xE9, 0x09, 0x07, 0x17, 0xE9, 0x09, 0x07}));
+}
+
 static void test_volume_key_hold()
 {
     using Bytes = std::vector<uint8_t>;
@@ -1996,6 +2079,7 @@ int main()
     test_context_key_commands();
     test_power_commands();
     test_volume_key_hold();
+    test_volume_max_hold_20_seconds();
     test_context_gates_and_authorization();
     test_context_send_exit_and_token_ownership();
     test_context_excludes_every_other_transmission();

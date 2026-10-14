@@ -2903,7 +2903,8 @@ class RemoteV2GatewayTest(CdSeekGatewayTest):
                 hold = self.operations(cookie)["volume_hold"]
                 self.assertEqual((hold["enabled"], hold["available_directions"],
                                   hold["hold_delay_ms"], hold["max_hold_ms"]),
-                                 (True, ["UP", "DOWN"], 400, 3000))
+                                 (True, ["UP", "DOWN"], 400, 20000))
+                self.assertEqual((hold["heartbeat_ms"], hold["lease_ms"]), (500, 1200))
                 code, payload, _, _ = self.start_volume(token, cookie, direction)
                 self.assertEqual((code, payload["result"]), (200, "HOLD_STARTED"), payload)
                 owner = self.hold_connection()
@@ -2937,11 +2938,11 @@ class RemoteV2GatewayTest(CdSeekGatewayTest):
         fake.wait(lambda: (owner, "CLOSE") in fake.events)
         self.assertEqual(fake.tx, ["0x17", "0xF9", "0x09", "0x07"])
         fake.close()
-        # Gateway maximum (3 s): renewal refused, socket closed.
+        # Gateway maximum (20 s): renewal refused, socket closed.
         fake = self.service()
         _, payload, _, _ = self.start_volume(payload["csrf_token"], cookie)
         owner = self.hold_connection()
-        self.hold()["started"] -= 3.0
+        self.hold()["started"] -= 20.0
         code, payload, _, _ = self.hold_request(payload["csrf_token"], cookie, {
             "action": "HEARTBEAT", "hold_id": payload["hold_id"]})
         # Either the heartbeat sees the maximum (reason MAX_HOLD) or the
@@ -2962,6 +2963,46 @@ class RemoteV2GatewayTest(CdSeekGatewayTest):
                          (409, "NOT_ACTIVE", "VOLUME_WATCHDOG"))
         fake.wait(lambda: (owner, "CLOSE") in fake.events)
         self.assertEqual(fake.tx, ["0x17", "0xE9", "0x09", "0x07"])
+
+    def test_volume_hold_maximum_boundary_is_20_seconds(self):
+        # A frozen Gateway clock makes the boundary exact; 1000.0 - 20.0 is exact.
+        clock = {"now": 1000.0}
+        frozen = mock.Mock(monotonic=lambda: clock["now"], monotonic_ns=time.monotonic_ns)
+        self.gate(volume_hold_enabled=True)
+        fake = self.service()
+        token, cookie = self.session()
+        _, payload, _, _ = self.start_volume(token, cookie)
+        owner = self.hold_connection()
+        with mock.patch.object(xs8_gateway, "time", frozen):
+            hold = self.hold()
+            hold["started"], hold["browser_seen"] = 1000.0 - 19.999, 1000.0
+            # 19,999 ms: the cleanup keeps the hold and a heartbeat still renews it.
+            self.server.service_actions()
+            self.assertIs(self.hold(), hold)
+            code, payload, _, _ = self.hold_request(payload["csrf_token"], cookie, {
+                "action": "HEARTBEAT", "hold_id": hold["hold_id"]})
+            self.assertEqual((code, payload["result"]), (200, "LEASE_RENEWED"))
+            # 20,000 ms: the cleanup closes the owning connection (the service
+            # stops at once) and the next heartbeat is refused without forwarding.
+            hold["started"] = 1000.0 - 20.0
+            self.server.service_actions()
+            self.assertIsNone(self.hold())
+            code, payload, _, _ = self.hold_request(payload["csrf_token"], cookie, {
+                "action": "HEARTBEAT", "hold_id": hold["hold_id"]})
+            self.assertEqual((code, payload["result"]), (409, "NOT_ACTIVE"))
+        fake.wait(lambda: (owner, "CLOSE") in fake.events)
+        self.assertEqual(fake.lines(owner), ["KEY_DOWN VOLUME_UP"] * 2 + ["CLOSE"])
+        self.assertEqual(fake.tx, ["0x17", "0xF9", "0x09", "0x07"], "never a new press")
+        # The heartbeat path is an independent backstop at the same boundary.
+        _, payload, _, _ = self.start_volume(payload["csrf_token"], cookie, "DOWN")
+        with mock.patch.object(xs8_gateway, "time", frozen):
+            hold = self.hold()
+            hold["started"], hold["browser_seen"] = 1000.0 - 20.0, 1000.0
+            code, payload, _, _ = self.hold_request(payload["csrf_token"], cookie, {
+                "action": "HEARTBEAT", "hold_id": hold["hold_id"]})
+            self.assertEqual((code, payload["result"]), (409, "NOT_ACTIVE"))
+            self.assertIn(payload.get("reason"), ("MAX_HOLD", None))
+            self.assertIsNone(self.hold())
 
     def test_volume_and_cd_holds_exclude_each_other(self):
         self.gate(volume_hold_enabled=True, cd_seek_enabled=True, volume_step_enabled=True)

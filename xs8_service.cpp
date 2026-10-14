@@ -242,7 +242,8 @@ int main(int argc, char **argv)
     bool research_tx_enabled = false;
     bool research_chain_enabled = false;
     bool research_context_enabled = false;
-    long hold_ms = 2000;
+    // One absolute volume MAX_HOLD for CEC and Web holds alike.
+    long hold_ms = 20000;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--allow-unrecovered-start") == 0)
             authorized = true;
@@ -256,15 +257,15 @@ int main(int argc, char **argv)
             socket_path = argv[++i];
         else if (std::strcmp(argv[i], "--max-hold-ms") == 0 && i + 1 < argc) {
             if (!parse_number(argv[++i], hold_ms) ||
-                hold_ms < 100 || hold_ms > 3000) {
-                std::fprintf(stderr, "Invalid max hold (100..3000 ms)\n");
+                hold_ms < 100 || hold_ms > 20000) {
+                std::fprintf(stderr, "Invalid max hold (100..20000 ms)\n");
                 return 2;
             }
         } else {
             std::fprintf(stderr, "Usage: %s [--socket PATH] "
                 "[--allow-unrecovered-start] [--enable-research-tx] "
                 "[--enable-research-chain] [--enable-research-context] "
-                "[--max-hold-ms 100..3000]\n",
+                "[--max-hold-ms 100..20000]\n",
                 argv[0]);
             return 2;
         }

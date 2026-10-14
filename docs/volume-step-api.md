@@ -48,7 +48,7 @@ Offline tests: `make test` (`volume_control_test`, `xs8_service_core_test`, `tes
 | `KEY_UP` from another connection during a hold | `ERR KEY_NOT_OWNER` | none |
 | `KEY_UP` with no hold | `OK KEY_UP_NONE last=<state>` | none |
 
-An uncertain start replies `ERR KEY_DOWN_UNCERTAIN action=A state=FAULT_LATCHED …`; `finish()` has already attempted `0x09 → 0x07`. The hold ends by `KEY_UP`; by its **owner connection closing** (`CLIENT_DISCONNECT`: `0x09 → 0x07` through the normal event loop); by **1200 ms without `KEY_DOWN`** (`INACTIVITY`); by the service's `--max-hold-ms` (`MAX_HOLD`); or by shutdown. Every STOP and exit failure latches `FAULT_LATCHED` exactly as for CEC.
+An uncertain start replies `ERR KEY_DOWN_UNCERTAIN action=A state=FAULT_LATCHED …`; `finish()` has already attempted `0x09 → 0x07`. The hold ends by `KEY_UP`; by its **owner connection closing** (`CLIENT_DISCONNECT`: `0x09 → 0x07` through the normal event loop); by **1200 ms without `KEY_DOWN`** (`INACTIVITY`); by the service's `--max-hold-ms` (`MAX_HOLD`; 100–20000 ms, default 20000, the same absolute limit as CEC holds); or by shutdown. Every STOP and exit failure latches `FAULT_LATCHED` exactly as for CEC.
 
 **Re-arm.** After `INACTIVITY` or `MAX_HOLD`, VolumeControl's existing re-arm block refuses the owner's late keepalive (`ERR KEY_EXPIRED last=VOLUME_WATCHDOG`), so it can never start a new press. The owner's `KEY_UP` clears it, as CEC's `VOLUME_RELEASE` does. Because a closed connection can send no stale keepalive, the disconnect of a **`KEY_DOWN` owner** also clears its block (no frame), so an abandoned Web hold never leaves CEC VOL+/− blocked. CEC (`VOLUME_PRESS`) owners keep the existing behavior: their disconnect does not clear the block.
 

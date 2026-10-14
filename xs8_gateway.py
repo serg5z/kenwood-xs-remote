@@ -64,10 +64,11 @@ CD_SEEK_MAX_HOLD_MS = 10000
 # service release at once) when the browser stops heartbeating for this long.
 CD_SEEK_BROWSER_TIMEOUT_MS = 1500
 VOLUME_DIRECTIONS = ("UP", "DOWN")
-# Held VOL+/VOL- on the service's connection-owned volume hold. The service's
-# --max-hold-ms (100-3000 ms) is authoritative; this Gateway bound is its maximum.
+# Held VOL+/VOL- on the service's connection-owned volume hold. One absolute
+# 20 s MAX_HOLD applies to CEC and Web holds alike: the service's --max-hold-ms
+# (default 20000) is authoritative; this Gateway bound is an independent backstop.
 VOLUME_HOLD_DIRECTIONS = {"UP": "VOLUME_UP", "DOWN": "VOLUME_DOWN"}
-VOLUME_HOLD_MAX_MS = 3000
+VOLUME_HOLD_MAX_MS = 20000
 # A press shorter than this is a single VOLUME_STEP tap; longer starts a hold.
 VOLUME_HOLD_DELAY_MS = 400
 # Kinds of connection-owned holds. The service allows one hold of any kind, so
