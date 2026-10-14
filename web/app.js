@@ -8,6 +8,8 @@ const playbackButtons = [document.getElementById('cd-play-pause'), document.getE
 const seekButtons = [document.getElementById('cd-rew'), document.getElementById('cd-ff')];
 const monitorButton = document.getElementById('monitor-button');
 const powerButtons = [document.getElementById('power-on'), document.getElementById('power-off')];
+const powerTrigger = document.getElementById('power-button');
+const powerMenu = document.getElementById('power-menu');
 let csrfToken = null;
 let serviceReady = false;
 let muteReady = false;
@@ -104,6 +106,9 @@ function updateControls() {
     button.disabled = controlBusy || !csrfToken || !serviceReady || !powerReady ||
       !enabledPowerActions.includes(button.dataset.powerAction);
   }
+  // The trigger only opens the chooser; it is usable when some choice is.
+  powerTrigger.disabled = powerButtons.every((button) => button.disabled);
+  if (powerTrigger.disabled) setPowerMenu(false);
   for (const button of playbackButtons) {
     button.disabled = controlBusy || !csrfToken || !serviceReady || !playbackReady ||
       !enabledPlaybackActions.includes(button.dataset.cdPlayback) || !!gesture;
@@ -777,10 +782,36 @@ monitorButton.addEventListener('click', async () => {
     (data) => volumeFailure('MONITOR', data));
 });
 
-// Explicit POWER ON and POWER OFF; no power state is read back or implied.
+// POWER: the round button opens a small ON / OFF chooser and never sends. Only an
+// explicit choice sends one POWER ON or POWER OFF; no power state is read back.
+function setPowerMenu(open) {
+  powerMenu.hidden = !open;
+  if (typeof powerTrigger.setAttribute === 'function') {
+    powerTrigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+}
+
+powerTrigger.addEventListener('click', () => {
+  if (powerTrigger.disabled || controlBusy || seek) return;
+  setPowerMenu(powerMenu.hidden);
+});
+const closePowerMenuOutside = (event) => {
+  const target = event && event.target;
+  const inside = (element) => !!target && (element === target ||
+    (typeof element.contains === 'function' && element.contains(target)));
+  if (!powerMenu.hidden && !inside(powerMenu) && !inside(powerTrigger)) setPowerMenu(false);
+};
+if (typeof document.addEventListener === 'function') {
+  document.addEventListener('pointerdown', closePowerMenuOutside);
+  document.addEventListener('keydown', (event) => {
+    if (event && event.key === 'Escape') setPowerMenu(false);
+  });
+}
+
 for (const button of powerButtons) {
   button.addEventListener('click', async () => {
-    if (button.disabled || controlBusy || seek) return;
+    if (button.disabled || controlBusy || seek || powerMenu.hidden) return;
+    setPowerMenu(false);
     const action = button.dataset.powerAction;
     await sendControl('/api/v1/power', JSON.stringify({ action }),
       `POWER ${action} TX VERIFIED · RECEIVER POWER UNVERIFIED`,

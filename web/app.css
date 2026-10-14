@@ -25,7 +25,9 @@
   padding: 4px;
 }
 
-.mute:not(:disabled) { background:#a64532; border-color:#a64532; color:#fff; cursor:pointer; }
+/* MUTE is a toggle with no reliable mute-state readback, so it stays neutral:
+   a TX result never paints it as muted. */
+.mute:not(:disabled) { background:#f6f5f0; color:#343b37; cursor:pointer; }
 .source-grid button:not(:disabled) { background:#f6f5f0; color:#343b37; cursor:pointer; }
 .transport-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .transport-grid button:not(:disabled) { background:#f6f5f0; color:#343b37; cursor:pointer; }
@@ -36,13 +38,27 @@
 .transport-grid button[data-active="true"] { border-color:#a64532; box-shadow:inset 0 0 0 2px #a64532; color:#a64532; }
 .source-grid #monitor-button { position:relative; display:flex; align-items:center; justify-content:center; }
 .source-grid #monitor-button small { position:absolute; top:calc(50% + 10px); left:0; right:0; font-size:9px; line-height:1; font-weight:600; color:#7d827e; letter-spacing:.12em; }
-/* Observed MONITOR state only: fresh ON green, fresh OFF gray, unknown or stale neutral. */
+/* Observed MONITOR state only: fresh ON lit green; fresh OFF stays unlit like an
+   unknown or stale state and differs only by its label, so the button never
+   flips from a dark fill to light when the observation ages past 30 s. */
 .source-grid #monitor-button[data-monitor-state="ON"] { background:#2f7d4f; border-color:#2f7d4f; color:#fff; }
-.source-grid #monitor-button[data-monitor-state="OFF"] { background:#9a9d97; border-color:#9a9d97; color:#fff; }
-.source-grid #monitor-button[data-monitor-state="ON"] small, .source-grid #monitor-button[data-monitor-state="OFF"] small { color:inherit; }
-.power { display:grid; gap:8px; margin-top:12px; }
-.power button { height:40px; border:1px solid #d6d7d0; border-radius:999px; background:#edeee9; color:#90958f; font:700 10px Arial,Helvetica,sans-serif; letter-spacing:.06em; }
-.power button:not(:disabled) { background:#f6f5f0; color:#343b37; cursor:pointer; }
+.source-grid #monitor-button[data-monitor-state="ON"] small { color:inherit; }
+.source-grid #monitor-button[data-monitor-state="ON"] small::after { content:" ON"; }
+.source-grid #monitor-button[data-monitor-state="OFF"] small::after { content:" OFF"; }
+/* POWER: one round red button opposite the heading; it only opens the ON / OFF
+   chooser, which sends nothing until a choice is made. */
+.remote-heading { position:relative; padding-right:60px; }
+.power-control { position:absolute; top:0; right:0; z-index:2; }
+.power-button { display:flex; align-items:center; justify-content:center; width:44px; height:44px; padding:0; border:1px solid #a64532; border-radius:50%; background:#a64532; color:#fff; box-shadow:0 2px 6px #a6453233; cursor:pointer; }
+.power-button svg { width:20px; height:20px; fill:none; stroke:currentColor; stroke-width:2.2; stroke-linecap:round; }
+.remote .power-button:disabled { background:#f1e9e5; border-color:#dcc3bb; color:#c79f94; box-shadow:none; cursor:not-allowed; }
+.power-button[aria-expanded="true"] { box-shadow:0 0 0 3px #a6453233; }
+.power-menu { position:absolute; top:52px; right:0; display:grid; gap:6px; width:112px; padding:10px; border:1px solid #d1d0c9; border-radius:16px; background:#f6f5f0; box-shadow:0 10px 24px #373b3426; }
+.power-menu[hidden] { display:none; }
+.power-menu-title { font-size:9px; font-weight:700; letter-spacing:.18em; color:#7d827e; text-align:center; }
+.power-menu button { height:38px; border:1px solid #d6d7d0; border-radius:999px; background:#edeee9; color:#90958f; font:700 11px Arial,Helvetica,sans-serif; letter-spacing:.08em; }
+.power-menu button:not(:disabled) { background:#fff; color:#343b37; cursor:pointer; }
+.power-menu button[data-power-action="OFF"]:not(:disabled) { color:#a64532; }
 .rocker button { touch-action:none; user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; }
 .transport-grid svg {
   display: block;
@@ -55,6 +71,12 @@
   stroke-linecap: round;
   stroke-linejoin: round;
 }
+
+/* CD transport labels: one size on every width; PLAY / PAUSE wraps at its
+   spaces where a button is narrower than the label. */
+.transport-grid small { font-size: 14px; font-weight: 600; letter-spacing: .04em; line-height: 1; }
+/* Below 360 px the buttons are under 50 px wide: keep every label whole. */
+@media (max-width: 359px) { .transport-grid small { font-size: 10px; letter-spacing: .02em; } }
 
 @media (max-width: 650px) {
   .topbar { margin-bottom: 16px; }

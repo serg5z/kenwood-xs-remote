@@ -4,10 +4,10 @@ const vm = require('node:vm');
 
 const html = fs.readFileSync('web/index.html', 'utf8');
 const css = fs.readFileSync('web/app.css', 'utf8');
-assert.match(html, /id="power-on" disabled type="button" data-power-action="ON">POWER ON</);
-assert.match(html, /id="power-off" disabled type="button" data-power-action="OFF">POWER OFF</);
+assert.match(html, /id="power-on" disabled type="button" data-power-action="ON">ON</);
+assert.match(html, /id="power-off" disabled type="button" data-power-action="OFF">OFF</);
 assert.match(css, /#monitor-button\[data-monitor-state="ON"\] \{ background:#2f7d4f/);
-assert.match(css, /#monitor-button\[data-monitor-state="OFF"\] \{ background:#9a9d97/);
+assert.match(css, /#monitor-button\[data-monitor-state="OFF"\] small::after \{ content:" OFF"; \}/);
 
 // ---- Fake clock ----
 let now = 100000;
@@ -71,6 +71,8 @@ const down = element('volume-down');
 const monitor = element('monitor-button');
 const powerOn = element('power-on');
 const powerOff = element('power-off');
+const powerButton = element('power-button');
+element('power-menu').hidden = true; // As in the markup.
 const windowListeners = {};
 const documentListeners = {};
 const document = {
@@ -215,12 +217,15 @@ async function main() {
   assert.equal(monitor.dataset.monitorState, 'OFF', 'still the last observed report');
   await idle();
 
-  // 3. POWER: two explicit buttons, one POST each, never a state claim.
+  // 3. POWER: the round button opens the chooser; one POST per explicit choice,
+  //    never a state claim.
   reset();
+  await powerButton.fire('click');
   await powerOn.fire('click');
   await settle();
   assert.match(availability(), /^POWER ON TX VERIFIED · RECEIVER POWER UNVERIFIED/);
   await idle();
+  await powerButton.fire('click');
   await powerOff.fire('click');
   await settle();
   assert.deepEqual(requests.map((r) => [r.url, r.body]),
@@ -361,6 +366,7 @@ async function main() {
   await advance(6000);
   assert.equal(powerOn.disabled, true);
   assert.equal(powerOff.disabled, true);
+  assert.equal(powerButton.disabled, true);
   assert.equal(monitor.disabled, true);
   reset();
   await up.fire('pointerdown');

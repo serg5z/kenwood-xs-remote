@@ -20,6 +20,16 @@
         <p class="eyebrow">SYSTEM CONTROL / XS8</p>
         <h1>Receiver control</h1>
         <p class="intro">A quiet place for your hi-fi controls. Controls are disabled in the standard read-only preview.</p>
+        <div class="power-control">
+          <button id="power-button" class="power-button" disabled type="button" aria-label="Receiver power" aria-haspopup="true" aria-expanded="false" aria-controls="power-menu">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 3.5v8M7.4 6.6a7 7 0 1 0 9.2 0"/></svg>
+          </button>
+          <div id="power-menu" class="power-menu" role="group" aria-label="Receiver power: choose ON or OFF" hidden>
+            <span class="power-menu-title">POWER</span>
+            <button id="power-on" disabled type="button" data-power-action="ON">ON</button>
+            <button id="power-off" disabled type="button" data-power-action="OFF">OFF</button>
+          </div>
+        </div>
       </div>
 
       <div class="control-layout">
@@ -80,10 +90,6 @@
             <button id="volume-down" disabled type="button" aria-label="Volume down" data-volume-direction="DOWN">−</button>
           </div>
           <button class="mute" id="mute-button" disabled type="button">MUTE</button>
-          <div class="power" role="group" aria-label="Receiver power">
-            <button id="power-on" disabled type="button" data-power-action="ON">POWER ON</button>
-            <button id="power-off" disabled type="button" data-power-action="OFF">POWER OFF</button>
-          </div>
         </section>
       </div>
 
