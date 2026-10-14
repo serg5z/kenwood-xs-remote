@@ -401,7 +401,9 @@ async function sendControl(url, body, success, failure, options = {}) {
     }
     succeeded = response.ok;
     responseData = response.data;
-    controlResult = response.ok ? success : failure(response.data);
+    controlResult = response.ok
+      ? (typeof success === 'function' ? success(response.data) : success)
+      : failure(response.data);
   } catch (_) {
     controlResult = url.endsWith('/mute') ? 'MUTE RESULT UNKNOWN · CHECK RECEIVER'
       : url.endsWith('/query') ? 'SYNC RESULT UNKNOWN · CHECK RECEIVER'
@@ -447,9 +449,18 @@ for (const button of sourceButtons) {
   button.addEventListener('click', async () => {
     if (button.disabled || controlBusy || Date.now() - lastSourceAttempt < 1000) return;
     lastSourceAttempt = Date.now();
-    await sendControl('/api/v1/source', JSON.stringify({ source: button.dataset.source }),
-      `${button.dataset.source} TX REPORTED · SELECTION UNVERIFIED`,
-      (data) => `SOURCE ${data.result || 'FAILED'} · SELECTION UNVERIFIED`);
+    const name = button.dataset.source;
+    // The Gateway stops the CD first when leaving a freshly observed CD source.
+    await sendControl('/api/v1/source', JSON.stringify({ source: name }),
+      (data) => (data && data.cd_stop
+        ? `CD STOP TX REPORTED · ${name} TX REPORTED · SELECTION UNVERIFIED`
+        : `${name} TX REPORTED · SELECTION UNVERIFIED`),
+      (data) => (data && data.stage === 'CD_STOP'
+        ? `CD STOP ${data.result || 'FAILED'} · ${name} NOT SENT${
+          data.physical_check_required ? ' · CHECK CHANGER' : ''}`
+        : data && data.stage === 'SELECT_SOURCE'
+          ? `CD STOP TX REPORTED · SOURCE ${data.result || 'FAILED'} · CHECK RECEIVER`
+          : `SOURCE ${data.result || 'FAILED'} · SELECTION UNVERIFIED`));
   });
 }
 

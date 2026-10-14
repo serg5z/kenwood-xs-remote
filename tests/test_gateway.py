@@ -5,6 +5,7 @@ import json
 import os
 import re
 import socket
+import socketserver
 import struct
 import subprocess
 import tempfile
@@ -3103,6 +3104,307 @@ class RealServiceVolumeHoldTest(RealServiceSeekTest):
         self.server.server_close()
         self.wait_tx(["0x17", "0xE9", "0x09", "0x07", "0x17", "0xF9", "0x09", "0x07"])
         self.assertIn("XS8 STOP reason=CLIENT_DISCONNECT", self.log_path.read_text())
+
+
+def receiver_status(source="CD", age_s=0.0, integrity="HEALTHY", base=None):
+    """CD-capable STATUS with one receiver source observation, observed age_s ago."""
+    observed = source != "UNKNOWN"
+    ns = time.monotonic_ns() - int(age_s * 1e9) if observed else 0
+    return (CD_IDLE_STATUS if base is None else base).replace(b"\n", (
+        f" receiver_source={source} receiver_source_ns={ns}"
+        f" receiver_source_evidence={'PASSIVE' if observed else 'NONE'}"
+        " receiver_monitor=UNKNOWN receiver_monitor_ns=0 receiver_monitor_evidence=NONE"
+        f" receiver_integrity={integrity}\n").encode())
+
+
+CD_STOP_OK = CD_TRANSPORT_OK
+CD_STOP_UNCERTAIN = (b"ERR CD_TRANSPORT_UNCERTAIN action=STOP gpio_tx=TX_OK "
+                     b"waveform=MISSING receiver_execution=UNVERIFIED\n")
+
+
+class ScriptedService(RecordingService):
+    """Per-command replies (None: close without replying) and optional delays.
+    Each connection is answered on its own thread, so STATUS is never queued
+    behind a delayed command."""
+
+    def __init__(self, path, status, replies, delays=None):
+        self.replies = replies
+        self.delays = delays or {}
+        super().__init__(path, status=status)
+
+    def run(self):
+        while not self.stop.is_set():
+            try:
+                client, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            threading.Thread(target=self.answer, args=(client,), daemon=True).start()
+
+    def answer(self, client):
+        with client:
+            command = client.recv(128)
+            self.commands.append(command)
+            time.sleep(self.delays.get(command, 0))
+            reply = self.status if command == b"STATUS\n" else self.replies.get(command)
+            if reply is not None:
+                try:
+                    client.sendall(reply)
+                except BrokenPipeError:
+                    pass
+
+
+class SourceCdStopGatewayTest(GatewayTest):
+    """Leaving a fresh CD source: CD_STOP, then SELECT_SOURCE, in the Gateway."""
+
+    for _name in [n for n in dir(GatewayTest) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name
+
+    def setUp(self):
+        super().setUp()
+        handler = self.server.RequestHandlerClass
+        handler.production_source_enabled = True
+        handler.https_origin = "https://woodland-pi.local"
+        self.server.proxy_peer_verified = True
+        self.fake = None
+
+    def tearDown(self):
+        if self.fake is not None:
+            self.fake.close()
+        super().tearDown()
+
+    def service(self, status, stop=CD_STOP_OK, source=SOURCE_OK, delays=None):
+        if self.fake is not None:
+            self.fake.close()
+        replies = {b"CD_STOP\n": stop, b"CD_PLAY_PAUSE\n": CD_TRANSPORT_OK,
+                   b"VOLUME_STEP UP\n": None, b"TAPE2_MONITOR_TOGGLE\n": MONITOR_OK}
+        for name in xs8_gateway.EVIDENCED_SOURCES:
+            replies[f"SELECT_SOURCE {name}\n".encode()] = source
+        self.fake = ScriptedService(self.socket_path, status, replies, delays)
+        return self.fake
+
+    def select(self, name, token=None, cookie=None):
+        if token is None:
+            token, cookie = self.session()  # A new session: no per-session spacing.
+        code, body, _ = self.source(token, cookie, name)
+        return code, json.loads(body)
+
+    def sent(self):
+        return [c for c in self.fake.commands if c != b"STATUS\n"]
+
+    def elapse_cd_interval(self):
+        state = self.server.__dict__.get("cd_track")
+        if state:
+            state["completed"] = float("-inf")
+
+    def fresh_token(self, cookie):
+        code, body, _ = self.request_full("GET", "/api/v1/session", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        self.assertEqual(code, 200)
+        return json.loads(body)["csrf_token"]
+
+    def test_leaving_fresh_cd_stops_before_every_other_source(self):
+        self.assertEqual(xs8_gateway.SOURCES_STOPPING_CD, ("TUNER", "PHONO", "TV1", "TV2", "TAPE1"))
+        for name in xs8_gateway.SOURCES_STOPPING_CD:
+            with self.subTest(source=name):
+                self.elapse_cd_interval()
+                self.service(receiver_status("CD"))
+                code, payload = self.select(name)
+                self.assertEqual(code, 200, payload)
+                self.assertEqual(self.sent(), [b"CD_STOP\n", f"SELECT_SOURCE {name}\n".encode()])
+                self.assertEqual((payload["result"], payload["source"], payload["gpio_tx"],
+                                  payload["waveform"], payload["receiver_execution"]),
+                                 ("SERVICE_TX_OK", name, "TX_OK", "MATCH", "UNVERIFIED"))
+                self.assertEqual(payload["cd_stop"], {"gpio_tx": "TX_OK", "waveform": "MATCH",
+                                                      "receiver_execution": "UNVERIFIED"})
+
+    def test_no_stop_for_cd_other_sources_unknown_stale_or_unreliable(self):
+        cases = [("CD", receiver_status("CD")),                           # CD -> CD
+                 ("TV1", receiver_status("TUNER")),                       # non-CD -> other
+                 ("CD", receiver_status("TUNER")),
+                 ("TV2", receiver_status("UNKNOWN")),
+                 ("TV1", receiver_status("CD", age_s=31)),                # LAST_KNOWN
+                 ("TUNER", receiver_status("CD", integrity="UNCERTAIN")),
+                 ("PHONO", CD_IDLE_STATUS)]                               # no observation
+        for name, status in cases:
+            with self.subTest(source=name, status=status[-120:]):
+                self.elapse_cd_interval()
+                self.service(status)
+                code, payload = self.select(name)
+                self.assertEqual(code, 200, payload)
+                self.assertEqual(self.sent(), [f"SELECT_SOURCE {name}\n".encode()])
+                self.assertNotIn("cd_stop", payload)
+
+    def test_tape2_and_monitor_never_stop_the_cd(self):
+        self.server.RequestHandlerClass.tape2_monitor_enabled = True
+        self.service(receiver_status("CD"))
+        code, payload = self.select("TAPE2")
+        self.assertEqual((code, payload["result"]), (409, "SOURCE_UNVERIFIED"))
+        token, cookie = self.session()
+        code, raw, _ = self.request_full("POST", "/api/v1/receiver/monitor", body="{}", headers={
+            "Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+            "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": token,
+            "Cookie": cookie, "Content-Type": "application/json"})
+        self.assertEqual(code, 200, raw)
+        self.assertEqual(self.sent(), [b"TAPE2_MONITOR_TOGGLE\n"])
+
+    def test_stop_failure_or_timeout_never_selects(self):
+        for reply, code, result, physical in (
+                (b"ERR CD_TRACK_BUSY\n", 409, "REJECTED", False),
+                (CD_STOP_UNCERTAIN, 502, "SERVICE_UNCERTAIN", True),
+                (b"ERR CD_FAULT_LATCHED\n", 409, "CD_FAULT_LATCHED", True),
+                (b"OK SOMETHING_ELSE\n", 502, "INVALID_REPLY", True),
+                (None, 502, "DISCONNECTED", True)):
+            with self.subTest(result=result):
+                self.elapse_cd_interval()
+                self.service(receiver_status("CD"), stop=reply)
+                status, payload = self.select("TV1")
+                self.assertEqual((status, payload["result"]), (code, result), payload)
+                self.assertEqual(self.sent(), [b"CD_STOP\n"], "never SELECT_SOURCE, never a retry")
+                self.assertEqual((payload["stage"], payload["source"], payload["source_sent"],
+                                  payload["physical_check_required"], payload["receiver_execution"]),
+                                 ("CD_STOP", "TV1", False, physical, "UNVERIFIED"))
+                self.assertNotIn("cd_stop", payload)
+        # A reply timeout is uncertain: no SELECT_SOURCE either.
+        self.elapse_cd_interval()
+        self.service(receiver_status("CD"))
+        with mock.patch.object(xs8_gateway, "send_cd_playback", side_effect=
+                               xs8_gateway.MuteServiceError("TIMEOUT", "timed out")) as stop, \
+                mock.patch.object(xs8_gateway, "send_source") as select:
+            status, payload = self.select("TUNER")
+        self.assertEqual((status, payload["result"], payload["stage"],
+                          payload["physical_check_required"]), (504, "TIMEOUT", "CD_STOP", True))
+        stop.assert_called_once()
+        select.assert_not_called()
+
+    def test_source_failure_after_stop_is_reported_not_retried(self):
+        self.service(receiver_status("CD"), source=(
+            b"ERR SOURCE_UNCERTAIN gpio_tx=TX_OK waveform=MISSING receiver_execution=UNVERIFIED\n"))
+        code, payload = self.select("TV2")
+        self.assertEqual((code, payload["result"], payload["stage"], payload["source_sent"],
+                          payload["physical_check_required"]),
+                         (502, "SERVICE_UNCERTAIN", "SELECT_SOURCE", True, True))
+        self.assertEqual(payload["cd_stop"]["waveform"], "MATCH")
+        self.assertEqual(self.sent(), [b"CD_STOP\n", b"SELECT_SOURCE TV2\n"])
+        # A clean refusal of SELECT_SOURCE still follows a sent STOP.
+        self.elapse_cd_interval()
+        self.service(receiver_status("CD"), source=b"ERR VOLUME_BUSY\n")
+        code, payload = self.select("PHONO")
+        self.assertEqual((code, payload["result"], payload["stage"],
+                          payload["physical_check_required"]),
+                         (409, "REJECTED", "SELECT_SOURCE", True))
+        self.assertEqual(self.sent(), [b"CD_STOP\n", b"SELECT_SOURCE PHONO\n"])
+
+    def test_hold_fault_spacing_and_cd_field_gates_send_nothing(self):
+        holding = receiver_status("CD", base=CD_HOLD_STATUS)
+        volume = receiver_status("CD").replace(b"OK state=IDLE", b"OK state=HOLDING_UP")
+        fault = receiver_status("CD", base=CD_FAULT_STATUS)
+        no_cd_fields = receiver_status("CD", base=STATUS)
+        for status, code, result in ((holding, 409, "NOT_ELIGIBLE"), (volume, 409, "NOT_ELIGIBLE"),
+                                     (fault, 409, "NOT_ELIGIBLE"),
+                                     (no_cd_fields, 409, "NOT_ELIGIBLE")):
+            with self.subTest(status=status[:60]):
+                self.service(status)
+                self.assertEqual(self.select("TV1"), (code, {"result": result,
+                    "receiver_execution": "UNVERIFIED", **({"source": "TV1"}
+                    if status is no_cd_fields else {})}))
+                self.assertEqual(self.sent(), [])
+        # The STOP is a CD dispatch: inside the CD interval it is refused, unsent.
+        self.service(receiver_status("CD"))
+        self.server.__dict__.setdefault("cd_track", {"lock": threading.Lock(),
+                                                     "completed": 0.0})["completed"] = time.monotonic()
+        code, payload = self.select("TV1")
+        self.assertEqual((code, payload["result"]), (429, "TOO_FAST"))
+        self.assertEqual(self.sent(), [])
+
+    def test_queued_request_runs_only_after_stop_and_select(self):
+        # The Gateway serves one request at a time: a request arriving during
+        # CD_STOP waits until SELECT_SOURCE has completed.
+        self.service(receiver_status("CD"), delays={b"CD_STOP\n": 0.6})
+        results = {}
+        first = threading.Thread(target=lambda: results.setdefault("first", self.select("TV1")))
+        first.start()
+        deadline = time.monotonic() + 2
+        while b"CD_STOP\n" not in self.fake.commands:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        token, cookie = self.session()
+        self.assertEqual(self.select("CD", token, cookie)[0], 200)
+        first.join(timeout=5)
+        self.assertEqual(results["first"][0], 200, results)
+        self.assertEqual(self.sent(), [b"CD_STOP\n", b"SELECT_SOURCE TV1\n", b"SELECT_SOURCE CD\n"])
+
+    def test_control_locks_refuse_requests_during_stop_and_select(self):
+        # Defense in depth for a concurrent server: the source request holds every
+        # control lock from before STATUS until SELECT_SOURCE has answered.
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+        self.server.server_close()
+        threaded = type("ThreadedGateway", (socketserver.ThreadingMixIn,
+                                            xs8_gateway.GatewayHTTPServer),
+                        {"daemon_threads": True})
+        handler = self.server.RequestHandlerClass
+        handler.cd_playback_enabled = True
+        handler.volume_step_enabled = True
+        handler.power_enabled = True
+        self.server = threaded(("127.0.0.1", 0), handler)
+        self.server.proxy_peer_verified = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.service(receiver_status("CD"), delays={b"CD_STOP\n": 1.5})
+        results = {}
+        first = threading.Thread(target=lambda: results.setdefault("first", self.select("TV1")))
+        first.start()
+        deadline = time.monotonic() + 2
+        while b"CD_STOP\n" not in self.fake.commands:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        token, cookie = self.session()
+        during = time.monotonic()
+
+        def post(path, body, session_cookie=None):
+            session_cookie = session_cookie or cookie
+            token = self.fresh_token(session_cookie)  # Every refusal consumes the token.
+            code, raw, _ = self.request_full("POST", path, body=body, headers={
+                "Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+                "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": token,
+                "Cookie": session_cookie, "Content-Type": "application/json"})
+            return code, json.loads(raw)["result"]
+        self.assertEqual(self.select("CD", token, cookie)[1]["result"], "BUSY")
+        # Another session (no per-session spacing) is refused the same way.
+        self.assertEqual(post("/api/v1/source", '{"source":"TUNER"}', self.session()[1]),
+                         (409, "BUSY"))
+        self.assertEqual(post("/api/v1/cd/playback", '{"action":"PLAY_PAUSE"}'), (409, "CD_BUSY"))
+        self.assertEqual(post("/api/v1/volume/step", '{"direction":"UP"}'), (409, "VOLUME_BUSY"))
+        self.assertEqual(post("/api/v1/power", '{"action":"ON"}'), (409, "BUSY"))
+        self.assertLess(time.monotonic() - during, 1.0, "all refused while CD_STOP was in flight")
+        first.join(timeout=5)
+        self.assertEqual(results["first"][0], 200, results)
+        self.assertEqual(self.sent(), [b"CD_STOP\n", b"SELECT_SOURCE TV1\n"])
+        # The locks are released: the next request is served normally.
+        self.elapse_cd_interval()
+        self.assertEqual(post("/api/v1/source", '{"source":"TV2"}', self.session()[1])[0], 200)
+        self.assertEqual(self.sent(), [b"CD_STOP\n", b"SELECT_SOURCE TV1\n",
+                                       b"CD_STOP\n", b"SELECT_SOURCE TV2\n"])
+
+    def test_csrf_single_use_and_recovery_without_duplicates(self):
+        self.service(receiver_status("CD"), stop=CD_STOP_UNCERTAIN)
+        token, cookie = self.session()
+        code, payload = self.select("TV1", token, cookie)
+        self.assertEqual((code, payload["stage"]), (502, "CD_STOP"))
+        # The consumed token never dispatches again.
+        self.assertEqual(self.select("TV1", token, cookie)[0], 403)
+        self.assertEqual(self.sent(), [b"CD_STOP\n"])
+        # A recovered token is a new, explicit request: one STOP, one SELECT.
+        time.sleep(1.0)  # The existing per-session source spacing.
+        self.elapse_cd_interval()
+        self.service(receiver_status("CD"))
+        token = self.fresh_token(cookie)
+        code, payload = self.select("TV1", token, cookie)
+        self.assertEqual(code, 200, payload)
+        self.assertEqual(self.sent(), [b"CD_STOP\n", b"SELECT_SOURCE TV1\n"])
+        self.assertEqual(self.select("TV1", token, cookie)[0], 403)
+        self.assertEqual(len(self.sent()), 2)
 
 
 class BindingTest(unittest.TestCase):

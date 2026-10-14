@@ -26,6 +26,7 @@ let state = 'IDLE';
 let sourceEnabled = true;
 let now = 10000;
 let refresh;
+let reply = null; // { ok, data } for the next source POST; default verified.
 const context = {
   AbortController, setTimeout, clearTimeout,
   document: {
@@ -55,9 +56,9 @@ const context = {
     }) };
     if (url === '/api/v1/source') {
       posts.push(options);
-      return { ok: true, json: async () => ({
-        result: 'SERVICE_TX_OK', receiver_execution: 'UNVERIFIED',
-      }) };
+      const next = reply || { ok: true, data: { result: 'SERVICE_TX_OK', receiver_execution: 'UNVERIFIED' } };
+      reply = null;
+      return { ok: next.ok, json: async () => next.data };
     }
     throw new Error(`unexpected request ${url}`);
   },
@@ -78,6 +79,40 @@ async function main() {
   assert.match(elements.get('availability-text').textContent, /SELECTION UNVERIFIED/);
   await buttons[0].click();
   assert.equal(posts.length, 1, 'rapid repeat must not dispatch');
+
+  // Leaving CD: the Gateway's CD_STOP outcome is shown; the browser never
+  // retries and never claims a stopped changer or a selected source.
+  const text = () => elements.get('availability-text').textContent;
+  const stop = { gpio_tx: 'TX_OK', waveform: 'MATCH', receiver_execution: 'UNVERIFIED' };
+  const cases = [
+    [1, { ok: true, data: { result: 'SERVICE_TX_OK', source: 'TUNER', cd_stop: stop,
+      receiver_execution: 'UNVERIFIED' } },
+    /^CD STOP TX REPORTED · TUNER TX REPORTED · SELECTION UNVERIFIED$/],
+    [2, { ok: false, data: { result: 'SERVICE_UNCERTAIN', stage: 'CD_STOP', source: 'PHONO',
+      source_sent: false, physical_check_required: true } },
+    /^CD STOP SERVICE_UNCERTAIN · PHONO NOT SENT · CHECK CHANGER$/],
+    [5, { ok: false, data: { result: 'REJECTED', stage: 'CD_STOP', source: 'TAPE1',
+      source_sent: false, physical_check_required: false } },
+    /^CD STOP REJECTED · TAPE1 NOT SENT$/],
+    [1, { ok: false, data: { result: 'SERVICE_UNCERTAIN', stage: 'SELECT_SOURCE', source: 'TUNER',
+      source_sent: true, cd_stop: stop, physical_check_required: true } },
+    /^CD STOP TX REPORTED · SOURCE SERVICE_UNCERTAIN · CHECK RECEIVER$/],
+    [0, { ok: true, data: { result: 'SERVICE_TX_OK', receiver_execution: 'UNVERIFIED' } },
+    /^CD TX REPORTED · SELECTION UNVERIFIED$/],
+  ];
+  for (const [index, response, message] of cases) {
+    now += 1001;
+    const before = posts.length;
+    reply = response;
+    await buttons[index].click();
+    assert.equal(posts.length, before + 1);
+    assert.match(text(), message);
+    now += 1001;
+    refresh();
+    await settle();
+    assert.equal(posts.length, before + 1, 'no automatic retry');
+  }
+
   now += 1001;
   state = 'FAULT_LATCHED';
   refresh();

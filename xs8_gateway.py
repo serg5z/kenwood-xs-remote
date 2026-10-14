@@ -85,6 +85,12 @@ POWER_PROVISIONAL_ACTIONS = ("OFF",)
 POWER_INTERVAL_MS = 2000
 # CONTEXT 0x48: historical TAPE2 MONITOR toggle, not yet physically validated.
 TAPE2_MONITOR_INTERVAL_MS = 1000
+# Leaving a freshly observed CD source stops the changer first: CD_STOP (0x9C,
+# physically observed), then SELECT_SOURCE. Selecting CD never stops it.
+SOURCES_STOPPING_CD = ("TUNER", "PHONO", "TV1", "TV2", "TAPE1")
+# Every server-wide control lock a source request holds, so no CD, volume, power
+# or MONITOR request can run between its CD_STOP and its SELECT_SOURCE.
+SOURCE_CONTROL_LOCKS = ("cd_track", "volume_step", "power", "tape2_monitor")
 # Server-wide spacing from one completed VOLUME_STEP dispatch to the next. Phase 1
 # exposes single taps only; this guards against duplicate submissions, not hold.
 VOLUME_STEP_INTERVAL_MS = 250
@@ -931,6 +937,36 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 status.get("state") not in ("HOLDING_UP", "HOLDING_DOWN")):
             end_cd_seek(self.server, "SERVICE_IDLE")
 
+    def take_source_locks(self):
+        """Hold every control lock for one source request, or none (refused)."""
+        taken = []
+        for name in SOURCE_CONTROL_LOCKS:
+            lock = self.server.__dict__.setdefault(
+                name, {"lock": threading.Lock(), "completed": float("-inf")})["lock"]
+            if not lock.acquire(blocking=False):
+                for held in taken:
+                    held.release()
+                return False
+            taken.append(lock)
+        self.extra_locks = taken
+        return True
+
+    @staticmethod
+    def source_is_fresh_cd(status):
+        # Only a fresh observation with healthy integrity; UNKNOWN, LAST_KNOWN
+        # and UNCERTAIN never cause a STOP.
+        source = receiver_state(status)["source"]
+        return source["value"] == "CD" and source["freshness"] == "FRESH"
+
+    def dispatch_source(self, source, stop_cd):
+        """CD_STOP then SELECT_SOURCE, or SELECT_SOURCE alone. A failed STOP raises
+        before SELECT_SOURCE; neither is ever retried."""
+        if stop_cd:
+            self.source_stage = "CD_STOP"
+            self.cd_stop_evidence = self.dispatch_cd_playback("STOP")
+        self.source_stage = "SELECT_SOURCE"
+        return send_source(self.socket_path, source)
+
     def take_spacing(self, name, interval_ms, session):
         """Server-wide lock and completion spacing for one control, or None after
         a refusal (the token is consumed)."""
@@ -973,6 +1009,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.start_timing()
         self.held_lock = None
+        self.extra_locks = []
+        self.source_stage = None
+        self.cd_stop_evidence = None
         self.cd_action = None
         self.cd_kind = "CD_TRACK"
         self.volume_direction = None
@@ -981,6 +1020,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         finally:
             if self.held_lock is not None:
                 self.held_lock.release()
+            for lock in self.extra_locks:
+                lock.release()
             if self.volume_direction is not None:
                 self.log_message("VOLUME_STEP direction=%s code=%s result=%s %s",
                                  self.volume_direction,
@@ -1167,6 +1208,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
             session["last_query_request"] = now
         # Single use: a repeated request with the same token cannot dispatch again.
         session["csrf"] = secrets.token_urlsafe(32)
+        if is_source and not self.take_source_locks():
+            self.send_json(409, {"result": "BUSY", "receiver_execution": "UNVERIFIED"})
+            return
+        stop_cd = False
         if (is_source or is_query or is_cd or is_volume or is_playback or
                 is_power or is_monitor or self.production_mute_enabled):
             try:
@@ -1200,6 +1245,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     else self.status_allows_mute(status)):
                 self.send_json(409, {"result": "NOT_ELIGIBLE", "receiver_execution": "UNVERIFIED"})
                 return
+            stop_cd = (is_source and source in SOURCES_STOPPING_CD and
+                       self.source_is_fresh_cd(status))
+            if stop_cd:
+                self.cd_kind, self.cd_action = "SOURCE_CD_STOP", source
+                # The STOP is a CD dispatch: CD STATUS fields and CD spacing apply.
+                interval = self.cd_track_interval_ms
+                if not self.status_allows_cd_track(status):
+                    self.send_json(409, {"result": "NOT_ELIGIBLE", "source": source,
+                                         "receiver_execution": "UNVERIFIED"})
+                    return
+                if (interval != CD_TRACK_INTERVAL_OFF and (time.monotonic() -
+                        self.cd_track_state()["completed"]) * 1000 < interval):
+                    self.send_json(429, {"result": "TOO_FAST", "min_interval_ms": interval,
+                                         "source": source, "receiver_execution": "UNVERIFIED"})
+                    return
         try:
             reply = (send_mute(self.socket_path, fake_only=not self.production_mute_enabled)
                      if is_mute else send_receiver_query(self.socket_path) if is_query
@@ -1208,7 +1268,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                      else self.dispatch_volume_step(direction) if is_volume
                      else self.dispatch_spaced(spacing, send_power, action) if is_power
                      else self.dispatch_spaced(spacing, send_tape2_monitor) if is_monitor
-                     else send_source(self.socket_path, source))
+                     else self.dispatch_source(source, stop_cd))
         except MuteServiceError as exc:
             code = {"UNAVAILABLE": 503, "REJECTED": 409, "CD_FAULT_LATCHED": 409,
                     "FAULT_LATCHED": 409, "TIMEOUT": 504}.get(exc.result, 502)
@@ -1223,6 +1283,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 # Never retried; only a clean refusal certainly sent nothing.
                 payload["physical_check_required"] = exc.result not in (
                     "UNAVAILABLE", "REJECTED")
+            if stop_cd:
+                payload["source"] = source
+                payload["stage"] = self.source_stage
+                payload["source_sent"] = self.source_stage == "SELECT_SOURCE"
+                if self.cd_stop_evidence:
+                    payload["cd_stop"] = self.cd_stop_evidence
+                # After a verified STOP the changer may have stopped whatever the
+                # source result; otherwise only a clean refusal sent nothing.
+                payload["physical_check_required"] = (
+                    self.cd_stop_evidence is not None or
+                    exc.result not in ("UNAVAILABLE", "REJECTED"))
             if is_volume:
                 payload["direction"] = direction
                 # Never retried here or in the browser; only a clean refusal sent nothing.
@@ -1267,6 +1338,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             payload["service_reply"] = reply
         else:
             payload.update(reply)
+            if stop_cd:
+                payload["source"] = source
+                payload["cd_stop"] = self.cd_stop_evidence
         self.send_json(200, payload)
 
 
