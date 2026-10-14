@@ -61,7 +61,7 @@ function element(id) {
   }
   return elements.get(id);
 }
-const sourceButtons = ['CD', 'TUNER', 'PHONO', 'TV1', 'TV2', 'TAPE1'].map((source) => {
+const sourceButtons = ['CD', 'TUNER', 'PHONO', 'VIDEO1', 'VIDEO2', 'TAPE1'].map((source) => {
   const button = element(`source-${source}`);
   button.dataset.source = source;
   return button;
@@ -139,7 +139,7 @@ const context = {
         state: 'IDLE', monitor: 'HEALTHY', stop_owed: '0', context_may_be_open: '0',
         last_byte: '0x07', last_gpio_tx: 'TX_OK', last_waveform: 'MATCH', cd_state: 'IDLE',
         cd_action: 'NONE', cd_release_owed: '0', cd_lease_expired: '0', cd_last_result: 'NONE' },
-        receiver: { source: { value: 'TV1', freshness: 'FRESH' }, monitor: monitorReport,
+        receiver: { source: { value: 'VIDEO1', freshness: 'FRESH' }, monitor: monitorReport,
           integrity, receiver_execution: 'UNVERIFIED' } } });
     }
     if (url === '/api/v1/session') {
@@ -150,7 +150,7 @@ const context = {
     }
     if (url === '/api/v1/capabilities') {
       return respond({ status: 200, data: { operations: {
-        source: { enabled: true, available_sources: ['CD', 'TUNER', 'PHONO', 'TV1', 'TV2', 'TAPE1'] },
+        source: { enabled: true, available_sources: ['CD', 'TUNER', 'PHONO', 'VIDEO1', 'VIDEO2', 'TAPE1'] },
         volume_step: { enabled: flags.step, available_directions: ['UP', 'DOWN'], min_interval_ms: 250 },
         volume_hold: { enabled: flags.hold, available_directions: ['UP', 'DOWN'], hold_delay_ms: 400,
           heartbeat_ms: 500, lease_ms: 1200, max_hold_ms: holdMaxMs },
@@ -183,13 +183,13 @@ async function main() {
   await settle();
   assert.equal(requests.length, 0, 'loading sends nothing');
 
-  // 1. TV1/TV2 are ordinary source buttons now; one POST per click.
+  // 1. VIDEO1/VIDEO2 are ordinary source buttons now; one POST per click.
   const tv1 = sourceButtons[3];
   assert.equal(tv1.disabled, false);
   assert.equal(sourceButtons[4].disabled, false);
   await tv1.fire('click');
   await settle();
-  assert.deepEqual(requests.map((r) => [r.url, r.body]), [['/api/v1/source', { source: 'TV1' }]]);
+  assert.deepEqual(requests.map((r) => [r.url, r.body]), [['/api/v1/source', { source: 'VIDEO1' }]]);
   await idle();
 
   // 2. MONITOR indicator: only fresh, confirmed reports colour it.

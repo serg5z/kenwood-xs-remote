@@ -151,7 +151,7 @@ static void test_source_selection()
         assert(tx.sent.back() == source.second);
     }
     const size_t count = tx.sent.size();
-    // TV1/TV2 are CONTEXT sequences (test_context_key_commands); TAPE2 stays blocked.
+    // VIDEO1/VIDEO2 are CONTEXT sequences (test_context_key_commands); TAPE2 stays blocked.
     assert(core.command("SELECT_SOURCE TAPE2", at(10), at(10)) == "ERR SOURCE_UNVERIFIED\n");
     assert(core.command("SELECT_SOURCE UNKNOWN", at(10), at(10)) ==
            "ERR UNKNOWN_SOURCE\n");
@@ -1671,7 +1671,10 @@ static void test_context_key_commands()
     using Bytes = std::vector<uint8_t>;
     const std::string ok = " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n";
     struct Key { const char *line; uint8_t byte; const char *reply; };
-    const Key keys[] = {{"SELECT_SOURCE TV1", 0x78, "OK SOURCE_TX"},
+    const Key keys[] = {{"SELECT_SOURCE VIDEO1", 0x78, "OK SOURCE_TX"},
+                        {"SELECT_SOURCE VIDEO2", 0x88, "OK SOURCE_TX"},
+                        // Compatibility aliases: the same wire bytes.
+                        {"SELECT_SOURCE TV1", 0x78, "OK SOURCE_TX"},
                         {"SELECT_SOURCE TV2", 0x88, "OK SOURCE_TX"},
                         {"TAPE2_MONITOR_TOGGLE", 0x48, "OK TAPE2_MONITOR_TX"}};
     for (const auto& key : keys) {
@@ -1722,7 +1725,7 @@ static void test_context_key_commands()
     context.connected(1);
     context.set_research_context_enabled(true);
     context.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED", at(1), at(1), 1);
-    assert(context.command("SELECT_SOURCE TV1", at(2), at(2), 1) == "ERR RESEARCH_CONTEXT_ACTIVE\n");
+    assert(context.command("SELECT_SOURCE VIDEO1", at(2), at(2), 1) == "ERR RESEARCH_CONTEXT_ACTIVE\n");
     assert(context.command("TAPE2_MONITOR_TOGGLE", at(2), at(2), 1) ==
            "ERR RESEARCH_CONTEXT_ACTIVE\n");
     assert(context_tx.sent == (Bytes{0x17}));
@@ -1732,14 +1735,14 @@ static void test_context_key_commands()
     Xs8ServiceCore stopping(stop_tx, Ms(2000), true, [&] { return signalled; },
                             [] { return at(0); });
     stopping.connected();
-    assert(stopping.command("SELECT_SOURCE TV2", at(1), at(1)) == "ERR SHUTDOWN\n");
+    assert(stopping.command("SELECT_SOURCE VIDEO2", at(1), at(1)) == "ERR SHUTDOWN\n");
     assert(stopping.command("TAPE2_MONITOR_TOGGLE", at(1), at(1)) == "ERR SHUTDOWN\n");
     assert(stop_tx.sent.empty() && stopping.state() == VolumeControl::State::IDLE);
 
     FakeTx boot_tx;
     Xs8ServiceCore boot(boot_tx, Ms(2000), false, {}, [] { return at(0); });
     boot.connected();
-    assert(boot.command("SELECT_SOURCE TV1", at(1), at(1)) == "ERR BOOT_INHIBIT\n");
+    assert(boot.command("SELECT_SOURCE VIDEO1", at(1), at(1)) == "ERR BOOT_INHIBIT\n");
     boot_tx.healthy = false;
     assert(boot.command("TAPE2_MONITOR_TOGGLE", at(1), at(1)) == "ERR MONITOR_FAILED\n");
     assert(boot_tx.sent.empty());

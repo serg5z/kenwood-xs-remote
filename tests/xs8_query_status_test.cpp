@@ -34,8 +34,8 @@ static void assert_contains(const std::string& text, const char *part)
 static void test_all_known_pairs()
 {
     const struct { uint8_t legacy, lsb; const char *name; } sources[] = {
-        {0x11, 0x77, "TV2"}, {0x13, 0x37, "PHONO"},
-        {0x19, 0x67, "TAPE1"}, {0x1A, 0xA7, "TV1"},
+        {0x11, 0x77, "VIDEO2"}, {0x13, 0x37, "PHONO"},
+        {0x19, 0x67, "TAPE1"}, {0x1A, 0xA7, "VIDEO1"},
         {0x1B, 0x27, "TUNER"}, {0x1D, 0x47, "CD"}
     };
     const struct { uint8_t legacy, lsb; const char *name; } monitors[] = {

@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 
 // Regression tests for two observed state-synchronization reports:
-// 1. PHONO -> TV1/TV2 changed the receiver but the source indicator stayed stale
+// 1. PHONO -> VIDEO1/VIDEO2 changed the receiver but the source indicator stayed stale
 //    until SYNC (the service dropped the receiver's broadcast; see
 //    xs8_receiver_state_test). The Web must show the service's new observation
 //    after the selection without SYNC, and never infer it from TX evidence.
@@ -18,7 +18,7 @@ const fresh = (value) => ({ value, freshness: 'FRESH' });
 
 function page(state) {
   const elements = new Map();
-  const sources = ['CD', 'TUNER', 'PHONO', 'TV1', 'TV2', 'TAPE1'].map((source) => ({
+  const sources = ['CD', 'TUNER', 'PHONO', 'VIDEO1', 'VIDEO2', 'TAPE1'].map((source) => ({
     dataset: { source }, disabled: true,
     addEventListener(_event, handler) { this.click = handler; },
   }));
@@ -49,7 +49,7 @@ function page(state) {
         receiver_query_available: true }) };
       if (url === '/api/v1/capabilities') return { ok: true, json: async () => ({
         operations: { source: { enabled: true,
-          available_sources: ['CD', 'TUNER', 'PHONO', 'TV1', 'TV2', 'TAPE1'] },
+          available_sources: ['CD', 'TUNER', 'PHONO', 'VIDEO1', 'VIDEO2', 'TAPE1'] },
         receiver_query: { enabled: true } } }) };
       if (options.method === 'POST') {
         ui.posts.push(url);
@@ -76,20 +76,20 @@ async function sourceAfterSelection() {
   const ui = page(state);
   await settle();
   assert.match(sourceText(ui), /^OBSERVED SOURCE PHONO · FRESH$/);
-  const tv1 = ui.sources.find((b) => b.dataset.source === 'TV1');
-  const tv2 = ui.sources.find((b) => b.dataset.source === 'TV2');
+  const tv1 = ui.sources.find((b) => b.dataset.source === 'VIDEO1');
+  const tv2 = ui.sources.find((b) => b.dataset.source === 'VIDEO2');
 
-  // The service observed the receiver's TV1 broadcast during the selection: the
+  // The service observed the receiver's VIDEO1 broadcast during the selection: the
   // refresh after the POST shows it, without SYNC.
   state.onPost = (url, body) => {
-    assert.deepEqual([url, body], ['/api/v1/source', { source: 'TV1' }]);
-    state.receiver = { ...state.receiver, source: { ...fresh('TV1'), evidence: 'AFTER_LOCAL_TX' } };
+    assert.deepEqual([url, body], ['/api/v1/source', { source: 'VIDEO1' }]);
+    state.receiver = { ...state.receiver, source: { ...fresh('VIDEO1'), evidence: 'AFTER_LOCAL_TX' } };
     return tx;
   };
   await tv1.click();
   await settle();
-  assert.match(sourceText(ui), /^OBSERVED SOURCE TV1 · FRESH$/);
-  assert.deepEqual(observed(ui), ['TV1']);
+  assert.match(sourceText(ui), /^OBSERVED SOURCE VIDEO1 · FRESH$/);
+  assert.deepEqual(observed(ui), ['VIDEO1']);
   assert.deepEqual(ui.posts, ['/api/v1/source'], 'no automatic SYNC or other POST');
 
   // No observation (the old behaviour): TX_OK/MATCH never moves the indicator.
@@ -97,14 +97,14 @@ async function sourceAfterSelection() {
   state.onPost = () => tx;
   await tv2.click();
   await settle();
-  assert.match(sourceText(ui), /^OBSERVED SOURCE TV1 · FRESH$/);
-  assert.deepEqual(observed(ui), ['TV1']);
-  assert.match(ui.element('availability-text').textContent, /TV2 TX REPORTED · SELECTION UNVERIFIED/);
+  assert.match(sourceText(ui), /^OBSERVED SOURCE VIDEO1 · FRESH$/);
+  assert.deepEqual(observed(ui), ['VIDEO1']);
+  assert.match(ui.element('availability-text').textContent, /VIDEO2 TX REPORTED · SELECTION UNVERIFIED/);
   // A later passive observation is picked up by the ordinary poll.
-  state.receiver = { ...state.receiver, source: fresh('TV2') };
+  state.receiver = { ...state.receiver, source: fresh('VIDEO2') };
   await ui.poll();
   await settle();
-  assert.deepEqual(observed(ui), ['TV2']);
+  assert.deepEqual(observed(ui), ['VIDEO2']);
   assert.deepEqual(ui.posts, ['/api/v1/source', '/api/v1/source']);
 }
 

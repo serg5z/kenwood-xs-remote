@@ -7,19 +7,19 @@ const char *source_name(uint8_t legacy, bool queried)
 {
     if (queried) {
         switch (legacy) {
-        case 0x11: return "TV2";
+        case 0x11: return "VIDEO2";
         case 0x13: return "PHONO";
         case 0x19: return "TAPE1";
-        case 0x1A: return "TV1";
+        case 0x1A: return "VIDEO1";
         case 0x1B: return "TUNER";
         case 0x1D: return "CD";
         }
     } else {
         switch (legacy) {
-        case 0x71: return "TV2";
+        case 0x71: return "VIDEO2";
         case 0x73: return "PHONO";
         case 0x79: return "TAPE1";
-        case 0x7A: return "TV1";
+        case 0x7A: return "VIDEO1";
         case 0x7B: return "TUNER";
         case 0x7D: return "CD";
         }

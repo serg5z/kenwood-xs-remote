@@ -4,7 +4,7 @@ const vm = require('node:vm');
 
 const html = fs.readFileSync('web/index.html', 'utf8');
 const css = fs.readFileSync('web/app.css', 'utf8');
-const names = ['CD', 'TUNER', 'PHONO', 'TV1', 'TV2', 'TAPE1', 'TAPE2'];
+const names = ['CD', 'TUNER', 'PHONO', 'VIDEO1', 'VIDEO2', 'TAPE1', 'TAPE2'];
 // Six selectable sources; the TAPE2 button is the separate MONITOR control.
 for (const name of names.slice(0, 6)) assert.match(html, new RegExp(`data-source="${name}"`));
 assert.doesNotMatch(html, /data-source="TAPE2"/);
@@ -27,8 +27,10 @@ let sourceEnabled = true;
 let now = 10000;
 let refresh;
 let reply = null; // { ok, data } for the next source POST; default verified.
+const delays = [];
 const context = {
-  AbortController, setTimeout, clearTimeout,
+  AbortController, clearTimeout,
+  setTimeout: (handler, ms) => { delays.push(ms); return setTimeout(handler, ms); },
   document: {
     getElementById(id) {
       if (id === 'mute-button') return mute;
@@ -52,12 +54,13 @@ const context = {
     }) };
     if (url === '/api/v1/capabilities') return { ok: true, json: async () => ({
       operations: { source: { enabled: sourceEnabled,
-        available_sources: ['CD', 'TUNER', 'PHONO', 'TAPE1'] } },
+        available_sources: ['CD', 'TUNER', 'PHONO', 'VIDEO1', 'VIDEO2', 'TAPE1'] } },
     }) };
     if (url === '/api/v1/source') {
       posts.push(options);
       const next = reply || { ok: true, data: { result: 'SERVICE_TX_OK', receiver_execution: 'UNVERIFIED' } };
       reply = null;
+      if (next.lost) throw new Error('aborted');
       return { ok: next.ok, json: async () => next.data };
     }
     throw new Error(`unexpected request ${url}`);
@@ -71,7 +74,7 @@ async function main() {
   await settle();
   assert.equal(posts.length, 0);
   for (const button of buttons) {
-    assert.equal(button.disabled, !['CD', 'TUNER', 'PHONO', 'TAPE1'].includes(button.dataset.source));
+    assert.equal(button.disabled, button.dataset.source === 'TAPE2');
   }
   await Promise.all([buttons[0].click(), buttons[0].click()]);
   assert.equal(posts.length, 1);
@@ -80,32 +83,41 @@ async function main() {
   await buttons[0].click();
   assert.equal(posts.length, 1, 'rapid repeat must not dispatch');
 
-  // Leaving CD: the Gateway's CD_STOP outcome is shown; the browser never
-  // retries and never claims a stopped changer or a selected source.
+  // Leaving CD: the Gateway selects first, then stops the CD; both outcomes are
+  // shown. The browser never retries and never claims a stopped changer or a
+  // selected source.
   const text = () => elements.get('availability-text').textContent;
-  const stop = { gpio_tx: 'TX_OK', waveform: 'MATCH', receiver_execution: 'UNVERIFIED' };
+  const tx = { gpio_tx: 'TX_OK', waveform: 'MATCH', receiver_execution: 'UNVERIFIED' };
   const cases = [
-    [1, { ok: true, data: { result: 'SERVICE_TX_OK', source: 'TUNER', cd_stop: stop,
-      receiver_execution: 'UNVERIFIED' } },
-    /^CD STOP TX REPORTED · TUNER TX REPORTED · SELECTION UNVERIFIED$/],
-    [2, { ok: false, data: { result: 'SERVICE_UNCERTAIN', stage: 'CD_STOP', source: 'PHONO',
-      source_sent: false, physical_check_required: true } },
-    /^CD STOP SERVICE_UNCERTAIN · PHONO NOT SENT · CHECK CHANGER$/],
-    [5, { ok: false, data: { result: 'REJECTED', stage: 'CD_STOP', source: 'TAPE1',
-      source_sent: false, physical_check_required: false } },
-    /^CD STOP REJECTED · TAPE1 NOT SENT$/],
-    [1, { ok: false, data: { result: 'SERVICE_UNCERTAIN', stage: 'SELECT_SOURCE', source: 'TUNER',
-      source_sent: true, cd_stop: stop, physical_check_required: true } },
-    /^CD STOP TX REPORTED · SOURCE SERVICE_UNCERTAIN · CHECK RECEIVER$/],
+    [1, { ok: true, data: { result: 'SERVICE_TX_OK', source: 'TUNER', ...tx, cd_stop: tx } },
+    /^TUNER TX REPORTED · CD STOP TX REPORTED · SELECTION UNVERIFIED$/],
+    [2, { ok: false, data: { result: 'SERVICE_UNCERTAIN', stage: 'SELECT_SOURCE', source: 'PHONO',
+      cd_stop_sent: false, physical_check_required: true } },
+    /^PHONO SERVICE_UNCERTAIN · CD STOP NOT SENT · CHECK RECEIVER$/],
+    [5, { ok: false, data: { result: 'REJECTED', stage: 'SELECT_SOURCE', source: 'TAPE1',
+      cd_stop_sent: false, physical_check_required: false } },
+    /^TAPE1 REJECTED · CD STOP NOT SENT$/],
+    [3, { ok: false, data: { result: 'SERVICE_UNCERTAIN', stage: 'CD_STOP', source: 'VIDEO1',
+      cd_stop_sent: true, ...tx, cd_stop: { result: 'SERVICE_UNCERTAIN' },
+      physical_check_required: true } },
+    /^VIDEO1 TX REPORTED · CD STOP SERVICE_UNCERTAIN · CHECK CHANGER$/],
+    [1, { ok: false, data: { result: 'REJECTED', stage: 'CD_STOP', source: 'TUNER',
+      cd_stop_sent: true, ...tx, cd_stop: { result: 'REJECTED' }, physical_check_required: true } },
+    /^TUNER TX REPORTED · CD STOP REJECTED · CHECK CHANGER$/],
     [0, { ok: true, data: { result: 'SERVICE_TX_OK', receiver_execution: 'UNVERIFIED' } },
     /^CD TX REPORTED · SELECTION UNVERIFIED$/],
+    // A lost or timed-out response may have sent either command.
+    [4, { lost: true }, /^SOURCE RESULT UNKNOWN · CHECK RECEIVER AND CHANGER$/],
   ];
   for (const [index, response, message] of cases) {
     now += 1001;
     const before = posts.length;
     reply = response;
+    delays.length = 0;
     await buttons[index].click();
     assert.equal(posts.length, before + 1);
+    // Two service commands: the source request outlasts the Gateway's worst case.
+    assert.ok(delays.includes(9000) && !delays.includes(6000), String(delays));
     assert.match(text(), message);
     now += 1001;
     refresh();

@@ -27,6 +27,10 @@ let enabledSeekDirections = [];
 let seekHeartbeatMs = 500;
 let seekMaxHoldMs = 10000;
 const SEEK_REQUEST_TIMEOUT_MS = 4000;
+// Leaving CD is two service commands (SELECT_SOURCE, then CD_STOP): the Gateway's
+// worst case is a 1 s STATUS read plus two 3 s replies. Other controls send one.
+const SOURCE_REQUEST_TIMEOUT_MS = 9000;
+const CONTROL_REQUEST_TIMEOUT_MS = 6000;
 // The active hold (CD seek or volume):
 // { kind, button, direction, token, holdId, phase, cancelled, reason, started, pointerId, timer, wake }
 let seek = null;
@@ -393,7 +397,8 @@ async function sendControl(url, body, success, failure, options = {}) {
   volumeHoldReady = false; powerReady = false; tape2MonitorReady = false;
   updateControls();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 6000);
+  const timeout = setTimeout(() => controller.abort(), url.endsWith('/source')
+    ? SOURCE_REQUEST_TIMEOUT_MS : CONTROL_REQUEST_TIMEOUT_MS);
   try {
     const response = await fetchJson(url, {
       method: 'POST', credentials: 'same-origin', signal: controller.signal,
@@ -417,7 +422,7 @@ async function sendControl(url, body, success, failure, options = {}) {
       : url.endsWith('/volume/step') ? 'VOLUME RESULT UNKNOWN · CHECK RECEIVER'
       : url.endsWith('/power') ? 'POWER RESULT UNKNOWN · CHECK RECEIVER'
       : url.endsWith('/receiver/monitor') ? 'MONITOR RESULT UNKNOWN · CHECK RECEIVER'
-      : 'SOURCE RESULT UNKNOWN · CHECK RECEIVER';
+      : 'SOURCE RESULT UNKNOWN · CHECK RECEIVER AND CHANGER';
   } finally {
     clearTimeout(timeout);
     if (url.endsWith('/volume/step')) lastVolumeCompleted = Date.now();
@@ -455,17 +460,18 @@ for (const button of sourceButtons) {
     if (button.disabled || controlBusy || Date.now() - lastSourceAttempt < 1000) return;
     lastSourceAttempt = Date.now();
     const name = button.dataset.source;
-    // The Gateway stops the CD first when leaving a freshly observed CD source.
+    // Leaving a freshly observed CD source, the Gateway selects first, then stops
+    // the CD. Neither is retried; nothing here claims the source or the changer.
     await sendControl('/api/v1/source', JSON.stringify({ source: name }),
       (data) => (data && data.cd_stop
-        ? `CD STOP TX REPORTED · ${name} TX REPORTED · SELECTION UNVERIFIED`
+        ? `${name} TX REPORTED · CD STOP TX REPORTED · SELECTION UNVERIFIED`
         : `${name} TX REPORTED · SELECTION UNVERIFIED`),
       (data) => (data && data.stage === 'CD_STOP'
-        ? `CD STOP ${data.result || 'FAILED'} · ${name} NOT SENT${
-          data.physical_check_required ? ' · CHECK CHANGER' : ''}`
+        ? `${name} TX REPORTED · CD STOP ${data.result || 'FAILED'} · CHECK CHANGER`
         : data && data.stage === 'SELECT_SOURCE'
-          ? `CD STOP TX REPORTED · SOURCE ${data.result || 'FAILED'} · CHECK RECEIVER`
-          : `SOURCE ${data.result || 'FAILED'} · SELECTION UNVERIFIED`));
+          ? `${name} ${data.result || 'FAILED'} · CD STOP NOT SENT${
+            data.physical_check_required ? ' · CHECK RECEIVER' : ''}`
+          : `SOURCE ${data && data.result || 'FAILED'} · SELECTION UNVERIFIED`));
   });
 }
 

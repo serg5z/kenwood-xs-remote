@@ -1,15 +1,15 @@
-# XS8 Service receiver controls: TV1/TV2, TAPE2 MONITOR, POWER
+# XS8 Service receiver controls: VIDEO1/VIDEO2, TAPE2 MONITOR, POWER
 
 These service commands back the Web Remote v2 controls ([Web API](web-api.md#web-remote-v2-controls)). All TX values are current logical TX (waveform_lsb). Every reply ends `receiver_execution=UNVERIFIED`: `TX_OK`/`MATCH` never proves the receiver acted, and nothing is retried automatically.
 
-## CONTEXT keys: `SELECT_SOURCE TV1|TV2`, `TAPE2_MONITOR_TOGGLE`
+## CONTEXT keys: `SELECT_SOURCE VIDEO1|VIDEO2`, `TAPE2_MONITOR_TOGGLE`
 
 One atomic CONTEXT transaction each, through VolumeControl's `context_key()`, the MUTE mechanism without MUTE's hold cancellation:
 
 | Command | Frames | Evidence |
 |---|---|---|
-| `SELECT_SOURCE TV1` | `0x17 → 0x78 → 0x07` | Physically validated 2026-10-12 (human-paced) |
-| `SELECT_SOURCE TV2` | `0x17 → 0x88 → 0x07` | Physically validated 2026-10-12 (human-paced) |
+| `SELECT_SOURCE VIDEO1` | `0x17 → 0x78 → 0x07` | Physically validated 2026-10-12 (human-paced) |
+| `SELECT_SOURCE VIDEO2` | `0x17 → 0x88 → 0x07` | Physically validated 2026-10-12 (human-paced) |
 | `TAPE2_MONITOR_TOGGLE` | `0x17 → 0x48 → 0x07` | **Historical only**; not physically validated |
 
 - Allowed only from volume IDLE with no STOP or CONTEXT obligation. Any volume hold answers `ERR VOLUME_BUSY`, any CD hold or pair `ERR CD_TRACK_BUSY`, an open research CONTEXT `ERR RESEARCH_CONTEXT_ACTIVE`, a CD fault `ERR CD_FAULT_LATCHED`; no frame is sent and no hold is cancelled.

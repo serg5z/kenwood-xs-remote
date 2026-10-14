@@ -940,6 +940,7 @@ int main(int argc, char **argv)
                     line == "CD_TRACK_PREVIOUS" ||
                     line.compare(0, 9, "CD_PRESS ") == 0 ||
                     line.compare(0, 9, "KEY_DOWN ") == 0 ||
+                    line == "SELECT_SOURCE VIDEO1" || line == "SELECT_SOURCE VIDEO2" ||
                     line == "SELECT_SOURCE TV1" || line == "SELECT_SOURCE TV2" ||
                     line == "TAPE2_MONITOR_TOGGLE" ||
                     line == "POWER_ON" || line == "POWER_OFF" ||

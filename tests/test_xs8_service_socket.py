@@ -304,14 +304,18 @@ class ServiceSocketTest(unittest.TestCase):
 
     def test_context_keys_and_power_frames(self):
         ok = " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED"
-        self.assertEqual(self.request("SELECT_SOURCE TV1"), "OK SOURCE_TX" + ok)
-        self.assertEqual(self.request("SELECT_SOURCE TV2"), "OK SOURCE_TX" + ok)
+        self.assertEqual(self.request("SELECT_SOURCE VIDEO1"), "OK SOURCE_TX" + ok)
+        self.assertEqual(self.request("SELECT_SOURCE VIDEO2"), "OK SOURCE_TX" + ok)
         self.assertEqual(self.request("TAPE2_MONITOR_TOGGLE"), "OK TAPE2_MONITOR_TX" + ok)
         self.assertEqual(self.request("POWER_ON"), "OK POWER_TX action=ON" + ok)
         self.assertEqual(self.request("POWER_OFF"), "OK POWER_TX action=OFF" + ok)
         self.assertEqual(self.transmitted(), [
             "0x17", "0x78", "0x07", "0x17", "0x88", "0x07", "0x17", "0x48", "0x07",
             "0x52", "0x62"])
+        # TV1/TV2 remain compatibility aliases with the same wire bytes.
+        self.assertEqual(self.request("SELECT_SOURCE TV1"), "OK SOURCE_TX" + ok)
+        self.assertEqual(self.request("SELECT_SOURCE TV2"), "OK SOURCE_TX" + ok)
+        self.assertEqual(self.transmitted()[-6:], ["0x17", "0x78", "0x07", "0x17", "0x88", "0x07"])
         self.assertIn("state=IDLE stop_owed=0 context_may_be_open=0", self.request("STATUS"))
 
     def test_web_volume_hold_released_by_closing_its_connection(self):

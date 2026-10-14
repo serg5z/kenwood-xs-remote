@@ -20,7 +20,7 @@ const capabilities = (enabled = true) => reply({ operations: { source: {
 } } });
 
 const elements = new Map();
-const buttons = ['CD', 'TUNER', 'PHONO', 'TV1', 'TV2', 'TAPE1', 'TAPE2'].map(
+const buttons = ['CD', 'TUNER', 'PHONO', 'VIDEO1', 'VIDEO2', 'TAPE1', 'TAPE2'].map(
   (source) => ({ dataset: { source }, disabled: true,
     addEventListener(_event, handler) { this.click = handler; } }));
 const mute = { disabled: true, addEventListener(_event, handler) { this.click = handler; } };

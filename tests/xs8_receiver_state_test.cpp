@@ -28,8 +28,8 @@ int main()
     has(state.status_fields(), "receiver_source=UNKNOWN");
     has(state.status_fields(), "receiver_monitor=UNKNOWN");
     const struct { uint8_t byte; const char *name; } sources[] = {
-        {0x71, "TV2"}, {0x73, "PHONO"}, {0x79, "TAPE1"},
-        {0x7A, "TV1"}, {0x7B, "TUNER"}, {0x7D, "CD"}
+        {0x71, "VIDEO2"}, {0x73, "PHONO"}, {0x79, "TAPE1"},
+        {0x7A, "VIDEO1"}, {0x7B, "TUNER"}, {0x7D, "CD"}
     };
     uint64_t time = 1000;
     for (const auto& source : sources) {
@@ -57,7 +57,7 @@ int main()
     state.observe(frame(11500, 0x7D), false);
     has(state.status_fields(), "receiver_source=PHONO"); // Older observation is stale.
 
-    // Back-to-back CONTEXT selection 0x17 -> 0x78 -> 0x07 (TV1): only each local
+    // Back-to-back CONTEXT selection 0x17 -> 0x78 -> 0x07 (VIDEO1): only each local
     // frame's own window is excluded. The receiver's source broadcast between
     // the key and the exit frame is observed although the exit ends later.
     {
@@ -72,14 +72,14 @@ int main()
         tv.observe(frame(104000, 0x7D), false);
         has(tv.status_fields(), "receiver_source=PHONO");
         tv.observe(frame(102700, 0x7A), false);
-        has(tv.status_fields(), "receiver_source=TV1");
+        has(tv.status_fields(), "receiver_source=VIDEO1");
         has(tv.status_fields(), "receiver_source_evidence=AFTER_LOCAL_TX");
-        // TV2 the same way; a broadcast long after the last TX is PASSIVE.
+        // VIDEO2 the same way; a broadcast long after the last TX is PASSIVE.
         tv.note_tx(200000, 201000);
         tv.note_tx(201500, 202500);
         tv.note_tx(203000, 204000);
         tv.observe(frame(202600, 0x71), false);
-        has(tv.status_fields(), "receiver_source=TV2");
+        has(tv.status_fields(), "receiver_source=VIDEO2");
         tv.observe(frame(900000000, 0x7B), false);
         has(tv.status_fields(), "receiver_source=TUNER");
         has(tv.status_fields(), "receiver_source_evidence=PASSIVE");
@@ -92,15 +92,15 @@ int main()
         has(many.status_fields(), "receiver_source=UNKNOWN");
         many.observe(frame(1018000, 0x7D), false); // Between retained windows.
         has(many.status_fields(), "receiver_source=CD");
-        // CD_STOP is ROOT 0xA1, the TV1 broadcast value (legacy 0x7A): the
-        // service's own STOP frame never reads as TV1; a later broadcast does.
+        // CD_STOP is ROOT 0xA1, the VIDEO1 broadcast value (legacy 0x7A): the
+        // service's own STOP frame never reads as VIDEO1; a later broadcast does.
         Xs8ReceiverState stop;
         stop.observe(frame(1000, 0x7D), false);
         stop.note_tx(300000, 301000);
         stop.observe(frame(300000, 0x7A), false);
         has(stop.status_fields(), "receiver_source=CD");
         stop.observe(frame(302000, 0x7A), false);
-        has(stop.status_fields(), "receiver_source=TV1");
+        has(stop.status_fields(), "receiver_source=VIDEO1");
         // Pending-query and suppressed frames stay excluded.
         Xs8ReceiverState queried;
         queried.observe(frame(5000, 0x7A), true);
@@ -115,7 +115,7 @@ int main()
     };
     query.observe(observations, 3); // First response precedes TX function return.
     state.apply_query(query, query.deadline_ns());
-    has(state.status_fields(), "receiver_source=TV2");
+    has(state.status_fields(), "receiver_source=VIDEO2");
     has(state.status_fields(), "receiver_source_evidence=QUERY");
     has(state.status_fields(), "receiver_monitor=ON");
 
@@ -125,14 +125,14 @@ int main()
     };
     failed.observe(bad, 2);
     state.apply_query(failed, failed.deadline_ns());
-    has(state.status_fields(), "receiver_source=TV2");
+    has(state.status_fields(), "receiver_source=VIDEO2");
     Xs8QueryStatus unknown(34000, 35000);
     const xs8_monitor_record unknown_frames[] = {
         frame(34100, 0x37), frame(36000, 0x55), frame(38000, 0x99)
     };
     unknown.observe(unknown_frames, 3);
     state.apply_query(unknown, unknown.deadline_ns());
-    has(state.status_fields(), "receiver_source=TV2");
+    has(state.status_fields(), "receiver_source=VIDEO2");
     has(state.status_fields(), "receiver_monitor=ON");
 
     xs8_monitor_record gap{};
@@ -140,7 +140,7 @@ int main()
     gap.decoded.lost_events = 2;
     state.observe(gap, false);
     state.observe(frame(40000, 0x7D), false);
-    has(state.status_fields(), "receiver_source=TV2");
+    has(state.status_fields(), "receiver_source=VIDEO2");
     has(state.status_fields(), "receiver_integrity=UNCERTAIN");
     state.monitor_failed();
     state.apply_query(query, query.deadline_ns());
@@ -149,7 +149,7 @@ int main()
     overflowed.history_overflow();
     overflowed.apply_query(query, query.deadline_ns());
     has(overflowed.status_fields(), "receiver_integrity=HEALTHY");
-    has(overflowed.status_fields(), "receiver_source=TV2");
+    has(overflowed.status_fields(), "receiver_source=VIDEO2");
     Xs8ReceiverState restarted;
     has(restarted.status_fields(), "receiver_source=UNKNOWN");
     has(restarted.status_fields(), "receiver_monitor=UNKNOWN");

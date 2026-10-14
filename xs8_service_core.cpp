@@ -441,7 +441,7 @@ std::string Xs8ServiceCore::volume_key(bool down, VolumeControl::Direction direc
         " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n";
 }
 
-// TV1, TV2 and TAPE2 MONITOR: one CONTEXT key through VolumeControl's entry
+// VIDEO1, VIDEO2 and TAPE2 MONITOR: one CONTEXT key through VolumeControl's entry
 // and exit. Refused, never cancelling, while any volume or CD hold exists.
 std::string Xs8ServiceCore::context_key_command(uint8_t byte, const char *name, Time now)
 {
@@ -546,7 +546,7 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
         return "ERR CD_UNKNOWN_ACTION\n";
     // Single ROOT key frames with no KEY UP: 0x41 is physically observed. CD STOP
     // is ROOT 0xA1 (physically observed through CD_STOP on the KR-V6070; the earlier
-    // 0x9C could provoke a changer restart on a following TV1/TV2 selection).
+    // 0x9C could provoke a changer restart on a following VIDEO1/VIDEO2 selection).
     // 0xBC is a historical PLAY/PAUSE mapping, not yet verified.
     // ROOT 0x52 is physically observed; 0x62 is historical. Never CONTEXT 0x39.
     if (line == "POWER_ON") return power(0x52, "ON");
@@ -566,8 +566,11 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
         else if (name == "PHONO") byte = 0x83;
         else if (name == "TAPE1") byte = 0x85;
         // Physically validated CONTEXT sequences (2026-10-12): one atomic step.
-        else if (name == "TV1") return context_key_command(0x78, "SOURCE", now);
-        else if (name == "TV2") return context_key_command(0x88, "SOURCE", now);
+        // TV1/TV2: compatibility aliases for an older Gateway; same frames.
+        else if (name == "VIDEO1" || name == "TV1")
+            return context_key_command(0x78, "SOURCE", now);
+        else if (name == "VIDEO2" || name == "TV2")
+            return context_key_command(0x88, "SOURCE", now);
         else if (name == "TAPE2") return "ERR SOURCE_UNVERIFIED\n";
         else return "ERR UNKNOWN_SOURCE\n";
         if (volume_.state() != VolumeControl::State::IDLE ||

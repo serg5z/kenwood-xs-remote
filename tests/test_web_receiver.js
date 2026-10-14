@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 
 const elements = new Map();
-const sources = ['CD', 'TV1', 'TV2', 'TUNER', 'PHONO', 'TAPE1', 'TAPE2'].map(
+const sources = ['CD', 'VIDEO1', 'VIDEO2', 'TUNER', 'PHONO', 'TAPE1', 'TAPE2'].map(
   (source) => ({ dataset: { source }, disabled: true,
     addEventListener(_event, handler) { this.click = handler; } }));
 const mute = { disabled: true, addEventListener(_event, handler) { this.click = handler; } };
@@ -92,7 +92,7 @@ async function main() {
   await poll();
   assert.equal(posts.length, 1, 'polling never retries the query');
 
-  receiver = { source: { value: 'TV1', freshness: 'FRESH' },
+  receiver = { source: { value: 'VIDEO1', freshness: 'FRESH' },
     monitor: { value: 'OFF', freshness: 'LAST_KNOWN' }, integrity: 'HEALTHY' };
   await poll(); // Simulated front-panel observation, with no Web command.
   assert.equal(sources[1].disabled, true);

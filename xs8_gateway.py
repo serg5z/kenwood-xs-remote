@@ -32,10 +32,10 @@ RECEIVER_FIELDS = {
 }
 CD_FIELDS = {"cd_state", "cd_action", "cd_release_owed",
              "cd_lease_expired", "cd_last_result"}
-SOURCES = ("CD", "TUNER", "PHONO", "TV1", "TV2", "TAPE1", "TAPE2")
-# TV1/TV2 are atomic service CONTEXT sequences (0x17 -> 0x78/0x88 -> 0x07),
+SOURCES = ("CD", "TUNER", "PHONO", "VIDEO1", "VIDEO2", "TAPE1", "TAPE2")
+# VIDEO1/VIDEO2 are atomic service CONTEXT sequences (0x17 -> 0x78/0x88 -> 0x07),
 # physically validated 2026-10-12. TAPE2 (MONITOR) is not a source selection.
-EVIDENCED_SOURCES = ("CD", "TUNER", "PHONO", "TV1", "TV2", "TAPE1")
+EVIDENCED_SOURCES = ("CD", "TUNER", "PHONO", "VIDEO1", "VIDEO2", "TAPE1")
 CD_TRACK_ACTIONS = ("NEXT", "PREVIOUS")
 CD_BLOCKED_ACTIONS = ("PLAY_PAUSE", "STOP", "SEEK_FORWARD", "SEEK_BACKWARD")
 CD_WAVEFORMS = ("MATCH", "MISMATCH", "INVALID", "MISSING", "NOT_OBSERVED")
@@ -86,12 +86,13 @@ POWER_PROVISIONAL_ACTIONS = ("OFF",)
 POWER_INTERVAL_MS = 2000
 # CONTEXT 0x48: historical TAPE2 MONITOR toggle, not yet physically validated.
 TAPE2_MONITOR_INTERVAL_MS = 1000
-# Leaving a freshly observed CD source stops the changer first: the same CD_STOP
-# as the Web STOP button (ROOT 0xA1), then SELECT_SOURCE. Selecting CD never
-# stops it.
-SOURCES_STOPPING_CD = ("TUNER", "PHONO", "TV1", "TV2", "TAPE1")
+# Leaving a freshly observed CD source: SELECT_SOURCE first, then the same CD_STOP
+# as the Web STOP button (ROOT 0xA1). Physically, STOP before SELECT_SOURCE made
+# the changer start a track; VIDEO1 then STOP left VIDEO1 selected and the changer
+# stopped. Selecting CD never stops it.
+SOURCES_STOPPING_CD = ("TUNER", "PHONO", "VIDEO1", "VIDEO2", "TAPE1")
 # Every server-wide control lock a source request holds, so no CD, volume, power
-# or MONITOR request can run between its CD_STOP and its SELECT_SOURCE.
+# or MONITOR request can run between its SELECT_SOURCE and its CD_STOP.
 SOURCE_CONTROL_LOCKS = ("cd_track", "volume_step", "power", "tape2_monitor")
 # Server-wide spacing from one completed VOLUME_STEP dispatch to the next. Phase 1
 # exposes single taps only; this guards against duplicate submissions, not hold.
@@ -961,13 +962,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return source["value"] == "CD" and source["freshness"] == "FRESH"
 
     def dispatch_source(self, source, stop_cd):
-        """CD_STOP then SELECT_SOURCE, or SELECT_SOURCE alone. A failed STOP raises
-        before SELECT_SOURCE; neither is ever retried."""
+        """SELECT_SOURCE, then CD_STOP when leaving CD. A failed or uncertain
+        SELECT_SOURCE raises before CD_STOP; neither is ever retried. No delay is
+        added between them."""
+        self.source_stage = "SELECT_SOURCE"
+        reply = send_source(self.socket_path, source)
         if stop_cd:
+            self.source_evidence = reply
             self.source_stage = "CD_STOP"
             self.cd_stop_evidence = self.dispatch_cd_playback("STOP")
-        self.source_stage = "SELECT_SOURCE"
-        return send_source(self.socket_path, source)
+        return reply
 
     def take_spacing(self, name, interval_ms, session):
         """Server-wide lock and completion spacing for one control, or None after
@@ -1013,6 +1017,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.held_lock = None
         self.extra_locks = []
         self.source_stage = None
+        self.source_evidence = None
         self.cd_stop_evidence = None
         self.cd_action = None
         self.cd_kind = "CD_TRACK"
@@ -1277,7 +1282,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             payload = {"result": exc.result, "error": str(exc),
                        "receiver_execution": "UNVERIFIED"}
             if (is_source or is_cd or is_volume or is_playback or is_power or
-                    is_monitor) and exc.evidence:
+                    is_monitor) and exc.evidence and not (
+                        stop_cd and self.source_stage == "CD_STOP"):
                 payload.update(exc.evidence)
             if is_power or is_monitor:
                 if is_power:
@@ -1288,14 +1294,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if stop_cd:
                 payload["source"] = source
                 payload["stage"] = self.source_stage
-                payload["source_sent"] = self.source_stage == "SELECT_SOURCE"
-                if self.cd_stop_evidence:
-                    payload["cd_stop"] = self.cd_stop_evidence
-                # After a verified STOP the changer may have stopped whatever the
-                # source result; otherwise only a clean refusal sent nothing.
-                payload["physical_check_required"] = (
-                    self.cd_stop_evidence is not None or
-                    exc.result not in ("UNAVAILABLE", "REJECTED"))
+                payload["cd_stop_sent"] = self.source_stage == "CD_STOP"
+                if self.source_stage == "CD_STOP":
+                    # The source was verified; the failed STOP's evidence is its own.
+                    payload.update(self.source_evidence)
+                    payload["cd_stop"] = dict(exc.evidence or {}, result=exc.result)
+                    # The receiver has switched and the changer may still play.
+                    payload["physical_check_required"] = True
+                else:
+                    # CD_STOP was never sent; only a clean refusal sent nothing.
+                    payload["physical_check_required"] = exc.result not in (
+                        "UNAVAILABLE", "REJECTED")
             if is_volume:
                 payload["direction"] = direction
                 # Never retried here or in the browser; only a clean refusal sent nothing.
