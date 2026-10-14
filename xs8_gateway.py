@@ -33,7 +33,9 @@ RECEIVER_FIELDS = {
 CD_FIELDS = {"cd_state", "cd_action", "cd_release_owed",
              "cd_lease_expired", "cd_last_result"}
 SOURCES = ("CD", "TUNER", "PHONO", "TV1", "TV2", "TAPE1", "TAPE2")
-EVIDENCED_SOURCES = ("CD", "TUNER", "PHONO", "TAPE1")
+# TV1/TV2 are atomic service CONTEXT sequences (0x17 -> 0x78/0x88 -> 0x07),
+# physically validated 2026-10-12. TAPE2 (MONITOR) is not a source selection.
+EVIDENCED_SOURCES = ("CD", "TUNER", "PHONO", "TV1", "TV2", "TAPE1")
 CD_TRACK_ACTIONS = ("NEXT", "PREVIOUS")
 CD_BLOCKED_ACTIONS = ("PLAY_PAUSE", "STOP", "SEEK_FORWARD", "SEEK_BACKWARD")
 CD_WAVEFORMS = ("MATCH", "MISMATCH", "INVALID", "MISSING", "NOT_OBSERVED")
@@ -62,6 +64,26 @@ CD_SEEK_MAX_HOLD_MS = 10000
 # service release at once) when the browser stops heartbeating for this long.
 CD_SEEK_BROWSER_TIMEOUT_MS = 1500
 VOLUME_DIRECTIONS = ("UP", "DOWN")
+# Held VOL+/VOL- on the service's connection-owned volume hold. The service's
+# --max-hold-ms (100-3000 ms) is authoritative; this Gateway bound is its maximum.
+VOLUME_HOLD_DIRECTIONS = {"UP": "VOLUME_UP", "DOWN": "VOLUME_DOWN"}
+VOLUME_HOLD_MAX_MS = 3000
+# A press shorter than this is a single VOLUME_STEP tap; longer starts a hold.
+VOLUME_HOLD_DELAY_MS = 400
+# Kinds of connection-owned holds. The service allows one hold of any kind, so
+# the Gateway keeps a single registry for all of them.
+KEY_HOLDS = {
+    "cd": {"directions": CD_SEEK_DIRECTIONS, "max_ms": CD_SEEK_MAX_HOLD_MS,
+           "label": "CD_SEEK"},
+    "volume": {"directions": VOLUME_HOLD_DIRECTIONS, "max_ms": VOLUME_HOLD_MAX_MS,
+               "label": "VOLUME_HOLD"},
+}
+# ROOT 0x52 POWER ON is physically observed; ROOT 0x62 POWER OFF is historical.
+POWER_COMMANDS = {"ON": "POWER_ON", "OFF": "POWER_OFF"}
+POWER_PROVISIONAL_ACTIONS = ("OFF",)
+POWER_INTERVAL_MS = 2000
+# CONTEXT 0x48: historical TAPE2 MONITOR toggle, not yet physically validated.
+TAPE2_MONITOR_INTERVAL_MS = 1000
 # Server-wide spacing from one completed VOLUME_STEP dispatch to the next. Phase 1
 # exposes single taps only; this guards against duplicate submissions, not hold.
 VOLUME_STEP_INTERVAL_MS = 250
@@ -144,7 +166,7 @@ def send_mute(socket_path, timeout=1.0, fake_only=True):
     raise MuteServiceError("INVALID_REPLY", "Invalid XS8 service reply")
 
 
-def send_source(socket_path, source, timeout=1.0):
+def send_source(socket_path, source, timeout=3.0):
     if source not in EVIDENCED_SOURCES:
         raise MuteServiceError("REJECTED", "Source lacks controlled TX evidence")
     line = _send_control(socket_path, f"SELECT_SOURCE {source}\n".encode("ascii"),
@@ -308,12 +330,66 @@ class ServiceConnection:
             raise
 
 
+def _single_frame_reply(line, ok_head, uncertain_head, prefix_fields=()):
+    """Strict OK/uncertain reply carrying gpio_tx and waveform; refusals raise."""
+    parts = line.split()
+    count = len(ok_head) + len(prefix_fields) + 3
+    if len(parts) == count and parts[-1] == "receiver_execution=UNVERIFIED" and \
+            parts[len(ok_head):len(ok_head) + len(prefix_fields)] == list(prefix_fields):
+        evidence = _evidence(parts[-3:-1], ("gpio_tx", "waveform"))
+        if (evidence and evidence["gpio_tx"] in ("TX_OK", "TX_FAIL") and
+                evidence["waveform"] in CD_WAVEFORMS):
+            evidence["receiver_execution"] = "UNVERIFIED"
+            if parts[:len(ok_head)] == list(ok_head) and \
+                    evidence["gpio_tx"] == "TX_OK" and evidence["waveform"] == "MATCH":
+                return evidence
+            if parts[:len(uncertain_head)] == list(uncertain_head):
+                raise MuteServiceError("SERVICE_UNCERTAIN", line, evidence)
+    if line == "ERR CD_FAULT_LATCHED":
+        raise MuteServiceError("CD_FAULT_LATCHED", line)
+    if line == "ERR FAULT_LATCHED":
+        raise MuteServiceError("FAULT_LATCHED", line)
+    if (line.startswith("ERR ") and len(parts) >= 2 and
+            parts[1] not in (ok_head[1], uncertain_head[1])):
+        raise MuteServiceError("REJECTED", line)
+    raise MuteServiceError("INVALID_REPLY", "Invalid XS8 service reply")
+
+
+def send_power(socket_path, action, timeout=2.0):
+    """One ROOT POWER frame; the service refuses it during any hold or obligation."""
+    if action not in POWER_COMMANDS:
+        raise MuteServiceError("REJECTED", "Power action is not allowlisted")
+    line = _send_control(socket_path, f"{POWER_COMMANDS[action]}\n".encode("ascii"),
+                         timeout, fake_only=False)
+    return _single_frame_reply(line, ("OK", "POWER_TX"), ("ERR", "POWER_UNCERTAIN"),
+                               (f"action={action}",))
+
+
+def send_tape2_monitor(socket_path, timeout=3.0):
+    """One atomic CONTEXT 0x17 -> 0x48 -> 0x07 toggle; never changes the indicator."""
+    line = _send_control(socket_path, b"TAPE2_MONITOR_TOGGLE\n", timeout, fake_only=False)
+    return _single_frame_reply(line, ("OK", "TAPE2_MONITOR_TX"),
+                               ("ERR", "TAPE2_MONITOR_UNCERTAIN"))
+
+
+def _volume_uncertain(parts, line):
+    """The volume form of an uncertain KEY reply: service state fields."""
+    evidence = _evidence(parts[3:6], ("state", "stop_owed", "context_may_be_open"))
+    if (evidence and evidence["state"] and evidence["stop_owed"] in ("0", "1") and
+            evidence["context_may_be_open"] in ("0", "1")):
+        evidence["receiver_execution"] = "UNVERIFIED"
+        raise MuteServiceError("SERVICE_UNCERTAIN", line, evidence)
+
+
 def parse_key_down(line, action):
     """Strict KEY_DOWN start reply. Raises for anything but a verified press."""
     parts = line.split()
     if parts == ["OK", "KEY_DOWN_TX", f"action={action}", "gpio_tx=TX_OK", "waveform=MATCH",
                  "receiver_execution=UNVERIFIED"]:
         return {"gpio_tx": "TX_OK", "waveform": "MATCH", "receiver_execution": "UNVERIFIED"}
+    if (len(parts) == 7 and parts[:2] == ["ERR", "KEY_DOWN_UNCERTAIN"] and
+            parts[2] == f"action={action}" and parts[6] == "receiver_execution=UNVERIFIED"):
+        _volume_uncertain(parts, line)
     if (len(parts) == 8 and parts[:2] == ["ERR", "KEY_DOWN_UNCERTAIN"] and
             parts[2] == f"action={action}" and parts[7] == "receiver_execution=UNVERIFIED"):
         evidence = _evidence(parts[3:7], ("gpio_tx", "waveform", "release_gpio_tx",
@@ -343,6 +419,9 @@ def parse_key_up(line, action):
                 return "RELEASED", evidence
             if parts[:2] == ["ERR", "KEY_UP_UNCERTAIN"]:
                 raise MuteServiceError("SERVICE_UNCERTAIN", line, evidence)
+    if (len(parts) == 7 and parts[:2] == ["ERR", "KEY_UP_UNCERTAIN"] and
+            parts[2] == f"action={action}" and parts[6] == "receiver_execution=UNVERIFIED"):
+        _volume_uncertain(parts, line)
     if len(parts) == 3 and parts[:2] == ["OK", "KEY_UP_NONE"] and \
             parts[2].startswith("last=") and len(parts[2]) > 5:
         return "NOT_ACTIVE", {"cd_last_result": parts[2][5:]}
@@ -493,7 +572,9 @@ def receiver_state(status):
 def capabilities(mute_available=False, source_available=False, query_available=False,
                  cd_track_available=False, cd_track_interval_ms=CD_TRACK_INTERVAL_MS,
                  volume_step_available=False, cd_playback_available=False,
-                 cd_seek_available=False, cd_blocked_actions=CD_BLOCKED_ACTIONS):
+                 cd_seek_available=False, cd_blocked_actions=CD_BLOCKED_ACTIONS,
+                 volume_hold_available=False, power_available=False,
+                 tape2_monitor_available=False):
     return {
         "api_version": "v0.1",
         "operations": {
@@ -513,7 +594,7 @@ def capabilities(mute_available=False, source_available=False, query_available=F
                 "classification": "unverified", "enabled": source_available,
                 "available_sources": list(EVIDENCED_SOURCES),
                 "blocked_sources": [s for s in SOURCES if s not in EVIDENCED_SOURCES],
-                "reason": "TX and waveform do not confirm receiver execution; TV1, TV2 and TAPE2 lack controlled TX evidence",
+                "reason": "TX and waveform do not confirm receiver execution; TAPE2 is a MONITOR, not a source selection",
             },
             "cd_transport": {
                 "classification": "unverified", "enabled": cd_track_available,
@@ -528,6 +609,25 @@ def capabilities(mute_available=False, source_available=False, query_available=F
                 "provisional_actions": list(CD_PROVISIONAL_ACTIONS),
                 "min_interval_ms": cd_track_interval_ms,
                 "reason": "STOP 0x9C is physically observed; PLAY/PAUSE 0xBC is a historical mapping not yet physically verified",
+            },
+            "volume_hold": {
+                "classification": "unverified", "enabled": volume_hold_available,
+                "available_directions": list(VOLUME_HOLD_DIRECTIONS),
+                "hold_delay_ms": VOLUME_HOLD_DELAY_MS,
+                "heartbeat_ms": CD_SEEK_HEARTBEAT_MS, "lease_ms": CD_SEEK_LEASE_MS,
+                "max_hold_ms": VOLUME_HOLD_MAX_MS,
+                "reason": "Held VOL+/VOL- on a service connection; a short press stays one VOLUME_STEP",
+            },
+            "power": {
+                "classification": "unverified", "enabled": power_available,
+                "available_actions": list(POWER_COMMANDS),
+                "provisional_actions": list(POWER_PROVISIONAL_ACTIONS),
+                "reason": "ROOT 0x52 ON is physically observed; ROOT 0x62 OFF is historical; no power state is read back",
+            },
+            "tape2_monitor": {
+                "classification": "unverified", "enabled": tape2_monitor_available,
+                "provisional": True,
+                "reason": "CONTEXT 0x48 is a historical MONITOR toggle, not yet physically validated; the indicator shows only observed receiver reports",
             },
             "cd_seek": {
                 "classification": "unverified", "enabled": cd_seek_available,
@@ -574,7 +674,7 @@ class CdSeekCleanupMixin:
             end_cd_seek(self, "SESSION_ENDED")
         elif (now - hold["browser_seen"]) * 1000 >= CD_SEEK_BROWSER_TIMEOUT_MS:
             end_cd_seek(self, "BROWSER_INACTIVE")
-        elif (now - hold["started"]) * 1000 >= CD_SEEK_MAX_HOLD_MS:
+        elif (now - hold["started"]) * 1000 >= hold["max_ms"]:
             end_cd_seek(self, "MAX_HOLD")
 
     def server_close(self):
@@ -597,6 +697,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
     volume_step_enabled = False
     cd_playback_enabled = False
     cd_seek_enabled = False
+    volume_hold_enabled = False
+    power_enabled = False
+    tape2_monitor_enabled = False
     https_origin = None
     sessions = None
 
@@ -607,7 +710,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return (self.mute_enabled() or self.production_source_enabled or
                 self.receiver_query_enabled or self.cd_track_enabled or
                 self.volume_step_enabled or self.cd_playback_enabled or
-                self.cd_seek_enabled)
+                self.cd_seek_enabled or self.volume_hold_enabled or
+                self.power_enabled or self.tape2_monitor_enabled)
 
     def authenticated_user(self):
         # nginx overwrites this header with $remote_user after Basic Auth.
@@ -690,7 +794,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "cd_playback": (self.cd_playback_enabled and status is not None and
                                 self.status_allows_cd_track(status)),
                 "cd_seek": (self.cd_seek_enabled and status is not None and
-                            self.status_allows_cd_track(status))}
+                            self.status_allows_cd_track(status)),
+                "volume_hold": (self.volume_hold_enabled and status is not None and
+                                self.status_allows_volume_step(status)),
+                "power": (self.power_enabled and status is not None and
+                          self.status_allows_cd_track(status)),
+                "tape2_monitor": (self.tape2_monitor_enabled and status is not None and
+                                  self.status_allows_volume_step(status))}
 
     def cd_blocked_actions(self):
         enabled = ((CD_PLAYBACK_ACTIONS if self.cd_playback_enabled else ()) +
@@ -742,7 +852,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                               self.cd_track_interval_ms,
                                               available["volume_step"],
                                               available["cd_playback"], available["cd_seek"],
-                                              self.cd_blocked_actions()))
+                                              self.cd_blocked_actions(),
+                                              available["volume_hold"], available["power"],
+                                              available["tape2_monitor"]))
             return
         if path == "/api/v1/session" and self.control_enabled():
             user = self.authenticated_user()
@@ -766,7 +878,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                  "cd_track_available": available["cd_track"],
                                  "volume_step_available": available["volume_step"],
                                  "cd_playback_available": available["cd_playback"],
-                                 "cd_seek_available": available["cd_seek"]}, headers)
+                                 "cd_seek_available": available["cd_seek"],
+                                 "volume_hold_available": available["volume_hold"],
+                                 "power_available": available["power"],
+                                 "tape2_monitor_available": available["tape2_monitor"]}, headers)
             return
         assets = {
             "/": ("index.html", "text/html; charset=utf-8"),
@@ -805,11 +920,40 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return cd_seek_state(self.server)
 
     def forget_stale_hold(self, status):
-        # STATUS IDLE means the service already ended the hold (inactivity,
+        # STATUS without that hold means the service already ended it (inactivity,
         # maximum, monitor). Closing the dead connection also clears the service's
         # re-arm block for it.
-        if status.get("cd_state") == "IDLE":
+        hold = self.cd_seek_state()["hold"]
+        if hold is None:
+            return
+        if (status.get("cd_state") == "IDLE" if hold["kind"] == "cd" else
+                status.get("state") not in ("HOLDING_UP", "HOLDING_DOWN")):
             end_cd_seek(self.server, "SERVICE_IDLE")
+
+    def take_spacing(self, name, interval_ms, session):
+        """Server-wide lock and completion spacing for one control, or None after
+        a refusal (the token is consumed)."""
+        state = self.server.__dict__.setdefault(
+            name, {"lock": threading.Lock(), "completed": float("-inf")})
+        if not state["lock"].acquire(blocking=False):
+            session["csrf"] = secrets.token_urlsafe(32)
+            self.send_json(409, {"result": "BUSY", "receiver_execution": "UNVERIFIED"})
+            return None
+        self.held_lock = state["lock"]
+        if (time.monotonic() - state["completed"]) * 1000 < interval_ms:
+            session["csrf"] = secrets.token_urlsafe(32)
+            self.send_json(429, {"result": "TOO_FAST", "min_interval_ms": interval_ms,
+                                 "receiver_execution": "UNVERIFIED"})
+            return None
+        return state
+
+    def dispatch_spaced(self, state, send, *args):
+        started = time.monotonic()
+        try:
+            return send(self.socket_path, *args)
+        finally:
+            state["completed"] = time.monotonic()
+            self.add_timing("xs8tx", started)
 
     def volume_step_state(self):
         # Server-wide, like CD: one receiver, whichever session sends.
@@ -861,8 +1005,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
         is_volume = path == "/api/v1/volume/step" and self.volume_step_enabled
         is_playback = path == "/api/v1/cd/playback" and self.cd_playback_enabled
         is_seek = path == "/api/v1/cd/seek" and self.cd_seek_enabled
+        is_volume_hold = path == "/api/v1/volume/hold" and self.volume_hold_enabled
+        is_power = path == "/api/v1/power" and self.power_enabled
+        is_monitor = path == "/api/v1/receiver/monitor" and self.tape2_monitor_enabled
         if (not (is_mute or is_source or is_query or is_cd or is_volume or
-                 is_playback or is_seek) or
+                 is_playback or is_seek or is_volume_hold or is_power or is_monitor) or
                 not getattr(self.server, "proxy_peer_verified", False)):
             length = self.headers.get("Content-Length", "")
             if len(length) <= 4 and length.isdecimal() and 0 < int(length) <= 4096:
@@ -889,7 +1036,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         types = self.headers.get_all("Content-Type", [])
         if (len(lengths) != 1 or not lengths[0].isdecimal() or
                 int(lengths[0]) > 64 or
-                ((is_mute or is_query) and lengths[0] != "2") or
+                ((is_mute or is_query or is_monitor) and lengths[0] != "2") or
                 types != ["application/json"] or self.headers.get("Transfer-Encoding")):
             self.send_json(400, {"error": "Invalid JSON request headers"})
             return
@@ -898,19 +1045,40 @@ class GatewayHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(int(lengths[0]))
         except (OSError, TimeoutError):
             return
-        if is_mute or is_query:
+        if is_mute or is_query or is_monitor:
             if body != b"{}":
                 self.send_json(400, {"error": "Expected JSON body {}"})
                 return
-        elif is_seek:
-            request = self.parse_seek(body)
+            if is_monitor:
+                self.cd_kind, self.cd_action = "TAPE2_MONITOR", "TOGGLE"
+                spacing = self.take_spacing("tape2_monitor", TAPE2_MONITOR_INTERVAL_MS, session)
+                if spacing is None:
+                    return
+        elif is_seek or is_volume_hold:
+            kind = "cd" if is_seek else "volume"
+            request = self.parse_seek(body, kind)
             if request is None:
-                self.send_json(400, {"error": "Expected one allowlisted CD seek request"})
+                self.send_json(400, {"error": "Expected one allowlisted hold request"})
                 return
-            self.cd_kind = "CD_SEEK"
+            self.cd_kind = KEY_HOLDS[kind]["label"]
             self.cd_action = request["action"]
-            self.handle_seek(session, request)
+            self.handle_seek(session, request, kind)
             return
+        elif is_power:
+            try:
+                pairs = json.loads(body, object_pairs_hook=list)
+                action = (pairs[0][1] if isinstance(pairs, list) and
+                          len(pairs) == 1 and isinstance(pairs[0], tuple) and
+                          pairs[0][0] == "action" else None)
+            except (UnicodeError, ValueError, TypeError, IndexError):
+                action = None
+            if not isinstance(action, str) or action not in POWER_COMMANDS:
+                self.send_json(400, {"error": "Expected one allowlisted power action"})
+                return
+            self.cd_kind, self.cd_action = "POWER", action
+            spacing = self.take_spacing("power", POWER_INTERVAL_MS, session)
+            if spacing is None:
+                return
         elif is_cd or is_playback:
             try:
                 pairs = json.loads(body, object_pairs_hook=list)
@@ -999,14 +1167,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
         # Single use: a repeated request with the same token cannot dispatch again.
         session["csrf"] = secrets.token_urlsafe(32)
         if (is_source or is_query or is_cd or is_volume or is_playback or
-                self.production_mute_enabled):
+                is_power or is_monitor or self.production_mute_enabled):
             try:
                 status = self.read_service_status()
             except ServiceError:
                 self.send_json(503, {"result": "UNAVAILABLE", "receiver_execution": "UNVERIFIED"})
                 return
-            if (is_cd or is_playback) and self.cd_seek_enabled:
-                self.forget_stale_hold(status)
+            self.forget_stale_hold(status)
             if (is_cd or is_playback) and self.cd_fault(status):
                 self.send_json(409, {"result": "CD_FAULT_LATCHED",
                                      "physical_check_required": True,
@@ -1015,7 +1182,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if (is_cd or is_playback) and status.get("cd_state") in ("ACTIVE", "HOLDING"):
                 self.send_json(409, {"result": "CD_BUSY", "receiver_execution": "UNVERIFIED"})
                 return
-            if is_volume:
+            if is_volume or is_power or is_monitor:
                 refusal = ("CD_FAULT_LATCHED" if self.cd_fault(status) else
                            "FAULT_LATCHED" if status.get("state") == "FAULT_LATCHED" else
                            "CD_BUSY" if status.get("cd_state") in ("ACTIVE", "HOLDING") else
@@ -1027,8 +1194,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         payload["physical_check_required"] = True
                     self.send_json(409, payload)
                     return
-            if not (self.status_allows_cd_track(status) if (is_cd or is_playback)
-                    else self.status_allows_volume_step(status) if is_volume
+            if not (self.status_allows_cd_track(status) if (is_cd or is_playback or is_power)
+                    else self.status_allows_volume_step(status) if (is_volume or is_monitor)
                     else self.status_allows_mute(status)):
                 self.send_json(409, {"result": "NOT_ELIGIBLE", "receiver_execution": "UNVERIFIED"})
                 return
@@ -1038,14 +1205,23 @@ class GatewayHandler(BaseHTTPRequestHandler):
                      else self.dispatch_cd_track(action) if is_cd
                      else self.dispatch_cd_playback(action) if is_playback
                      else self.dispatch_volume_step(direction) if is_volume
+                     else self.dispatch_spaced(spacing, send_power, action) if is_power
+                     else self.dispatch_spaced(spacing, send_tape2_monitor) if is_monitor
                      else send_source(self.socket_path, source))
         except MuteServiceError as exc:
             code = {"UNAVAILABLE": 503, "REJECTED": 409, "CD_FAULT_LATCHED": 409,
                     "FAULT_LATCHED": 409, "TIMEOUT": 504}.get(exc.result, 502)
             payload = {"result": exc.result, "error": str(exc),
                        "receiver_execution": "UNVERIFIED"}
-            if (is_source or is_cd or is_volume or is_playback) and exc.evidence:
+            if (is_source or is_cd or is_volume or is_playback or is_power or
+                    is_monitor) and exc.evidence:
                 payload.update(exc.evidence)
+            if is_power or is_monitor:
+                if is_power:
+                    payload["action"] = action
+                # Never retried; only a clean refusal certainly sent nothing.
+                payload["physical_check_required"] = exc.result not in (
+                    "UNAVAILABLE", "REJECTED")
             if is_volume:
                 payload["direction"] = direction
                 # Never retried here or in the browser; only a clean refusal sent nothing.
@@ -1075,6 +1251,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             # an explicit second PREV without three refresh round trips. It
             # grants nothing GET /api/v1/session would not.
             payload["csrf_token"] = session["csrf"]
+        elif is_power:
+            payload["action"] = action
+            payload.update(reply)
+            if action in POWER_PROVISIONAL_ACTIONS:
+                payload["mapping"] = "PROVISIONAL"
+        elif is_monitor:
+            # The indicator changes only from observed receiver reports.
+            payload.update(reply)
+            payload["mapping"] = "PROVISIONAL"
         elif is_query:
             payload["result"] = reply
         elif is_mute:
@@ -1085,7 +1270,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 
     @staticmethod
-    def parse_seek(body):
+    def parse_seek(body, kind="cd"):
         try:
             pairs = json.loads(body, object_pairs_hook=list)
         except (UnicodeError, ValueError):
@@ -1102,7 +1287,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 c.isascii() and (c.isalnum() or c in "-_") for c in hold_id)):
             return None
         if action == "START" and set(request) == {"action", "direction"} and \
-                request["direction"] in CD_SEEK_DIRECTIONS:
+                request["direction"] in KEY_HOLDS[kind]["directions"]:
             return request
         if action == "HEARTBEAT" and set(request) == {"action", "hold_id"}:
             return request
@@ -1119,7 +1304,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             payload.update(exc.evidence)
         return code, payload
 
-    def handle_seek(self, session, request):
+    def handle_seek(self, session, request, kind="cd"):
         """START, HEARTBEAT or RELEASE of the one server-wide held CD seek.
 
         The hold is owned by one persistent service connection: KEY_DOWN starts
@@ -1138,6 +1323,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         registry = self.cd_seek_state()
         hold = registry["hold"]
+        # Another kind's hold (CD seek versus volume) is not this endpoint's.
+        if hold is not None and hold["kind"] != kind:
+            hold = None
+        config = KEY_HOLDS[kind]
         action = request["action"]
         now = time.monotonic()
         if action == "HEARTBEAT":
@@ -1145,7 +1334,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     not secrets.compare_digest(hold["hold_id"], request["hold_id"])):
                 reply(409, {"result": "NOT_ACTIVE"})
                 return
-            if (now - hold["started"]) * 1000 >= CD_SEEK_MAX_HOLD_MS:
+            if (now - hold["started"]) * 1000 >= hold["max_ms"]:
                 # Independent backstop: never renew past the maximum; closing
                 # the owning connection makes the service release now.
                 end_cd_seek(self.server, "MAX_HOLD")
@@ -1201,20 +1390,26 @@ class GatewayHandler(BaseHTTPRequestHandler):
             finally:
                 # Always: the connection's only job was this hold.
                 end_cd_seek(self.server, "RELEASE")
-                self.cd_track_state()["completed"] = time.monotonic()
-                self.add_timing("xs8cd", started)
+                (self.cd_track_state() if kind == "cd" else
+                 self.volume_step_state())["completed"] = time.monotonic()
+                self.add_timing("xs8hold", started)
             reply(200, {"result": result, **evidence})
             return
         direction = request["direction"]
-        key_action = CD_SEEK_DIRECTIONS[direction]
-        state = self.cd_track_state()
+        key_action = config["directions"][direction]
+        if kind == "cd":
+            state, interval = self.cd_track_state(), self.cd_track_interval_ms
+            busy = "CD_BUSY"
+        else:
+            state, interval = self.volume_step_state(), VOLUME_STEP_INTERVAL_MS
+            busy = "VOLUME_BUSY"
         if not state["lock"].acquire(blocking=False):
-            reply(409, {"result": "CD_BUSY"})
+            reply(409, {"result": busy})
             return
         self.held_lock = state["lock"]
-        if (self.cd_track_interval_ms != CD_TRACK_INTERVAL_OFF and
-                (now - state["completed"]) * 1000 < self.cd_track_interval_ms):
-            reply(429, {"result": "TOO_FAST", "min_interval_ms": self.cd_track_interval_ms})
+        if (interval != CD_TRACK_INTERVAL_OFF and
+                (now - state["completed"]) * 1000 < interval):
+            reply(429, {"result": "TOO_FAST", "min_interval_ms": interval})
             return
         try:
             status = self.read_service_status()
@@ -1225,10 +1420,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if self.cd_fault(status):
             reply(409, {"result": "CD_FAULT_LATCHED", "physical_check_required": True})
             return
-        if status.get("cd_state") in ("ACTIVE", "HOLDING") or registry["hold"] is not None:
+        if kind == "volume" and status.get("state") == "FAULT_LATCHED":
+            reply(409, {"result": "FAULT_LATCHED", "physical_check_required": True})
+            return
+        if status.get("cd_state") in ("ACTIVE", "HOLDING"):
             reply(409, {"result": "CD_BUSY"})
             return
-        if not self.status_allows_cd_track(status):
+        if (status.get("state") in ("HOLDING_UP", "HOLDING_DOWN") or
+                registry["hold"] is not None):
+            reply(409, {"result": busy})
+            return
+        if not (self.status_allows_cd_track(status) if kind == "cd"
+                else self.status_allows_volume_step(status)):
             reply(409, {"result": "NOT_ELIGIBLE"})
             return
         started = time.monotonic()
@@ -1251,13 +1454,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.add_timing("xs8cd", started)
         now = time.monotonic()
         hold_id = secrets.token_urlsafe(16)
-        registry["hold"] = {"session": session, "connection": connection,
+        registry["hold"] = {"session": session, "connection": connection, "kind": kind,
                             "hold_id": hold_id, "direction": direction,
-                            "action": key_action, "started": now, "browser_seen": now}
+                            "action": key_action, "started": now, "browser_seen": now,
+                            "max_ms": config["max_ms"]}
         try:
-            reply(200, {"result": "SEEK_STARTED", "direction": direction, "hold_id": hold_id,
+            reply(200, {"result": "SEEK_STARTED" if kind == "cd" else "HOLD_STARTED",
+                        "direction": direction, "hold_id": hold_id,
                         **evidence, "heartbeat_ms": CD_SEEK_HEARTBEAT_MS,
-                        "lease_ms": CD_SEEK_LEASE_MS, "max_hold_ms": CD_SEEK_MAX_HOLD_MS})
+                        "lease_ms": CD_SEEK_LEASE_MS, "max_hold_ms": config["max_ms"]})
         except OSError:
             # The browser never learns of this hold: release it now.
             end_cd_seek(self.server, "START_REPLY_UNDELIVERED")
@@ -1322,6 +1527,12 @@ def parse_args(argv=None):
                         help="enable CD PLAY/PAUSE (provisional 0xBC) and STOP through the real local XS8 Service")
     parser.add_argument("--enable-cd-seek", action="store_true",
                         help="enable held CD FF/REW through the real local XS8 Service hold API")
+    parser.add_argument("--enable-volume-hold", action="store_true",
+                        help="enable held VOL+/VOL- on a connection-owned service hold")
+    parser.add_argument("--enable-power", action="store_true",
+                        help="enable POWER ON (ROOT 0x52) and provisional POWER OFF (ROOT 0x62)")
+    parser.add_argument("--enable-tape2-monitor", action="store_true",
+                        help="enable the unvalidated TAPE2 MONITOR toggle (CONTEXT 0x48)")
     parser.add_argument("--cd-track-interval-ms", type=int,
                         help="experimental minimum ms from one completed CD track "
                              f"command to the next (default {CD_TRACK_INTERVAL_MS}, "
@@ -1349,11 +1560,13 @@ def parse_args(argv=None):
     if args.enable_offline_mute and (args.enable_mute or args.enable_source or
                                     args.enable_receiver_query or args.enable_cd_track or
                                     args.enable_volume or args.enable_cd_playback or
-                                    args.enable_cd_seek):
+                                    args.enable_cd_seek or args.enable_volume_hold or
+                                    args.enable_power or args.enable_tape2_monitor):
         parser.error("offline and production MUTE modes are mutually exclusive")
     if (args.enable_offline_mute or args.enable_mute or args.enable_source or
             args.enable_receiver_query or args.enable_cd_track or args.enable_volume or
-            args.enable_cd_playback or args.enable_cd_seek):
+            args.enable_cd_playback or args.enable_cd_seek or args.enable_volume_hold or
+            args.enable_power or args.enable_tape2_monitor):
         if not args.systemd_socket or not args.https_origin:
             parser.error("active controls require --systemd-socket and --https-origin")
         try:
@@ -1416,6 +1629,9 @@ def main(argv=None):
                     "volume_step_enabled": args.enable_volume,
                     "cd_playback_enabled": args.enable_cd_playback,
                     "cd_seek_enabled": args.enable_cd_seek,
+                    "volume_hold_enabled": args.enable_volume_hold,
+                    "power_enabled": args.enable_power,
+                    "tape2_monitor_enabled": args.enable_tape2_monitor,
                     "https_origin": args.https_origin, "sessions": {}})
     if args.systemd_socket:
         try:
@@ -1431,7 +1647,10 @@ def main(argv=None):
                     (f"CD TRACK {args.cd_track_interval_ms} ms", args.enable_cd_track),
                     ("VOLUME STEP", args.enable_volume),
                     ("CD PLAYBACK", args.enable_cd_playback),
-                    ("CD SEEK", args.enable_cd_seek))
+                    ("CD SEEK", args.enable_cd_seek),
+                    ("VOLUME HOLD", args.enable_volume_hold),
+                    ("POWER", args.enable_power),
+                    ("TAPE2 MONITOR", args.enable_tape2_monitor))
                     if enabled) or "read-only")
         print(f"XS8 gateway listening on {GATEWAY_SOCKET} ({mode})")
     else:

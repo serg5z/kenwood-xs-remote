@@ -1,5 +1,6 @@
 #include "xs8_service_core.h"
 
+#include <algorithm>
 #include <cassert>
 #include <deque>
 #include <iostream>
@@ -37,6 +38,7 @@ struct FakeTx final : ServiceTransmitter {
     bool fail_root = false;
     bool fail_release = false;
     bool fail_release_gpio = false;
+    int fail_byte = -1; // Every frame of this byte fails its waveform check.
     WaveformEvidence fail_waveform = WaveformEvidence::MISSING;
     ServiceTxEvidence last{}, last_stop{};
     Clock::time_point end_time = at(10);
@@ -62,7 +64,7 @@ struct FakeTx final : ServiceTransmitter {
         }
         const bool match = last.gpio_completed && healthy && !fail_next &&
             !(fail_root && byte == 0x07) &&
-            !(fail_release && byte == 0x72);
+            !(fail_release && byte == 0x72) && int(byte) != fail_byte;
         fail_next = false;
         last.waveform = match ? WaveformEvidence::MATCH
                                 : fail_waveform;
@@ -149,9 +151,8 @@ static void test_source_selection()
         assert(tx.sent.back() == source.second);
     }
     const size_t count = tx.sent.size();
-    for (const char* name : {"TV1", "TV2", "TAPE2"})
-        assert(core.command(std::string("SELECT_SOURCE ") + name, at(10), at(10)) ==
-               "ERR SOURCE_UNVERIFIED\n");
+    // TV1/TV2 are CONTEXT sequences (test_context_key_commands); TAPE2 stays blocked.
+    assert(core.command("SELECT_SOURCE TAPE2", at(10), at(10)) == "ERR SOURCE_UNVERIFIED\n");
     assert(core.command("SELECT_SOURCE UNKNOWN", at(10), at(10)) ==
            "ERR UNKNOWN_SOURCE\n");
     assert(tx.sent.size() == count);
@@ -1467,7 +1468,7 @@ static void test_cd_key_holds()
                "OK KEY_DOWN_TX", 0) == 0);
     }
     for (const char *line : {"KEY_DOWN TRACK_NEXT", "KEY_DOWN seek_forward", "KEY_UP ",
-                             "KEY_DOWN SEEK_FORWARD ", "KEY_UP VOLUME_UP"}) {
+                             "KEY_DOWN SEEK_FORWARD ", "KEY_UP VOLUME_LEFT"}) {
         FakeTx tx;
         Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
         core.connected(1);
@@ -1665,6 +1666,308 @@ static void test_cd_key_holds()
     assert(shut.command("KEY_DOWN SEEK_BACKWARD", at(3), at(3), 1) == "ERR SHUTDOWN\n");
 }
 
+static void test_context_key_commands()
+{
+    using Bytes = std::vector<uint8_t>;
+    const std::string ok = " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n";
+    struct Key { const char *line; uint8_t byte; const char *reply; };
+    const Key keys[] = {{"SELECT_SOURCE TV1", 0x78, "OK SOURCE_TX"},
+                        {"SELECT_SOURCE TV2", 0x88, "OK SOURCE_TX"},
+                        {"TAPE2_MONITOR_TOGGLE", 0x48, "OK TAPE2_MONITOR_TX"}};
+    for (const auto& key : keys) {
+        FakeTx tx;
+        Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+        core.connected(1);
+        core.connected(2);
+        // One atomic CONTEXT operation: entry, key, exit.
+        assert(core.command(key.line, at(1), at(1), 1) == std::string(key.reply) + ok);
+        assert(tx.sent == (Bytes{0x17, key.byte, 0x07}));
+        assert(status_has(core, 2, " state=IDLE stop_owed=0 context_may_be_open=0 "));
+        // Refused, never cancelling, during another client's volume hold.
+        core.command("VOLUME_PRESS UP", at(10), at(10), 2);
+        assert(core.command(key.line, at(20), at(20), 1) == "ERR VOLUME_BUSY\n");
+        assert(core.command(key.line, at(20), at(20), 2) == "ERR VOLUME_BUSY\n");
+        assert(core.state() == VolumeControl::State::HOLDING_UP);
+        core.command("VOLUME_RELEASE UP", at(30), at(30), 2);
+        // And during a CD hold.
+        core.command("KEY_DOWN SEEK_FORWARD", at(40), at(40), 2);
+        assert(core.command(key.line, at(50), at(50), 1) == "ERR CD_TRACK_BUSY\n");
+        core.command("KEY_UP SEEK_FORWARD", at(60), at(60), 2);
+        assert(tx.sent == (Bytes{0x17, key.byte, 0x07, 0x17, 0xF9, 0x09, 0x07, 0x7A, 0x72}));
+
+        // Failure at the entry, the key or the exit: FAULT, exit attempted, key
+        // never resent, and every later transmission refused.
+        for (int frame = 0; frame < 3; ++frame) {
+            FakeTx fail_tx;
+            Xs8ServiceCore fail(fail_tx, Ms(2000), true, {}, [] { return at(0); });
+            fail.connected();
+            if (frame == 0) fail_tx.fail_byte = 0x17;
+            else if (frame == 1) fail_tx.fail_byte = key.byte;
+            else fail_tx.fail_root = true;
+            const std::string reply = fail.command(key.line, at(1), at(1));
+            assert(reply.rfind(std::string("ERR ") + (key.byte == 0x48 ? "TAPE2_MONITOR" : "SOURCE") +
+                               "_UNCERTAIN ", 0) == 0);
+            assert(reply.find("receiver_execution=UNVERIFIED") != std::string::npos);
+            const Bytes expected = frame == 0 ? Bytes{0x17, 0x07} : frame == 1 ?
+                Bytes{0x17, key.byte, 0x07} : Bytes{0x17, key.byte, 0x07, 0x07, 0x07};
+            assert(fail_tx.sent == expected);
+            assert(fail.state() == VolumeControl::State::FAULT_LATCHED);
+            assert(fail.command(key.line, at(2), at(2)) == "ERR FAULT_LATCHED\n");
+            assert(fail.command("POWER_OFF", at(2), at(2)) == "ERR FAULT_LATCHED\n");
+            assert(fail_tx.sent == expected);
+        }
+    }
+    FakeTx context_tx;
+    Xs8ServiceCore context(context_tx, Ms(2000), true, {}, [] { return at(0); });
+    context.connected(1);
+    context.set_research_context_enabled(true);
+    context.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED", at(1), at(1), 1);
+    assert(context.command("SELECT_SOURCE TV1", at(2), at(2), 1) == "ERR RESEARCH_CONTEXT_ACTIVE\n");
+    assert(context.command("TAPE2_MONITOR_TOGGLE", at(2), at(2), 1) ==
+           "ERR RESEARCH_CONTEXT_ACTIVE\n");
+    assert(context_tx.sent == (Bytes{0x17}));
+
+    bool signalled = true;
+    FakeTx stop_tx;
+    Xs8ServiceCore stopping(stop_tx, Ms(2000), true, [&] { return signalled; },
+                            [] { return at(0); });
+    stopping.connected();
+    assert(stopping.command("SELECT_SOURCE TV2", at(1), at(1)) == "ERR SHUTDOWN\n");
+    assert(stopping.command("TAPE2_MONITOR_TOGGLE", at(1), at(1)) == "ERR SHUTDOWN\n");
+    assert(stop_tx.sent.empty() && stopping.state() == VolumeControl::State::IDLE);
+
+    FakeTx boot_tx;
+    Xs8ServiceCore boot(boot_tx, Ms(2000), false, {}, [] { return at(0); });
+    boot.connected();
+    assert(boot.command("SELECT_SOURCE TV1", at(1), at(1)) == "ERR BOOT_INHIBIT\n");
+    boot_tx.healthy = false;
+    assert(boot.command("TAPE2_MONITOR_TOGGLE", at(1), at(1)) == "ERR MONITOR_FAILED\n");
+    assert(boot_tx.sent.empty());
+}
+
+static void test_power_commands()
+{
+    using Bytes = std::vector<uint8_t>;
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+    core.connected(1);
+    core.connected(2);
+    assert(core.command("POWER_ON", at(1), at(1), 1) ==
+           "OK POWER_TX action=ON gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n");
+    assert(core.command("POWER_OFF", at(2), at(2), 1) ==
+           "OK POWER_TX action=OFF gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n");
+    assert(tx.sent == (Bytes{0x52, 0x62}) && "ROOT only; never CONTEXT 0x39");
+    for (const char *line : {"POWER", "POWER_TOGGLE", "POWER_OFF ", "power_on"})
+        assert(core.command(line, at(3), at(3), 1) == "ERR UNKNOWN_COMMAND\n");
+
+    // Refused while any volume or CD hold, or obligation, exists.
+    core.command("VOLUME_PRESS DOWN", at(10), at(10), 2);
+    assert(core.command("POWER_OFF", at(11), at(11), 1) == "ERR HOLDING_DOWN\n");
+    core.command("VOLUME_RELEASE DOWN", at(12), at(12), 2);
+    core.command("KEY_DOWN VOLUME_UP", at(20), at(20), 2);
+    assert(core.command("POWER_OFF", at(21), at(21), 1) == "ERR HOLDING_UP\n");
+    core.command("KEY_UP VOLUME_UP", at(22), at(22), 2);
+    core.command("KEY_DOWN SEEK_BACKWARD", at(30), at(30), 2);
+    assert(core.command("POWER_OFF", at(31), at(31), 1) == "ERR CD_TRACK_BUSY\n");
+    core.command("KEY_UP SEEK_BACKWARD", at(32), at(32), 2);
+    const auto token = hold_token(core.command("CD_PRESS SEEK_FORWARD", at(40), at(40), 2));
+    assert(core.command("POWER_OFF", at(41), at(41), 1) == "ERR CD_TRACK_BUSY\n");
+    tx.fail_release = true;
+    core.command("CD_RELEASE " + token, at(42), at(42), 2);
+    assert(core.cd_release_owed());
+    assert(core.command("POWER_OFF", at(43), at(43), 1) == "ERR CD_FAULT_LATCHED\n");
+    assert(core.command("POWER_ON", at(43), at(43), 1) == "ERR CD_FAULT_LATCHED\n");
+    assert(std::count(tx.sent.begin(), tx.sent.end(), 0x62) == 1);
+
+    FakeTx stop_tx;
+    Xs8ServiceCore stopped(stop_tx, Ms(2000), true, {}, [] { return at(0); });
+    stopped.connected();
+    stop_tx.stop_matches = {false, false, false};
+    stopped.command("VOLUME_PRESS UP", at(1), at(1));
+    stopped.command("VOLUME_RELEASE UP", at(2), at(2));
+    assert(stopped.stop_owed());
+    assert(stopped.command("POWER_OFF", at(3), at(3)) == "ERR FAULT_LATCHED\n");
+
+    // Uncertain frame: reported, never retried, no fault latched (no obligation).
+    FakeTx fail_tx;
+    Xs8ServiceCore fail(fail_tx, Ms(2000), true, {}, [] { return at(0); });
+    fail.connected();
+    fail_tx.fail_next = true;
+    assert(fail.command("POWER_OFF", at(1), at(1)) ==
+           "ERR POWER_UNCERTAIN action=OFF gpio_tx=TX_OK waveform=MISSING "
+           "receiver_execution=UNVERIFIED\n");
+    assert(fail_tx.sent == (Bytes{0x62}));
+    assert(fail.state() == VolumeControl::State::IDLE && !fail.cd_fault());
+    fail.tick(at(5000));
+    assert(fail_tx.sent.size() == 1);
+
+    FakeTx context_tx;
+    Xs8ServiceCore context(context_tx, Ms(2000), true, {}, [] { return at(0); });
+    context.connected(1);
+    context.set_research_context_enabled(true);
+    context.command("CONTEXT_SESSION_ENTER CONFIRM_ATTENDED", at(1), at(1), 1);
+    assert(context.command("POWER_OFF", at(2), at(2), 1) == "ERR RESEARCH_CONTEXT_ACTIVE\n");
+    FakeTx boot_tx;
+    Xs8ServiceCore boot(boot_tx, Ms(2000), false, {}, [] { return at(0); });
+    boot.connected();
+    assert(boot.command("POWER_ON", at(1), at(1)) == "ERR BOOT_INHIBIT\n");
+    FakeTx shut_tx;
+    Xs8ServiceCore shut(shut_tx, Ms(2000), true, {}, [] { return at(0); });
+    shut.connected();
+    assert(shut.shutdown(at(1)));
+    assert(shut.command("POWER_ON", at(2), at(2)) == "ERR SHUTDOWN\n");
+    assert(boot_tx.sent.empty() && shut_tx.sent.empty() && context_tx.sent == (Bytes{0x17}));
+}
+
+static void test_volume_key_hold()
+{
+    using Bytes = std::vector<uint8_t>;
+    const std::string ok = " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n";
+    for (const auto& trial : {std::pair<const char*, uint8_t>{"VOLUME_UP", 0xF9},
+                              {"VOLUME_DOWN", 0xE9}}) {
+        const std::string action = trial.first;
+        FakeTx tx;
+        Xs8ServiceCore core(tx, Ms(3000), true, {}, [] { return at(0); });
+        core.connected(1);
+        assert(core.command("KEY_DOWN " + action, at(10), at(10), 1) ==
+               "OK KEY_DOWN_TX action=" + action + ok);
+        for (int time = 400; time <= 2800; time += 400)
+            assert(core.command("KEY_DOWN " + action, at(time), at(time), 1) ==
+                   "OK KEY_ALIVE action=" + action + "\n");
+        assert(tx.sent == (Bytes{0x17, trial.second}) && "keepalives never retransmit");
+        assert(core.command("KEY_UP " + action, at(2900), at(2900), 1) ==
+               "OK KEY_UP_TX action=" + action + ok);
+        assert(tx.sent == (Bytes{0x17, trial.second, 0x09, 0x07}));
+        assert(core.command("KEY_UP " + action, at(3000), at(3000), 1) ==
+               "OK KEY_UP_NONE last=IDLE\n");
+        assert(core.command("KEY_DOWN " + action, at(3100), at(3100), 1).rfind(
+               "OK KEY_DOWN_TX", 0) == 0 && "no re-arm block after a normal KEY_UP");
+    }
+
+    // Owner versus non-owner; the owner's disconnect is STOP then exit.
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(3000), true, {}, [] { return at(0); });
+    core.connected(1);
+    core.connected(2);
+    core.command("KEY_DOWN VOLUME_UP", at(10), at(10), 1);
+    assert(core.command("KEY_UP VOLUME_UP", at(20), at(20), 2) == "ERR KEY_NOT_OWNER\n");
+    assert(core.command("VOLUME_RELEASE UP", at(20), at(20), 2) == "ERR VOLUME_NOT_OWNER\n");
+    assert(core.command("MUTE", at(20), at(20), 2) == "ERR VOLUME_BUSY\n");
+    assert(core.command("VOLUME_PRESS UP", at(20), at(20), 2) == "ERR VOLUME_BUSY\n");
+    assert(core.command("VOLUME_STEP UP", at(20), at(20), 2) == "ERR VOLUME_BUSY\n");
+    assert(core.command("KEY_DOWN VOLUME_UP", at(20), at(20), 2) == "ERR KEY_BUSY\n");
+    assert(core.command("KEY_DOWN VOLUME_DOWN", at(20), at(20), 1) == "ERR KEY_BUSY\n");
+    assert(core.command("KEY_UP VOLUME_DOWN", at(20), at(20), 1) == "ERR KEY_ACTION_MISMATCH\n");
+    assert(core.command("KEY_DOWN SEEK_FORWARD", at(20), at(20), 2) == "ERR HOLDING_UP\n");
+    assert(core.command("CD_TRACK_NEXT", at(20), at(20), 2) == "ERR HOLDING_UP\n");
+    core.disconnected(at(30), 2);
+    assert(tx.sent == (Bytes{0x17, 0xF9}) && core.state() == VolumeControl::State::HOLDING_UP);
+    core.disconnected(at(40), 1);
+    assert(tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x07}));
+    assert(core.state() == VolumeControl::State::IDLE && !core.stop_owed());
+
+    // A CEC hold blocks a Web press; CEC press/release on its own connection
+    // is unchanged, and a non-owner can no longer stop it.
+    core.connected(3);
+    core.connected(4);
+    assert(core.command("VOLUME_PRESS DOWN", at(50), at(50), 3) == "OK VOLUME_PRESS_TX\n");
+    assert(core.command("KEY_DOWN VOLUME_DOWN", at(60), at(60), 4) == "ERR KEY_BUSY\n");
+    assert(core.command("VOLUME_RELEASE DOWN", at(60), at(60), 4) == "ERR VOLUME_NOT_OWNER\n");
+    assert(core.command("MUTE", at(60), at(60), 4) == "ERR VOLUME_BUSY\n");
+    assert(core.state() == VolumeControl::State::HOLDING_DOWN); // CEC hold uninterrupted.
+    assert(core.command("VOLUME_PRESS DOWN", at(70), at(70), 3) == "OK VOLUME_PRESS_TX\n");
+    assert(core.command("VOLUME_RELEASE DOWN", at(80), at(80), 3) == "OK VOLUME_RELEASE_TX\n");
+    assert(tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x07, 0x17, 0xE9, 0x09, 0x07}));
+
+    // Inactivity (1200 ms) and the late keepalive: never a new press; the owner's
+    // KEY_UP or disconnect clears its block.
+    FakeTx idle_tx;
+    Xs8ServiceCore idle(idle_tx, Ms(3000), true, {}, [] { return at(0); });
+    idle.connected(1);
+    idle.connected(2);
+    idle.command("KEY_DOWN VOLUME_DOWN", at(10), at(10), 1);
+    idle.command("KEY_DOWN VOLUME_DOWN", at(1000), at(1000), 1);
+    idle.tick(at(2199));
+    assert(idle_tx.sent == (Bytes{0x17, 0xE9}));
+    assert(idle.command("KEY_DOWN VOLUME_DOWN", at(2250), at(2250), 1) ==
+           "ERR KEY_EXPIRED last=VOLUME_WATCHDOG\n");
+    assert(idle_tx.sent == (Bytes{0x17, 0xE9, 0x09, 0x07}));
+    assert(idle.command("KEY_UP VOLUME_DOWN", at(2300), at(2300), 1) ==
+           "OK KEY_UP_NONE last=IDLE\n");
+    assert(idle.command("KEY_DOWN VOLUME_DOWN", at(2400), at(2400), 1).rfind("OK KEY_DOWN_TX", 0) == 0);
+    idle.tick(at(3700)); // The second hold also expires (inactivity), with a re-arm block.
+    assert(idle_tx.sent == (Bytes{0x17, 0xE9, 0x09, 0x07, 0x17, 0xE9, 0x09, 0x07}));
+    // Owner disconnect after an expiry clears the block so CEC is not stuck.
+    idle.disconnected(at(3800), 1);
+    assert(idle.command("VOLUME_PRESS DOWN", at(3900), at(3900), 2) == "OK VOLUME_PRESS_TX\n");
+    idle.command("VOLUME_RELEASE DOWN", at(4000), at(4000), 2);
+
+    // CEC re-arm is unchanged: its own disconnect after an expiry keeps the block.
+    FakeTx cec_tx;
+    Xs8ServiceCore cec(cec_tx, Ms(3000), true, {}, [] { return at(0); });
+    cec.connected(1);
+    cec.connected(2);
+    cec.command("VOLUME_PRESS UP", at(10), at(10), 1);
+    cec.tick(at(1300));
+    cec.disconnected(at(1400), 1);
+    assert(cec.command("VOLUME_PRESS UP", at(1500), at(1500), 2) == "ERR IDLE\n");
+    assert(cec.command("KEY_DOWN VOLUME_UP", at(1500), at(1500), 2) ==
+           "ERR KEY_EXPIRED last=VOLUME_WATCHDOG\n");
+    assert(cec_tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x07}));
+
+    // MAX_HOLD bounds a hold whose keepalives continue.
+    FakeTx max_tx;
+    Xs8ServiceCore longest(max_tx, Ms(2000), true, {}, [] { return at(0); });
+    longest.connected(1);
+    longest.command("KEY_DOWN VOLUME_UP", at(10), at(10), 1);
+    for (int time = 400; time <= 2000; time += 400)
+        assert(longest.command("KEY_DOWN VOLUME_UP", at(time), at(time), 1) ==
+               "OK KEY_ALIVE action=VOLUME_UP\n");
+    assert(longest.command("KEY_DOWN VOLUME_UP", at(2010), at(2010), 1) ==
+           "ERR KEY_EXPIRED last=VOLUME_WATCHDOG\n");
+    assert(max_tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x07}));
+
+    // Uncertain start, KEY_UP and disconnect STOPs latch FAULT; nothing is retried.
+    FakeTx start_tx;
+    Xs8ServiceCore start(start_tx, Ms(3000), true, {}, [] { return at(0); });
+    start.connected(1);
+    start_tx.fail_byte = 0xF9;
+    assert(start.command("KEY_DOWN VOLUME_UP", at(1), at(1), 1) ==
+           "ERR KEY_DOWN_UNCERTAIN action=VOLUME_UP state=FAULT_LATCHED stop_owed=0 "
+           "context_may_be_open=0 receiver_execution=UNVERIFIED\n");
+    assert(start_tx.sent == (Bytes{0x17, 0xF9, 0x09, 0x07}));
+    assert(start.command("KEY_DOWN VOLUME_UP", at(2), at(2), 1) == "ERR FAULT_LATCHED\n");
+    for (int path = 0; path < 2; ++path) {
+        FakeTx fail_tx;
+        Xs8ServiceCore fail(fail_tx, Ms(3000), true, {}, [] { return at(0); });
+        fail.connected(1);
+        fail.command("KEY_DOWN VOLUME_DOWN", at(10), at(10), 1);
+        fail_tx.stop_matches = {false, false, false};
+        if (path == 0)
+            assert(fail.command("KEY_UP VOLUME_DOWN", at(20), at(20), 1) ==
+                   "ERR KEY_UP_UNCERTAIN action=VOLUME_DOWN state=FAULT_LATCHED stop_owed=1 "
+                   "context_may_be_open=1 receiver_execution=UNVERIFIED\n");
+        else fail.disconnected(at(20), 1);
+        assert(fail_tx.sent == (Bytes{0x17, 0xE9, 0x09, 0x09, 0x09}));
+        assert(fail.state() == VolumeControl::State::FAULT_LATCHED && fail.stop_owed());
+        fail.connected(2);
+        assert(fail.command("KEY_DOWN VOLUME_DOWN", at(30), at(30), 2) == "ERR FAULT_LATCHED\n");
+        fail.tick(at(9000));
+        assert(fail_tx.sent.size() == 5);
+        assert(!fail.shutdown(at(9001)));
+        assert(fail_tx.sent == (Bytes{0x17, 0xE9, 0x09, 0x09, 0x09, 0x09, 0x07}));
+    }
+
+    // A CD hold blocks a volume key press.
+    FakeTx cd_tx;
+    Xs8ServiceCore cd(cd_tx, Ms(3000), true, {}, [] { return at(0); });
+    cd.connected(1);
+    cd.connected(2);
+    cd.command("KEY_DOWN SEEK_FORWARD", at(1), at(1), 1);
+    assert(cd.command("KEY_DOWN VOLUME_UP", at(2), at(2), 2) == "ERR KEY_BUSY\n");
+    assert(cd_tx.sent == (Bytes{0x7A}));
+}
+
 int main()
 {
     test_startup_and_parsing();
@@ -1690,6 +1993,9 @@ int main()
     test_volume_step();
     test_cd_transport_keys();
     test_cd_key_holds();
+    test_context_key_commands();
+    test_power_commands();
+    test_volume_key_hold();
     test_context_gates_and_authorization();
     test_context_send_exit_and_token_ownership();
     test_context_excludes_every_other_transmission();

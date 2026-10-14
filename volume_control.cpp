@@ -247,6 +247,14 @@ bool VolumeControl::mute(Time now)
         if (!finish(now, StopReason::CANCELLED)) return false;
     }
     if (state_ != State::IDLE) return false;
+    return context_key(0xD8, now);
+}
+
+bool VolumeControl::context_key(uint8_t byte, Time now, bool *byte_sent)
+{
+    if (byte_sent) *byte_sent = false;
+    if (state_ != State::IDLE || stop_owed_ || context_may_be_open_ ||
+        cancelled()) return false;
     state_ = State::ENTERING;
     context_may_be_open_ = true;
     if (!tx_.send(0x17)) {
@@ -255,11 +263,12 @@ bool VolumeControl::mute(Time now)
         return false;
     }
     if (cancelled()) return finish(now, StopReason::CANCELLED);
-    if (!tx_.send(0xD8)) {
+    if (!tx_.send(byte)) {
         finish(now, StopReason::TX_ERROR);
         fault();
         return false;
     }
+    if (byte_sent) *byte_sent = true;
     if (!finish(now, StopReason::NONE)) return false;
     return true;
 }

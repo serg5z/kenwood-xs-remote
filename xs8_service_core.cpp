@@ -344,11 +344,15 @@ std::string Xs8ServiceCore::cd_transport(uint8_t byte, const char *action)
 // Connection-owned CD holds. The socket client that sent KEY_DOWN owns the hold;
 // KEY_UP, its disconnect, 1200 ms without KEY_DOWN, MAX_HOLD, monitor failure or
 // shutdown release it through the same cd_release() path as token holds.
-std::string Xs8ServiceCore::key_command(const std::string& line, Time now,
-                                        uint64_t client_id)
+std::string Xs8ServiceCore::key_command(const std::string& line, Time received,
+                                        Time now, uint64_t client_id)
 {
     const bool down = line.compare(0, 9, "KEY_DOWN ") == 0;
     const std::string action = line.substr(down ? 9 : 7);
+    if (action == "VOLUME_UP" || action == "VOLUME_DOWN")
+        return volume_key(down, action == "VOLUME_UP" ? VolumeControl::Direction::UP
+                                                      : VolumeControl::Direction::DOWN,
+                          action, received, now, client_id);
     uint8_t byte = 0;
     if (action == "SEEK_FORWARD") byte = 0x7A;
     else if (action == "SEEK_BACKWARD") byte = 0x6A;
@@ -374,6 +378,121 @@ std::string Xs8ServiceCore::key_command(const std::string& line, Time now,
     return cd_press(byte, action.c_str(), now, &client_id);
 }
 
+// Connection-owned volume hold for the Web, on the same VolumeControl press,
+// release and disconnect path as CEC's VOLUME_PRESS. Start: 0x17 -> 0xF9/0xE9.
+// Release (KEY_UP, owner disconnect, 1200 ms inactivity, MAX_HOLD): 0x09 -> 0x07.
+std::string Xs8ServiceCore::volume_key(bool down, VolumeControl::Direction direction,
+                                       const std::string& action, Time received,
+                                       Time now, uint64_t client_id)
+{
+    using State = VolumeControl::State;
+    const State state = volume_.state();
+    const bool holding = state == State::HOLDING_UP || state == State::HOLDING_DOWN;
+    const bool owner = volume_owner_set_ && volume_key_owned_ &&
+                       volume_owner_client_ == client_id;
+    const auto fields = [&] {
+        return std::string(" state=") + state_name(volume_.state()) +
+            " stop_owed=" + (volume_.stop_owed() ? "1" : "0") +
+            " context_may_be_open=" + (volume_.context_may_be_open() ? "1" : "0") +
+            " receiver_execution=UNVERIFIED\n";
+    };
+    if (!down) {
+        if (holding && !owner) return "ERR KEY_NOT_OWNER\n";
+        if (holding && owner_direction_ != direction) return "ERR KEY_ACTION_MISMATCH\n";
+        if (holding) {
+            const bool released = volume_.release(direction, now);
+            if (released)
+                return "OK KEY_UP_TX action=" + action +
+                    " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n";
+            return "ERR KEY_UP_UNCERTAIN action=" + action + fields();
+        }
+        // No hold. The former owner's KEY_UP clears its own re-arm block
+        // (no XS8 frame), as CEC's VOLUME_RELEASE does.
+        if (owner) volume_.release(direction, now);
+        return std::string("OK KEY_UP_NONE last=") + state_name(volume_.state()) + "\n";
+    }
+    if (holding) {
+        if (!owner || owner_direction_ != direction) return "ERR KEY_BUSY\n";
+        // Keepalive: refreshes inactivity without a new frame. A watchdog
+        // stop inside press() leaves the re-arm block, so it is never a new press.
+        if (volume_.press(direction, received, now))
+            return "OK KEY_ALIVE action=" + action + "\n";
+        return "ERR KEY_EXPIRED last=VOLUME_WATCHDOG\n";
+    }
+    if (cd_hold_ || cd_active_) return "ERR KEY_BUSY\n";
+    if (cd_fault_ || cd_release_owed_) return "ERR CD_FAULT_LATCHED\n";
+    if (!tx_.monitor_healthy()) return "ERR MONITOR_FAILED\n";
+    if (state != State::IDLE) return std::string("ERR ") + state_name(state) + "\n";
+    if (volume_.stop_owed() || volume_.context_may_be_open()) return "ERR UNRESOLVED_STATE\n";
+    if (volume_.rearm_blocked()) return "ERR KEY_EXPIRED last=VOLUME_WATCHDOG\n";
+    volume_owner_client_ = client_id;
+    volume_owner_set_ = true;
+    volume_key_owned_ = true;
+    if (!volume_.press(direction, received, now)) {
+        if (volume_.state() == State::FAULT_LATCHED || volume_.stop_owed() ||
+            volume_.context_may_be_open())
+            return "ERR KEY_DOWN_UNCERTAIN action=" + action + fields();
+        volume_owner_set_ = false;
+        volume_key_owned_ = false;
+        return "ERR KEY_REFUSED\n"; // Stale or shutting down: nothing sent.
+    }
+    owner_direction_ = direction;
+    return "OK KEY_DOWN_TX action=" + action +
+        " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n";
+}
+
+// TV1, TV2 and TAPE2 MONITOR: one CONTEXT key through VolumeControl's entry
+// and exit. Refused, never cancelling, while any volume or CD hold exists.
+std::string Xs8ServiceCore::context_key_command(uint8_t byte, const char *name, Time now)
+{
+    using State = VolumeControl::State;
+    const State state = volume_.state();
+    if (state == State::HOLDING_UP || state == State::HOLDING_DOWN)
+        return "ERR VOLUME_BUSY\n";
+    if (state != State::IDLE) return std::string("ERR ") + state_name(state) + "\n";
+    if (volume_.stop_owed() || volume_.context_may_be_open()) return "ERR UNRESOLVED_STATE\n";
+    bool byte_sent = false;
+    const bool exited = volume_.context_key(byte, now, &byte_sent);
+    const ServiceTxEvidence evidence = tx_.last_evidence();
+    const bool verified = exited && byte_sent;
+    std::fprintf(stderr, "XS8 CONTEXT_KEY name=%s byte=0x%02X result=%s state=%s "
+                         "context_may_be_open=%d receiver_execution=UNVERIFIED\n", name, byte,
+        verified ? "TX_VERIFIED" : exited ? "CANCELLED" : "UNCERTAIN",
+        state_name(volume_.state()), volume_.context_may_be_open() ? 1 : 0);
+    // Refused before any frame (shutdown signalled), or entry undone by
+    // shutdown before the key: nothing was sent and no fault is latched.
+    if (!byte_sent && volume_.state() != State::FAULT_LATCHED &&
+        !volume_.stop_owed() && !volume_.context_may_be_open())
+        return "ERR SHUTDOWN\n";
+    return std::string(verified ? "OK " : "ERR ") + name +
+        (verified ? "_TX" : "_UNCERTAIN") +
+        " gpio_tx=" + (evidence.gpio_completed ? "TX_OK" : "TX_FAIL") +
+        " waveform=" + waveform_name(evidence.waveform) +
+        " receiver_execution=UNVERIFIED\n";
+}
+
+// POWER ON/OFF: one ROOT frame. The CD preflight also requires volume IDLE with
+// no STOP or CONTEXT obligation, so no hold or release obligation can be active.
+std::string Xs8ServiceCore::power(uint8_t byte, const char *action)
+{
+    const std::string denied = cd_preflight();
+    if (!denied.empty()) return denied;
+    bool verified = false;
+    bool threw = false;
+    try { verified = tx_.send(byte); }
+    catch (...) { threw = true; }
+    const auto evidence = threw ? ServiceTxEvidence{} : tx_.last_evidence();
+    const bool confirmed = verified && evidence.attempted && evidence.byte == byte &&
+        evidence.gpio_completed && evidence.waveform == WaveformEvidence::MATCH;
+    std::fprintf(stderr, "XS8 POWER action=%s result=%s receiver_execution=UNVERIFIED\n",
+                 action, confirmed ? "TX_VERIFIED" : "TX_UNCERTAIN");
+    return std::string(confirmed ? "OK POWER_TX" : "ERR POWER_UNCERTAIN") +
+        " action=" + action +
+        " gpio_tx=" + (evidence.gpio_completed ? "TX_OK" : "TX_FAIL") +
+        " waveform=" + waveform_name(evidence.waveform) +
+        " receiver_execution=UNVERIFIED\n";
+}
+
 std::string Xs8ServiceCore::command(const std::string& line, Time received,
                                     Time now, uint64_t client_id)
 {
@@ -384,7 +503,8 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
         return context_command(line, now, client_id);
     // KEY_UP transmits only to end this connection's own hold, so like
     // VOLUME_RELEASE it is answered even while research CONTEXT is open.
-    if (line.compare(0, 7, "KEY_UP ") == 0) return key_command(line, now, client_id);
+    if (line.compare(0, 7, "KEY_UP ") == 0)
+        return key_command(line, received, now, client_id);
     // No other XS8 transmission while research CONTEXT may be open. RELEASE
     // stays available; it transmits nothing without an active hold.
     if (context_open_) {
@@ -393,7 +513,8 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
             return "OK VOLUME_RELEASE_TX\n";
         return "ERR RESEARCH_CONTEXT_ACTIVE\n";
     }
-    if (line.compare(0, 9, "KEY_DOWN ") == 0) return key_command(line, now, client_id);
+    if (line.compare(0, 9, "KEY_DOWN ") == 0)
+        return key_command(line, received, now, client_id);
     if (line == "CD_RELEASE" || line.compare(0, 11, "CD_RELEASE ") == 0 ||
         line == "CD_HEARTBEAT" ||
         line.compare(0, 13, "CD_HEARTBEAT ") == 0) {
@@ -425,6 +546,11 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
         return "ERR CD_UNKNOWN_ACTION\n";
     // Single ROOT key frames with no KEY UP: 0x41 and 0x9C are physically
     // observed; 0xBC is a historical PLAY/PAUSE mapping, not yet verified.
+    // ROOT 0x52 is physically observed; 0x62 is historical. Never CONTEXT 0x39.
+    if (line == "POWER_ON") return power(0x52, "ON");
+    if (line == "POWER_OFF") return power(0x62, "OFF");
+    // CONTEXT 0x48: historical MONITOR toggle, not yet physically validated.
+    if (line == "TAPE2_MONITOR_TOGGLE") return context_key_command(0x48, "TAPE2_MONITOR", now);
     if (line == "CD_PLAY") return cd_transport(0x41, "PLAY");
     if (line == "CD_PLAY_PAUSE") return cd_transport(0xBC, "PLAY_PAUSE");
     if (line == "CD_STOP") return cd_transport(0x9C, "STOP");
@@ -437,8 +563,10 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
         else if (name == "TUNER") byte = 0x82;
         else if (name == "PHONO") byte = 0x83;
         else if (name == "TAPE1") byte = 0x85;
-        else if (name == "TV1" || name == "TV2" || name == "TAPE2")
-            return "ERR SOURCE_UNVERIFIED\n";
+        // Physically validated CONTEXT sequences (2026-10-12): one atomic step.
+        else if (name == "TV1") return context_key_command(0x78, "SOURCE", now);
+        else if (name == "TV2") return context_key_command(0x88, "SOURCE", now);
+        else if (name == "TAPE2") return "ERR SOURCE_UNVERIFIED\n";
         else return "ERR UNKNOWN_SOURCE\n";
         if (volume_.state() != VolumeControl::State::IDLE ||
             volume_.stop_owed() || volume_.context_may_be_open())
@@ -451,8 +579,14 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
             " receiver_execution=UNVERIFIED\n";
     }
     if (line == "MUTE") {
+        // MUTE ends the caller's own hold first, never another owner's.
+        if (volume_owner_set_ && volume_owner_client_ != client_id &&
+            (volume_.state() == VolumeControl::State::HOLDING_UP ||
+             volume_.state() == VolumeControl::State::HOLDING_DOWN))
+            return "ERR VOLUME_BUSY\n";
         volume_owner_client_ = client_id;
         volume_owner_set_ = true;
+        volume_key_owned_ = false;
         const bool sent = volume_.mute(now);
         if (volume_.state() == VolumeControl::State::IDLE &&
             !volume_.stop_owed() && !volume_.context_may_be_open())
@@ -478,6 +612,7 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
             return "ERR VOLUME_BUSY\n";
         volume_owner_client_ = client_id;
         volume_owner_set_ = true;
+        volume_key_owned_ = false;
         if (!volume_.press(direction, received, now)) {
             if (volume_.state() == VolumeControl::State::IDLE &&
                 !volume_.stop_owed() && !volume_.context_may_be_open())
@@ -489,6 +624,10 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
         volume_owner_set_ = true;
         return "OK VOLUME_PRESS_TX\n";
     }
+    if ((volume_.state() == VolumeControl::State::HOLDING_UP ||
+         volume_.state() == VolumeControl::State::HOLDING_DOWN) &&
+        (!volume_owner_set_ || volume_owner_client_ != client_id))
+        return "ERR VOLUME_NOT_OWNER\n"; // Never another owner's hold.
     return volume_.release(direction, now) ? "OK VOLUME_RELEASE_TX\n"
                                            : "ERR VOLUME_STOP_UNCERTAIN\n";
 }
@@ -597,11 +736,17 @@ void Xs8ServiceCore::disconnected(Time now, uint64_t client_id)
         context_close(now, "OWNER_DISCONNECTED", false);
     if (!volume_owner_set_ || volume_owner_client_ != client_id) return;
     volume_owner_set_ = false;
+    const bool key_owned = volume_key_owned_;
+    volume_key_owned_ = false;
     if (volume_.state() == VolumeControl::State::HOLDING_UP ||
         volume_.state() == VolumeControl::State::HOLDING_DOWN)
         volume_.disconnect(owner_direction_, now);
     else if (volume_.stop_owed() || volume_.context_may_be_open())
         volume_.shutdown(now);
+    else if (key_owned && volume_.rearm_blocked())
+        // A closed Web connection can send no stale keepalive, so its watchdog
+        // re-arm block must not linger and block CEC. No XS8 frame.
+        volume_.disconnect(owner_direction_, now);
 }
 
 void Xs8ServiceCore::tick(Time now)

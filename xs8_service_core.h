@@ -81,7 +81,13 @@ private:
     std::string cd_press(uint8_t press_byte, const char *action, Time now,
                          const uint64_t *owner = nullptr);
     std::string cd_release(const char *reason, const char *key_action = nullptr);
-    std::string key_command(const std::string& line, Time now, uint64_t client_id);
+    std::string key_command(const std::string& line, Time received, Time now,
+                            uint64_t client_id);
+    std::string volume_key(bool down, VolumeControl::Direction direction,
+                           const std::string& action, Time received, Time now,
+                           uint64_t client_id);
+    std::string context_key_command(uint8_t byte, const char *name, Time now);
+    std::string power(uint8_t byte, const char *action);
     std::string cd_preflight() const;
     bool attempt_cd_release();
     ServiceTransmitter& tx_;
@@ -92,6 +98,9 @@ private:
     std::unordered_set<uint64_t> clients_;
     uint64_t volume_owner_client_ = 0;
     bool volume_owner_set_ = false;
+    // The volume owner started its hold with KEY_DOWN (Web), not VOLUME_PRESS
+    // (CEC). Only such an owner's disconnect also clears its re-arm block.
+    bool volume_key_owned_ = false;
     bool monitor_fault_handled_ = false;
     bool cd_active_ = false;
     bool cd_hold_ = false;

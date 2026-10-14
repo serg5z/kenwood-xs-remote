@@ -302,6 +302,43 @@ class ServiceSocketTest(unittest.TestCase):
         self.assertEqual(self.process.wait(timeout=3), 0)
         self.assertEqual(self.transmitted(), ["0x6A", "0x72"])
 
+    def test_context_keys_and_power_frames(self):
+        ok = " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED"
+        self.assertEqual(self.request("SELECT_SOURCE TV1"), "OK SOURCE_TX" + ok)
+        self.assertEqual(self.request("SELECT_SOURCE TV2"), "OK SOURCE_TX" + ok)
+        self.assertEqual(self.request("TAPE2_MONITOR_TOGGLE"), "OK TAPE2_MONITOR_TX" + ok)
+        self.assertEqual(self.request("POWER_ON"), "OK POWER_TX action=ON" + ok)
+        self.assertEqual(self.request("POWER_OFF"), "OK POWER_TX action=OFF" + ok)
+        self.assertEqual(self.transmitted(), [
+            "0x17", "0x78", "0x07", "0x17", "0x88", "0x07", "0x17", "0x48", "0x07",
+            "0x52", "0x62"])
+        self.assertIn("state=IDLE stop_owed=0 context_may_be_open=0", self.request("STATUS"))
+
+    def test_web_volume_hold_released_by_closing_its_connection(self):
+        with self.connect() as cec:
+            self.command(cec, "STATUS")  # Accepted before the next connect.
+            with self.connect() as owner:
+                self.assertEqual(self.command(owner, "KEY_DOWN VOLUME_DOWN"),
+                                 "OK KEY_DOWN_TX action=VOLUME_DOWN gpio_tx=TX_OK "
+                                 "waveform=MATCH receiver_execution=UNVERIFIED")
+                for _ in range(3):
+                    time.sleep(0.3)
+                    self.assertEqual(self.command(owner, "KEY_DOWN VOLUME_DOWN"),
+                                     "OK KEY_ALIVE action=VOLUME_DOWN")
+                self.assertEqual(self.command(cec, "VOLUME_PRESS DOWN"), "ERR VOLUME_BUSY")
+                self.assertEqual(self.command(cec, "VOLUME_RELEASE DOWN"), "ERR VOLUME_NOT_OWNER")
+                self.assertEqual(self.command(cec, "MUTE"), "ERR VOLUME_BUSY")
+                self.assertEqual(self.request("POWER_OFF"), "ERR HOLDING_DOWN")
+                self.assertEqual(self.transmitted(), ["0x17", "0xE9"])
+            closed = time.monotonic()
+            self.wait_status("state=IDLE stop_owed=0 context_may_be_open=0")
+            self.assertLess(time.monotonic() - closed, 0.5)
+            self.assertEqual(self.transmitted(), ["0x17", "0xE9", "0x09", "0x07"])
+            self.assertIn("XS8 STOP reason=CLIENT_DISCONNECT", self.log_path.read_text())
+            # CEC volume works normally afterwards.
+            self.assertEqual(self.command(cec, "VOLUME_PRESS UP"), "OK VOLUME_PRESS_TX")
+            self.assertEqual(self.command(cec, "VOLUME_RELEASE UP"), "OK VOLUME_RELEASE_TX")
+
     def test_volume_owner_disconnect_still_stops_with_other_clients(self):
         with self.connect() as cec:
             self.assertEqual(self.command(cec, "VOLUME_PRESS DOWN"),

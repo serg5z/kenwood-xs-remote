@@ -176,7 +176,8 @@ class KeyService:
     the hold. `script[verb]` can queue raw replies (bytes), None (close without
     replying) or ("delay", seconds, bytes)."""
 
-    PRESS = {"SEEK_FORWARD": "0x7A", "SEEK_BACKWARD": "0x6A"}
+    PRESS = {"SEEK_FORWARD": ["0x7A"], "SEEK_BACKWARD": ["0x6A"],
+             "VOLUME_UP": ["0x17", "0xF9"], "VOLUME_DOWN": ["0x17", "0xE9"]}
 
     def __init__(self, path, status=CD_IDLE_STATUS):
         self.path = path
@@ -247,6 +248,9 @@ class KeyService:
             if self.script.get(verb):
                 return self.script[verb].pop(0)
             if line == "STATUS":
+                if self.hold and self.hold["action"].startswith("VOLUME_"):
+                    return CD_IDLE_STATUS.replace(
+                        b"OK state=IDLE", b"OK state=HOLDING_" + self.hold["action"][7:].encode())
                 return (CD_HOLD_STATUS.replace(b"cd_action=TRACK_NEXT",
                                                b"cd_action=" + self.hold["action"].encode())
                         if self.hold else self.status)
@@ -261,7 +265,7 @@ class KeyService:
                 if cid in self.expired:
                     return f"ERR KEY_EXPIRED last={self.expired[cid]}\n".encode()
                 self.hold = {"conn": cid, "action": action}
-                self.tx.append(self.PRESS[action])
+                self.tx.extend(self.PRESS[action])
                 return (f"OK KEY_DOWN_TX action={action} gpio_tx=TX_OK waveform=MATCH "
                         "receiver_execution=UNVERIFIED\n").encode()
             if verb == "KEY_UP":
@@ -278,7 +282,8 @@ class KeyService:
             return b"ERR UNKNOWN_COMMAND\n"
 
     def release(self, reason):
-        self.tx.append("0x72")
+        # CD KEY UP, or volume STOP then CONTEXT exit.
+        self.tx.extend(["0x72"] if self.hold["action"].startswith("SEEK_") else ["0x09", "0x07"])
         self.last = reason
         owner = self.hold["conn"]
         self.hold = None
@@ -458,12 +463,13 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(code, 200)
         parser = DisabledControls()
         parser.feed(body.decode())
-        self.assertEqual(len(parser.buttons), 17)
+        self.assertEqual(len(parser.buttons), 19)
         self.assertTrue(all("disabled" in button for button in parser.buttons))
         for path in ("/api/v1/source", "/api/v1/mute",
                      "/api/v1/receiver/query",
                      "/api/v1/volume/step", "/api/v1/cd/transport",
                      "/api/v1/cd/track", "/api/v1/cd/playback", "/api/v1/cd/seek",
+                     "/api/v1/volume/hold", "/api/v1/power", "/api/v1/receiver/monitor",
                      "/api/v1/status", "/anything"):
             code, _ = self.request("POST", path)
             self.assertEqual(code, 501)
@@ -2370,8 +2376,9 @@ class CdSeekGatewayTest(CdPlaybackGatewayTest):
         self.hold()["started"] -= 10.0
         code, payload, _, _ = self.seek(payload["csrf_token"], cookie,
                                         {"action": "HEARTBEAT", "hold_id": payload["hold_id"]})
-        self.assertEqual((code, payload["result"], payload["reason"]),
-                         (409, "NOT_ACTIVE", "MAX_HOLD"))
+        # The heartbeat or the service_actions() cleanup reaches the maximum first.
+        self.assertEqual((code, payload["result"]), (409, "NOT_ACTIVE"))
+        self.assertIn(payload.get("reason"), ("MAX_HOLD", None))
         fake.wait(lambda: (owner, "CLOSE") in fake.events)
         self.assertEqual(fake.lines(owner), ["KEY_DOWN SEEK_FORWARD", "CLOSE"])
         # The cleanup loop enforces the maximum even while heartbeats continue.
@@ -2674,6 +2681,387 @@ class RealServiceSeekTest(CdSeekGatewayTest):
         time.sleep(0.3)
         self.assertEqual(self.transmitted(), ["0x7A", "0x72"], "never a second press")
         self.assertIsNone(self.hold())
+
+
+SOURCE_OK = b"OK SOURCE_TX gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n"
+POWER_OK = (b"OK POWER_TX action=ON gpio_tx=TX_OK waveform=MATCH "
+            b"receiver_execution=UNVERIFIED\n")
+MONITOR_OK = (b"OK TAPE2_MONITOR_TX gpio_tx=TX_OK waveform=MATCH "
+              b"receiver_execution=UNVERIFIED\n")
+VOLUME_HOLDING = CD_IDLE_STATUS.replace(b"OK state=IDLE", b"OK state=HOLDING_UP")
+
+
+class RemoteV2GatewayTest(CdSeekGatewayTest):
+    """TV1/TV2 sources, POWER, TAPE2 MONITOR and held Web volume."""
+
+    for _name in [n for n in dir(CdSeekGatewayTest) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name
+
+    def gate(self, **flags):
+        handler = self.server.RequestHandlerClass
+        for name, value in flags.items():
+            setattr(handler, name, value)
+        handler.https_origin = "https://woodland-pi.local"
+        self.server.proxy_peer_verified = True
+
+    def dispatched(self, fake):
+        return [c for c in fake.commands if c != b"STATUS\n"]
+
+    def spaced(self, name):
+        state = self.server.__dict__.get(name)
+        if state:
+            state["completed"] = float("-inf")
+
+    def operations(self, cookie):
+        _, body, _ = self.request_full("GET", "/api/v1/capabilities", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        return json.loads(body)["operations"]
+
+    def session_flags(self, cookie):
+        _, body, _ = self.request_full("GET", "/api/v1/session", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        return json.loads(body)
+
+    # ---- TV1 / TV2 ----
+    def test_tv_sources_are_single_atomic_service_commands(self):
+        self.gate(production_source_enabled=True)
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=SOURCE_OK)
+        try:
+            token, cookie = self.session()
+            source = self.operations(cookie)["source"]
+            self.assertEqual(source["available_sources"],
+                             ["CD", "TUNER", "PHONO", "TV1", "TV2", "TAPE1"])
+            self.assertEqual(source["blocked_sources"], ["TAPE2"])
+            for name in ("TV1", "TV2"):
+                code, body, _ = self.source(token, cookie, name)
+                self.assertEqual(code, 200, body)
+                self.assertEqual(json.loads(body)["receiver_execution"], "UNVERIFIED")
+                time.sleep(1.0)  # The existing per-session source spacing.
+                token = self.fresh_token(cookie)
+            code, body, _ = self.source(token, cookie, "TAPE2")
+            self.assertEqual((code, json.loads(body)["result"]), (409, "SOURCE_UNVERIFIED"))
+        finally:
+            fake.close()
+        # One service command each: the CONTEXT sequence is the service's job.
+        self.assertEqual(self.dispatched(fake), [b"SELECT_SOURCE TV1\n", b"SELECT_SOURCE TV2\n"])
+        with mock.patch.object(xs8_gateway, "_send_control",
+                               return_value=SOURCE_OK.decode().strip()) as control:
+            xs8_gateway.send_source("/unused", "TV2")
+        self.assertGreaterEqual(control.call_args.args[2], 3.0, "three frames need time")
+
+    def test_tv_source_uncertainty_is_reported_not_retried(self):
+        self.gate(production_source_enabled=True)
+        reply = (b"ERR SOURCE_UNCERTAIN gpio_tx=TX_OK waveform=MISSING "
+                 b"receiver_execution=UNVERIFIED\n")
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=reply)
+        token, cookie = self.session()
+        code, body, _ = self.source(token, cookie, "TV1")
+        fake.close()
+        self.assertEqual((code, json.loads(body)["result"]), (502, "SERVICE_UNCERTAIN"))
+        self.assertEqual(self.dispatched(fake), [b"SELECT_SOURCE TV1\n"])
+
+    # ---- POWER ----
+    def power(self, token, cookie, action, body=None):
+        return self.post("/api/v1/power", token, cookie,
+                         body if body is not None else json.dumps({"action": action}))
+
+    def test_power_gate_capability_and_exact_commands(self):
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=POWER_OK)
+        try:
+            self.assertEqual(self.power("x", "x", "ON")[0], 501)
+            self.assertFalse(json.loads(self.request("GET", "/api/v1/capabilities")[1])
+                             ["operations"]["power"]["enabled"])
+            self.gate(power_enabled=True)
+            token, cookie = self.session()
+            self.assertTrue(self.session_flags(cookie)["power_available"])
+            power = self.operations(cookie)["power"]
+            self.assertEqual((power["enabled"], power["available_actions"],
+                              power["provisional_actions"]), (True, ["ON", "OFF"], ["OFF"]))
+            for action in ("ON", "OFF"):
+                fake.mute_reply = POWER_OK.replace(b"action=ON", f"action={action}".encode())
+                self.spaced("power")
+                code, body, _ = self.power(token, cookie, action)
+                payload = json.loads(body)
+                self.assertEqual((code, payload["result"], payload["action"],
+                                  payload["receiver_execution"]),
+                                 (200, "SERVICE_TX_OK", action, "UNVERIFIED"))
+                self.assertIs(payload.get("mapping") == "PROVISIONAL", action == "OFF")
+                self.assertEqual(self.power(token, cookie, action)[0], 403, "single use")
+                token = self.fresh_token(cookie)
+            for body in ('{"action":"on"}', '{"action":"TOGGLE"}', '{"action":"STANDBY"}',
+                         '{"action":"0x39"}', '{}', '{"action":"ON","x":1}'):
+                self.assertEqual(self.power(token, cookie, None, body)[0], 400, body)
+            # Spacing: a second POWER within 2 s is refused before dispatch.
+            code, body, _ = self.power(token, cookie, "ON")
+            self.assertEqual((code, json.loads(body)["result"]), (429, "TOO_FAST"))
+        finally:
+            fake.close()
+        self.assertEqual(self.dispatched(fake), [b"POWER_ON\n", b"POWER_OFF\n"])
+
+    def test_power_refused_during_holds_and_faults(self):
+        self.gate(power_enabled=True)
+        cases = {
+            "volume_hold": (VOLUME_HOLDING, "VOLUME_BUSY"),
+            "cd_hold": (CD_HOLD_STATUS, "CD_BUSY"),
+            "cd_fault": (CD_FAULT_STATUS, "CD_FAULT_LATCHED"),
+            "volume_fault": (CD_IDLE_STATUS.replace(b"OK state=IDLE", b"OK state=FAULT_LATCHED"),
+                             "FAULT_LATCHED"),
+            "stop_owed": (CD_IDLE_STATUS.replace(b"stop_owed=0", b"stop_owed=1"), "NOT_ELIGIBLE"),
+            "context": (CD_IDLE_STATUS.replace(b"context_may_be_open=0",
+                                               b"context_may_be_open=1"), "NOT_ELIGIBLE"),
+            "boot": (CD_IDLE_STATUS.replace(b"OK state=IDLE", b"OK state=BOOT_INHIBIT"),
+                     "NOT_ELIGIBLE"),
+            "no_cd_fields": (STATUS, "NOT_ELIGIBLE"),
+        }
+        for name, (status, result) in cases.items():
+            with self.subTest(case=name):
+                token, cookie = self.session()
+                self.spaced("power")
+                fake = RecordingService(self.socket_path, status=status, mute_reply=POWER_OK)
+                code, body, _ = self.power(token, cookie, "OFF")
+                fake.close()
+                self.assertEqual((code, json.loads(body)["result"]), (409, result))
+                self.assertEqual(self.dispatched(fake), [])
+
+    def test_power_uncertain_and_timeout_never_retried(self):
+        self.gate(power_enabled=True)
+        uncertain = (b"ERR POWER_UNCERTAIN action=OFF gpio_tx=TX_OK waveform=MISSING "
+                     b"receiver_execution=UNVERIFIED\n")
+        for reply, code, result, check in (
+                (uncertain, 502, "SERVICE_UNCERTAIN", True),
+                (POWER_OK, 502, "INVALID_REPLY", True),  # action=ON for an OFF request
+                (POWER_OK.replace(b"waveform=MATCH", b"waveform=MISSING"), 502,
+                 "INVALID_REPLY", True),
+                (b"ERR HOLDING_UP\n", 409, "REJECTED", False),
+                (b"ERR CD_FAULT_LATCHED\n", 409, "CD_FAULT_LATCHED", True)):
+            with self.subTest(reply=reply):
+                token, cookie = self.session()
+                self.spaced("power")
+                fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=reply)
+                status, body, _ = self.power(token, cookie, "OFF")
+                fake.close()
+                payload = json.loads(body)
+                self.assertEqual((status, payload["result"]), (code, result))
+                self.assertIs(payload["physical_check_required"], check)
+                self.assertEqual(self.dispatched(fake), [b"POWER_OFF\n"])
+
+    # ---- TAPE2 MONITOR ----
+    def monitor(self, token, cookie, body="{}"):
+        return self.post("/api/v1/receiver/monitor", token, cookie, body)
+
+    def test_tape2_monitor_is_gated_provisional_and_dispatches_once(self):
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=MONITOR_OK)
+        try:
+            self.assertEqual(self.monitor("x", "x")[0], 501)
+            self.gate(tape2_monitor_enabled=True)
+            token, cookie = self.session()
+            self.assertTrue(self.session_flags(cookie)["tape2_monitor_available"])
+            monitor = self.operations(cookie)["tape2_monitor"]
+            self.assertTrue(monitor["enabled"] and monitor["provisional"])
+            self.assertEqual(self.monitor(token, cookie, '{"on":true}')[0], 400)
+            code, body, _ = self.monitor(token, cookie)
+            payload = json.loads(body)
+            self.assertEqual((code, payload["result"], payload["mapping"],
+                              payload["receiver_execution"]),
+                             (200, "SERVICE_TX_OK", "PROVISIONAL", "UNVERIFIED"))
+            self.assertNotIn("monitor", {k.lower() for k in payload} - {"mapping"},
+                             "a TX never reports a MONITOR state")
+            code, body, _ = self.monitor(self.fresh_token(cookie), cookie)
+            self.assertEqual((code, json.loads(body)["result"]), (429, "TOO_FAST"))
+            fake.status = VOLUME_HOLDING
+            self.spaced("tape2_monitor")
+            code, body, _ = self.monitor(self.fresh_token(cookie), cookie)
+            self.assertEqual((code, json.loads(body)["result"]), (409, "VOLUME_BUSY"))
+            fake.status = CD_IDLE_STATUS
+            fake.mute_reply = (b"ERR TAPE2_MONITOR_UNCERTAIN gpio_tx=TX_OK waveform=MISSING "
+                               b"receiver_execution=UNVERIFIED\n")
+            self.spaced("tape2_monitor")
+            code, body, _ = self.monitor(self.fresh_token(cookie), cookie)
+            self.assertEqual((code, json.loads(body)["result"]), (502, "SERVICE_UNCERTAIN"))
+            self.assertTrue(json.loads(body)["physical_check_required"])
+        finally:
+            fake.close()
+        self.assertEqual(self.dispatched(fake), [b"TAPE2_MONITOR_TOGGLE\n"] * 2)
+
+    # ---- Web volume hold ----
+    def hold_request(self, token, cookie, body):
+        code, raw, headers = self.post("/api/v1/volume/hold", token, cookie, json.dumps(body))
+        return code, json.loads(raw), raw, headers
+
+    def start_volume(self, token, cookie, direction="UP"):
+        self.spaced("volume_step")
+        return self.hold_request(token, cookie, {"action": "START", "direction": direction})
+
+    def test_volume_hold_lifecycle_on_one_connection(self):
+        self.assertEqual(self.post("/api/v1/volume/hold", "x", "x", "{}")[0], 501)
+        self.gate(volume_hold_enabled=True)
+        for direction, frames in (("UP", ["0x17", "0xF9"]), ("DOWN", ["0x17", "0xE9"])):
+            with self.subTest(direction=direction):
+                fake = self.service()
+                token, cookie = self.session()
+                hold = self.operations(cookie)["volume_hold"]
+                self.assertEqual((hold["enabled"], hold["available_directions"],
+                                  hold["hold_delay_ms"], hold["max_hold_ms"]),
+                                 (True, ["UP", "DOWN"], 400, 3000))
+                code, payload, _, _ = self.start_volume(token, cookie, direction)
+                self.assertEqual((code, payload["result"]), (200, "HOLD_STARTED"), payload)
+                owner = self.hold_connection()
+                connection = self.hold()["connection"]
+                for _ in range(3):
+                    code, payload, _, _ = self.hold_request(
+                        payload["csrf_token"], cookie,
+                        {"action": "HEARTBEAT", "hold_id": payload["hold_id"]
+                         if "hold_id" in payload else self.hold()["hold_id"]})
+                    self.assertEqual((code, payload["result"]), (200, "LEASE_RENEWED"))
+                self.assertEqual(fake.tx, frames, "keepalives never press again")
+                code, payload, _, _ = self.hold_request(payload["csrf_token"], cookie,
+                                                        {"action": "RELEASE"})
+                self.assertEqual((code, payload["result"]), (200, "RELEASED"))
+                fake.wait(lambda: (owner, "CLOSE") in fake.events)
+                self.assertTrue(connection.closed)
+                action = "VOLUME_" + direction
+                self.assertEqual(fake.lines(owner), [f"KEY_DOWN {action}"] * 4 +
+                                 [f"KEY_UP {action}", "CLOSE"])
+                self.assertEqual(fake.tx, frames + ["0x09", "0x07"])
+                fake.close()
+                self.fake = None
+
+    def test_volume_hold_closing_and_expiry_paths(self):
+        self.gate(volume_hold_enabled=True)
+        # Browser silence: the cleanup closes the socket; the service stops at once.
+        fake = self.service()
+        token, cookie = self.session()
+        _, payload, _, _ = self.start_volume(token, cookie)
+        owner = self.hold_connection()
+        fake.wait(lambda: (owner, "CLOSE") in fake.events)
+        self.assertEqual(fake.tx, ["0x17", "0xF9", "0x09", "0x07"])
+        fake.close()
+        # Gateway maximum (3 s): renewal refused, socket closed.
+        fake = self.service()
+        _, payload, _, _ = self.start_volume(payload["csrf_token"], cookie)
+        owner = self.hold_connection()
+        self.hold()["started"] -= 3.0
+        code, payload, _, _ = self.hold_request(payload["csrf_token"], cookie, {
+            "action": "HEARTBEAT", "hold_id": payload["hold_id"]})
+        # Either the heartbeat sees the maximum (reason MAX_HOLD) or the
+        # service_actions() cleanup closed it first; both refuse without forwarding.
+        self.assertEqual((code, payload["result"]), (409, "NOT_ACTIVE"))
+        self.assertIn(payload.get("reason"), ("MAX_HOLD", None))
+        fake.wait(lambda: (owner, "CLOSE") in fake.events)
+        self.assertEqual(fake.lines(owner), ["KEY_DOWN VOLUME_UP", "CLOSE"])
+        fake.close()
+        # Service watchdog then a late keepalive: KEY_EXPIRED, never a new press.
+        fake = self.service()
+        _, payload, _, _ = self.start_volume(payload["csrf_token"], cookie, "DOWN")
+        owner = self.hold_connection()
+        fake.expire("VOLUME_WATCHDOG")
+        code, payload, _, _ = self.hold_request(payload["csrf_token"], cookie, {
+            "action": "HEARTBEAT", "hold_id": payload["hold_id"]})
+        self.assertEqual((code, payload["result"], payload["cd_last_result"]),
+                         (409, "NOT_ACTIVE", "VOLUME_WATCHDOG"))
+        fake.wait(lambda: (owner, "CLOSE") in fake.events)
+        self.assertEqual(fake.tx, ["0x17", "0xE9", "0x09", "0x07"])
+
+    def test_volume_and_cd_holds_exclude_each_other(self):
+        self.gate(volume_hold_enabled=True, cd_seek_enabled=True, volume_step_enabled=True)
+        fake = self.service()
+        token, cookie = self.session()
+        _, payload, _, _ = self.start_volume(token, cookie)
+        token = payload["csrf_token"]
+        # A CD seek, a volume step and a second hold are refused; nothing is sent.
+        self.elapse_interval()
+        code, payload, _, _ = self.seek(token, cookie, {"action": "START", "direction": "FORWARD"})
+        self.assertEqual((code, payload["result"]), (409, "CD_BUSY"))
+        self.spaced("volume_step")  # Shared with the hold START; spacing is not the point here.
+        code, raw, _ = self.post("/api/v1/volume/step", payload["csrf_token"], cookie,
+                                 json.dumps({"direction": "UP"}))
+        self.assertEqual((code, json.loads(raw)["result"]), (409, "VOLUME_BUSY"))
+        code, payload, _, _ = self.start_volume(self.fresh_token(cookie), cookie, "DOWN")
+        self.assertEqual((code, payload["result"]), (409, "VOLUME_BUSY"))
+        # A CD RELEASE (session-scoped) never ends the volume hold.
+        code, payload, _, _ = self.seek(payload["csrf_token"], cookie, {"action": "RELEASE"})
+        self.assertEqual((code, payload["result"]), (200, "NOT_ACTIVE"))
+        self.assertIsNotNone(self.hold())
+        self.assertEqual(fake.lines(), ["KEY_DOWN VOLUME_UP"])
+        code, payload, _, _ = self.hold_request(payload["csrf_token"], cookie, {"action": "RELEASE"})
+        self.assertEqual(payload["result"], "RELEASED")
+
+    def test_volume_hold_uncertain_replies(self):
+        self.gate(volume_hold_enabled=True)
+        down = (b"ERR KEY_DOWN_UNCERTAIN action=VOLUME_UP state=FAULT_LATCHED stop_owed=0 "
+                b"context_may_be_open=0 receiver_execution=UNVERIFIED\n")
+        up = (b"ERR KEY_UP_UNCERTAIN action=VOLUME_UP state=FAULT_LATCHED stop_owed=1 "
+              b"context_may_be_open=1 receiver_execution=UNVERIFIED\n")
+        fake = self.service()
+        fake.script["KEY_DOWN"] = [down]
+        token, cookie = self.session()
+        code, payload, _, _ = self.start_volume(token, cookie)
+        self.assertEqual((code, payload["result"], payload["state"]),
+                         (502, "SERVICE_UNCERTAIN", "FAULT_LATCHED"))
+        self.assertTrue(payload["physical_check_required"])
+        self.assertIsNone(self.hold())
+        _, payload, _, _ = self.start_volume(payload["csrf_token"], cookie)
+        fake.script["KEY_UP"] = [up]
+        code, payload, _, _ = self.hold_request(payload["csrf_token"], cookie, {"action": "RELEASE"})
+        self.assertEqual((code, payload["result"], payload["stop_owed"]),
+                         (502, "SERVICE_UNCERTAIN", "1"))
+        self.assertTrue(payload["physical_check_required"])
+        self.assertEqual(sum(l.startswith("KEY_DOWN") for l in fake.lines()), 2)
+
+    def test_cli_gates(self):
+        base = ["--systemd-socket", "--nginx-uid", "33", "--https-origin",
+                "https://woodland-pi.local"]
+        for flag, name in (("--enable-volume-hold", "enable_volume_hold"),
+                           ("--enable-power", "enable_power"),
+                           ("--enable-tape2-monitor", "enable_tape2_monitor")):
+            with self.subTest(flag=flag):
+                self.assertTrue(getattr(xs8_gateway.parse_args([flag] + base), name))
+                self.assertFalse(getattr(xs8_gateway.parse_args([]), name))
+                for options in ([flag], [flag] + base + ["--socket", self.socket_path],
+                                [flag, "--enable-offline-mute"] + base +
+                                ["--socket", self.socket_path]):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit):
+                            xs8_gateway.parse_args(options)
+
+
+class RealServiceVolumeHoldTest(RealServiceSeekTest):
+    """Web volume hold through the Gateway against the real service loop."""
+
+    for _name in [n for n in dir(RealServiceSeekTest) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name
+
+    def test_real_service_volume_hold_and_shutdown_release(self):
+        handler = self.server.RequestHandlerClass
+        handler.volume_hold_enabled = True
+        handler.https_origin = "https://woodland-pi.local"
+        self.server.proxy_peer_verified = True
+        token, cookie = self.session()
+        code, raw, _ = self.post("/api/v1/volume/hold", token, cookie,
+                                 json.dumps({"action": "START", "direction": "DOWN"}))
+        payload = json.loads(raw)
+        self.assertEqual((code, payload["result"]), (200, "HOLD_STARTED"), payload)
+        time.sleep(0.4)
+        code, raw, _ = self.post("/api/v1/volume/hold", payload["csrf_token"], cookie,
+                                 json.dumps({"action": "HEARTBEAT", "hold_id": payload["hold_id"]}))
+        payload = json.loads(raw)
+        self.assertEqual((code, payload["result"]), (200, "LEASE_RENEWED"), payload)
+        self.assertEqual(self.transmitted(), ["0x17", "0xE9"])
+        code, raw, _ = self.post("/api/v1/volume/hold", payload["csrf_token"], cookie,
+                                 json.dumps({"action": "RELEASE"}))
+        self.assertEqual((code, json.loads(raw)["result"]), (200, "RELEASED"), raw)
+        self.assertEqual(self.transmitted(), ["0x17", "0xE9", "0x09", "0x07"])
+        # A second hold, then Gateway shutdown: STOP then exit from the close.
+        time.sleep(0.3)
+        code, raw, _ = self.post("/api/v1/volume/hold", json.loads(raw)["csrf_token"], cookie,
+                                 json.dumps({"action": "START", "direction": "UP"}))
+        self.assertEqual(code, 200, raw)
+        self.server.shutdown()
+        self.server.server_close()
+        self.wait_tx(["0x17", "0xE9", "0x09", "0x07", "0x17", "0xF9", "0x09", "0x07"])
+        self.assertIn("XS8 STOP reason=CLIENT_DISCONNECT", self.log_path.read_text())
 
 
 class BindingTest(unittest.TestCase):

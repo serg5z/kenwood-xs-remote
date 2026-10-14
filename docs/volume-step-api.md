@@ -33,3 +33,25 @@ The step does not set or clear the CEC re-arm block: after a CEC hold is stopped
 ## Validation status
 
 Offline tests: `make test` (`volume_control_test`, `xs8_service_core_test`, `tests/test_xs8_service_socket.py`). The operator reported that initial attended tests of both directions on the KR-V6070 passed (2026-10-13); the trial details, the change per step and a per-frame failure rate over repeated steps are not recorded here. Hold-to-repeat should wait for that failure-rate evidence.
+
+## Connection-owned volume hold
+
+`KEY_DOWN VOLUME_UP|VOLUME_DOWN` and `KEY_UP VOLUME_UP|VOLUME_DOWN` give the Web a held volume control on the **same VolumeControl path as CEC's `VOLUME_PRESS`**: `press()`, `release()` and the owner-disconnect `disconnect()`. Ownership is the socket connection that sent `KEY_DOWN`; no new framework or timer was added.
+
+| Request (owning connection unless noted) | Reply | XS8 TX |
+|---|---|---|
+| `KEY_DOWN A` while volume and CD are idle | `OK KEY_DOWN_TX action=A gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED` | `0x17 → 0xF9` (UP) or `0xE9` (DOWN) |
+| `KEY_DOWN A` again, same direction | `OK KEY_ALIVE action=A` (renews the 1200 ms inactivity) | none |
+| `KEY_DOWN` during any other hold (other direction, other connection, CEC, CD) | `ERR KEY_BUSY` | none |
+| `KEY_UP A` | `OK KEY_UP_TX action=A …` or `ERR KEY_UP_UNCERTAIN action=A state=… stop_owed=… context_may_be_open=… receiver_execution=UNVERIFIED` | `0x09 → 0x07` |
+| `KEY_UP` naming the other direction | `ERR KEY_ACTION_MISMATCH` | none |
+| `KEY_UP` from another connection during a hold | `ERR KEY_NOT_OWNER` | none |
+| `KEY_UP` with no hold | `OK KEY_UP_NONE last=<state>` | none |
+
+An uncertain start replies `ERR KEY_DOWN_UNCERTAIN action=A state=FAULT_LATCHED …`; `finish()` has already attempted `0x09 → 0x07`. The hold ends by `KEY_UP`; by its **owner connection closing** (`CLIENT_DISCONNECT`: `0x09 → 0x07` through the normal event loop); by **1200 ms without `KEY_DOWN`** (`INACTIVITY`); by the service's `--max-hold-ms` (`MAX_HOLD`); or by shutdown. Every STOP and exit failure latches `FAULT_LATCHED` exactly as for CEC.
+
+**Re-arm.** After `INACTIVITY` or `MAX_HOLD`, VolumeControl's existing re-arm block refuses the owner's late keepalive (`ERR KEY_EXPIRED last=VOLUME_WATCHDOG`), so it can never start a new press. The owner's `KEY_UP` clears it, as CEC's `VOLUME_RELEASE` does. Because a closed connection can send no stale keepalive, the disconnect of a **`KEY_DOWN` owner** also clears its block (no frame), so an abandoned Web hold never leaves CEC VOL+/− blocked. CEC (`VOLUME_PRESS`) owners keep the existing behavior: their disconnect does not clear the block.
+
+**Owner checks (all clients).** During any volume hold, `VOLUME_RELEASE` from a non-owner now answers `ERR VOLUME_NOT_OWNER` and `MUTE` from a non-owner answers `ERR VOLUME_BUSY`, both without transmitting: no client can end another's hold. The CEC client only releases and mutes on its own owning connection, so its behavior is unchanged; `VOLUME_RELEASE` while idle still answers OK (clearing a matching re-arm block), and the research gates still admit it.
+
+Single-tap `VOLUME_STEP` is unchanged and refused (`ERR VOLUME_BUSY`) during any hold.

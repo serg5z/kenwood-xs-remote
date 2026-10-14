@@ -385,6 +385,60 @@ static void test_step() {
     }
 }
 
+static void test_context_key() {
+    using Bytes = std::vector<uint8_t>;
+    for (uint8_t key : {uint8_t(0x78), uint8_t(0x88), uint8_t(0x48)}) {
+        FakeTx tx;
+        VolumeControl ctl(tx, Ms(1200), Ms(2000), {}, [] { return fake_now; });
+        CHECK(ctl.startup(false, true));
+        bool sent = false;
+        CHECK(ctl.context_key(key, at(10), &sent));
+        CHECK(sent && tx.sent == (Bytes{0x17, key, 0x07}));
+        CHECK(ctl.state() == State::IDLE && !ctl.context_may_be_open() && !ctl.stop_owed());
+    }
+    // Never from a hold: no cancellation, no frame.
+    FakeTx hold_tx;
+    VolumeControl hold(hold_tx, Ms(1200), Ms(2000), {}, [] { return fake_now; });
+    CHECK(hold.startup(false, true));
+    CHECK(hold.press(Direction::UP, at(1), at(1)));
+    CHECK(!hold.context_key(0x78, at(2)));
+    CHECK(hold.state() == State::HOLDING_UP && hold_tx.sent == (Bytes{0x17, 0xF9}));
+    FakeTx boot_tx;
+    VolumeControl boot(boot_tx, Ms(1200), Ms(2000), {}, [] { return fake_now; });
+    CHECK(!boot.context_key(0x78, at(1)) && boot_tx.sent.empty());
+    // Failure at each frame latches FAULT; the exit is attempted, the key never resent.
+    const std::pair<std::deque<bool>, Bytes> failures[] = {
+        {{false}, {0x17, 0x07}},
+        {{true, false}, {0x17, 0x88, 0x07}},
+        {{true, true, false, false, false}, {0x17, 0x88, 0x07, 0x07, 0x07}},
+    };
+    for (const auto& failure : failures) {
+        FakeTx tx;
+        VolumeControl ctl(tx, Ms(1200), Ms(2000), {}, [] { return fake_now; });
+        CHECK(ctl.startup(false, true));
+        tx.outcomes = failure.first;
+        bool sent = true;
+        CHECK(!ctl.context_key(0x88, at(10), &sent));
+        CHECK(tx.sent == failure.second);
+        CHECK(ctl.state() == State::FAULT_LATCHED);
+        CHECK(!ctl.context_key(0x88, at(20)) && tx.sent == failure.second);
+    }
+    // Shutdown before entry sends nothing; after entry, the exit still runs and
+    // byte_sent stays false.
+    bool stopping = true;
+    FakeTx stop_tx;
+    VolumeControl stopped(stop_tx, Ms(1200), Ms(2000), [&] { return stopping; },
+                          [] { return fake_now; });
+    CHECK(stopped.startup(false, true));
+    bool sent = true;
+    CHECK(!stopped.context_key(0x78, at(1), &sent) && !sent && stop_tx.sent.empty());
+    stopping = false;
+    stop_tx.on_send = [&](uint8_t byte) { if (byte == 0x17) stopping = true; };
+    CHECK(stopped.context_key(0x78, at(2), &sent));
+    CHECK(!sent && stop_tx.sent == (Bytes{0x17, 0x07}));
+    CHECK(stopped.state() == State::IDLE && !stopped.context_may_be_open());
+}
+
 int main() {
     test_boot_and_normal_paths();
     test_direction_change_and_shutdown();
@@ -394,5 +448,6 @@ int main() {
     test_mute_failure();
     test_startup_recovery_and_interruption();
     test_step();
+    test_context_key();
     std::cout << "volume state machine tests passed\n";
 }

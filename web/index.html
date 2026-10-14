@@ -37,7 +37,7 @@
               <button disabled type="button" data-source="TUNER">TUNER</button>
               <button disabled type="button" data-source="PHONO">PHONO</button>
               <button disabled type="button" data-source="TAPE1">TAPE1</button>
-              <button disabled type="button" data-source="TAPE2"><span>TAPE2</span><small>MONITOR</small></button>
+              <button id="monitor-button" disabled type="button" data-monitor-state="UNKNOWN" aria-label="Toggle TAPE2 monitor (state shown only when observed)"><span>TAPE2</span><small>MONITOR</small></button>
             </div>
           </section>
 
@@ -80,6 +80,10 @@
             <button id="volume-down" disabled type="button" aria-label="Volume down" data-volume-direction="DOWN">−</button>
           </div>
           <button class="mute" id="mute-button" disabled type="button">MUTE</button>
+          <div class="power" role="group" aria-label="Receiver power">
+            <button id="power-on" disabled type="button" data-power-action="ON">POWER ON</button>
+            <button id="power-off" disabled type="button" data-power-action="OFF">POWER OFF</button>
+          </div>
         </section>
       </div>
 

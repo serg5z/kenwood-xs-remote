@@ -1,6 +1,6 @@
 # Web Remote and HTTP API v0.1
 
-The Gateway remains **read-only by default**. Explicit production `--enable-mute` and `--enable-source` options independently gate MUTE and the four evidenced source commands through authenticated HTTPS and the systemd Unix socket. TV1, TV2 and TAPE2 remain blocked pending controlled TX validation. A separate default-off `--enable-volume` option gates single-tap VOL+/VOL− steps ([below](#volume-step-phase-1)); hold and repeat are not exposed. `--enable-cd-playback` and `--enable-cd-seek` gate CD PLAY/PAUSE and STOP, and held FF/REW ([below](#cd-playback-and-held-seek)). A separate default-off `--enable-cd-track` option gates discrete CD NEXT/PREVIOUS ([below](#cd-track-nextprevious-phase-a)). The checked-in systemd unit enables no control. See [MUTE deployment](mute-control.md) and [source selection evidence and rollout](source-selection.md) before opting in.
+The Gateway remains **read-only by default**. Explicit production `--enable-mute` and `--enable-source` options independently gate MUTE and the four evidenced source commands through authenticated HTTPS and the systemd Unix socket. TV1, TV2 and TAPE2 remain blocked pending controlled TX validation. A separate default-off `--enable-volume` option gates single-tap VOL+/VOL− steps ([below](#volume-step-phase-1)); hold and repeat are not exposed. `--enable-cd-playback` and `--enable-cd-seek` gate CD PLAY/PAUSE and STOP, and held FF/REW ([below](#cd-playback-and-held-seek)). `--enable-volume-hold`, `--enable-power` and `--enable-tape2-monitor` gate held VOL+/VOL−, POWER ON/OFF and the provisional TAPE2 MONITOR toggle ([below](#web-remote-v2-controls)). Every gate is off by default. A separate default-off `--enable-cd-track` option gates discrete CD NEXT/PREVIOUS ([below](#cd-track-nextprevious-phase-a)). The checked-in systemd unit enables no control. See [MUTE deployment](mute-control.md) and [source selection evidence and rollout](source-selection.md) before opting in.
 
 An independent default-off `--enable-receiver-query` gate permits one explicit authenticated `POST /api/v1/receiver/query` for live source/MONITOR synchronization. GET status and background polling remain passive. See [live receiver status](receiver-status.md) for the cache fields, uncertainty model, and manual rollout.
 
@@ -46,6 +46,9 @@ python3 -m unittest discover -s tests -p 'test_gateway.py'
 | `POST /api/v1/cd/track` | Returns 501 with the CD gate disabled. With `--enable-cd-track`, accepts exactly `{ "action": "NEXT" }` or `{ "action": "PREVIOUS" }`, checks fresh XS8 and CD eligibility, and dispatches at most one discrete `CD_TRACK_*` pair. |
 | `POST /api/v1/cd/playback` | Returns 501 with `--enable-cd-playback` off. Otherwise accepts exactly `{ "action": "PLAY_PAUSE" }` or `{ "action": "STOP" }` and dispatches at most one single-frame key. |
 | `POST /api/v1/cd/seek` | Returns 501 with `--enable-cd-seek` off. Otherwise accepts `START` (with `direction` `FORWARD`/`BACKWARD`), `HEARTBEAT` (with `hold_id`) or `RELEASE` (optional `hold_id`) for one held seek. |
+| `POST /api/v1/volume/hold` | Returns 501 with `--enable-volume-hold` off. Otherwise `START` (with `direction` `UP`/`DOWN`), `HEARTBEAT` (with `hold_id`) or `RELEASE` for one connection-owned volume hold. |
+| `POST /api/v1/power` | Returns 501 with `--enable-power` off. Otherwise exactly `{ "action": "ON" }` or `{ "action": "OFF" }`; one ROOT frame. |
+| `POST /api/v1/receiver/monitor` | Returns 501 with `--enable-tape2-monitor` off. Otherwise body `{}`; one provisional TAPE2 MONITOR toggle. |
 | `POST /api/v1/volume/step` | Returns 501 with the volume gate disabled. With `--enable-volume`, accepts exactly `{ "direction": "UP" }` or `{ "direction": "DOWN" }`, checks fresh XS8 eligibility, and dispatches at most one atomic `VOLUME_STEP`. |
 
 `status` preserves the service's `last_gpio_tx`, `last_waveform`, and `receiver_execution` fields. `TX_OK` and `MATCH` do not prove that the Kenwood executed a command. The gateway opens one short-lived Unix socket connection per status request. It does not modify XS8 state.
@@ -210,6 +213,28 @@ Offline tests: `python3 -m unittest tests.test_gateway` (classes `CdPlaybackGate
 ### Rollout and rollback
 
 Rollout follows the [CD track pattern](#rollout-and-rollback), with `--enable-cd-playback` and/or `--enable-cd-seek`. The XS8 Service must be a build with `CD_PLAY_PAUSE`/`CD_STOP` and the 10 s CD hold maximum. To roll back, remove the flags and confirm that both endpoints return 501 and the four buttons are disabled.
+
+## Web Remote v2 controls
+
+All three gates below share the active-control startup requirements of `--enable-cd-track` and are printed in the startup mode (`VOLUME HOLD`, `POWER`, `TAPE2 MONITOR`). Capabilities gain `volume_hold`, `power` and `tape2_monitor`; the session gains `volume_hold_available`, `power_available` and `tape2_monitor_available`. TV1 and TV2 need no new gate: they join `available_sources` under the existing `--enable-source` ([source selection](source-selection.md)); TAPE2 stays a blocked source.
+
+### Volume hold
+
+`POST /api/v1/volume/hold` reuses the CD seek handler and its single hold registry (the service allows one hold of any kind) with the service's connection-owned volume hold: `KEY_DOWN VOLUME_UP|VOLUME_DOWN` starts `0x17 → 0xF9/0xE9`; a repeated `KEY_DOWN` on the owning connection renews it without a frame; `KEY_UP`, or closing the connection, sends STOP `0x09` then exit `0x07` ([service API](volume-step-api.md#connection-owned-volume-hold)). START uses the volume lock and 250 ms spacing shared with `VOLUME_STEP`, and refuses with `VOLUME_BUSY` (any volume hold, including CEC's), `CD_BUSY`, `FAULT_LATCHED`, `CD_FAULT_LATCHED` or `NOT_ELIGIBLE`. A successful START answers `HOLD_STARTED` with `hold_id`, `heartbeat_ms` 500, `lease_ms` 1200 (the service's inactivity limit) and `max_hold_ms` 3000. The service's `--max-hold-ms` (100–3000 ms) remains authoritative; a late keepalive after its watchdog gets `KEY_EXPIRED` and is reported `NOT_ACTIVE`, never a new press. Session, `hold_id`, CSRF, cleanup and no-retry rules are exactly those of [held FF/REW](#held-ffrew); a CD RELEASE never ends a volume hold and vice versa. Single-click `POST /api/v1/volume/step` is unchanged.
+
+**Web gesture.** With `volume_hold` available, a VOL+/VOL− `pointerdown` starts a `hold_delay_ms` (400 ms) timer. Released earlier, the gesture is the existing click: one `VOLUME_STEP`. Still held when the timer fires, it becomes a hold, and that gesture's click is suppressed until its pointer is released, so **one gesture never produces both a step and a hold**, even when the hold ended on its own before the finger lifted. Release, cancellation, blur, hiding, races and unknown outcomes follow the FF/REW rules. Without the capability, pointer events do nothing and the click still steps.
+
+### POWER
+
+`--enable-power` enables `POST /api/v1/power` with exactly `{ "action": "ON" }` or `{ "action": "OFF" }`. The service sends one ROOT frame: `0x52` ON (physically observed, from standby) or `0x62` OFF (historical; a verified reply carries `"mapping": "PROVISIONAL"`). CONTEXT `0x39` is never used. The service refuses POWER during any volume or CD hold, any STOP, CONTEXT or CD release obligation, a fault, an open research CONTEXT, an unhealthy monitor, BOOT_INHIBIT or shutdown; the Gateway also requires an eligible STATUS with CD fields, a server-wide lock and 2 s spacing. An uncertain frame is never retried and latches no fault (it leaves no obligation). The Web shows two explicit buttons and never claims a power state: there is no reliable readback, and neither the standby LED nor the switched outlets indicate it.
+
+### TAPE2 MONITOR (provisional)
+
+`--enable-tape2-monitor` enables `POST /api/v1/receiver/monitor` (body `{}`), one `TAPE2_MONITOR_TOGGLE`: the service's atomic CONTEXT `0x17 → 0x48 → 0x07`, with the same entry, exit, fault and refusal rules as TV1/TV2. `0x48` in CONTEXT is a **historical** MONITOR toggle, not yet physically validated; every reply carries `"mapping": "PROVISIONAL"`, with a server-wide lock and 1 s spacing.
+
+The TAPE2 button is the MONITOR control and indicator. Its background comes only from the passive receiver-state tracking (`receiver.monitor`, the ROOT `0x13` second frame or broadcasts: `0xD7` ON, `0xE7` OFF in waveform_lsb): **green** for a fresh (≤ 30 s), healthy, confirmed ON; **gray** for a fresh, confirmed OFF; **neutral** for UNKNOWN, LAST_KNOWN (stale), uncertain integrity or a lost connection. A successful toggle TX never changes it; only a later observed report does.
+
+Offline tests: `python3 -m unittest tests.test_gateway` (classes `RemoteV2GatewayTest` and `RealServiceVolumeHoldTest`) and `node tests/test_web_remote_v2.js`.
 
 ## Volume step (phase 1)
 

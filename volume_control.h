@@ -36,6 +36,11 @@ public:
     bool release(Direction direction, Time now);
     bool disconnect(Direction direction, Time now);
     bool mute(Time now);
+    // One CONTEXT key from IDLE only: 0x17 -> byte -> 0x07 through finish(),
+    // latching FAULT on any unverified frame. Unlike mute(), it never cancels
+    // a hold; it refuses unless IDLE with no obligations.
+    // byte_sent (optional) reports whether the key frame itself was verified.
+    bool context_key(uint8_t byte, Time now, bool *byte_sent = nullptr);
     // One bounded movement from IDLE: 0x17 -> 0xF9/0xE9 -> 0x09 -> 0x07 with
     // no added hold. Never retried as a whole; start() and finish() keep the
     // STOP/exit obligations and fault latching. Re-arm state is untouched.

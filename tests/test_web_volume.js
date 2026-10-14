@@ -12,8 +12,12 @@ const events = [];
 const elements = new Map();
 const stub = () => ({ disabled: true, dataset: {}, addEventListener() {} });
 function volumeButton(direction) {
-  return { dataset: { volumeDirection: direction }, disabled: true,
-    addEventListener(event, handler) { events.push(event); this.click = handler; } };
+  return { dataset: { volumeDirection: direction }, disabled: true, handlers: {},
+    addEventListener(event, handler) {
+      events.push(event);
+      this.handlers[event] = handler;
+      if (event === 'click') this.click = handler;
+    } };
 }
 const volume = { 'volume-up': volumeButton('UP'), 'volume-down': volumeButton('DOWN') };
 const up = volume['volume-up'];
@@ -100,7 +104,15 @@ async function main() {
   assert.equal(posts.length, 0, 'loading the page must not step');
   assert.equal(up.disabled, false);
   assert.equal(down.disabled, false);
-  assert.deepEqual([...new Set(events)], ['click'], 'phase 1: no pointer, key or hold handlers');
+  // Pointer handlers exist for the separately gated hold; without that
+  // capability a press sends nothing and the click alone steps.
+  assert.deepEqual([...new Set(events)].sort(),
+    ['click', 'contextmenu', 'lostpointercapture', 'pointercancel', 'pointerdown', 'pointerup']);
+  up.handlers.pointerdown({ button: 0, pointerId: 1, preventDefault() {} });
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  up.handlers.pointerup({});
+  await settle();
+  assert.equal(posts.length, 0, 'no hold without the volume_hold capability');
 
   // One click, one POST; both controls disabled while it is in flight.
   duringPost = () => {

@@ -5,10 +5,12 @@ const vm = require('node:vm');
 const html = fs.readFileSync('web/index.html', 'utf8');
 const css = fs.readFileSync('web/app.css', 'utf8');
 const names = ['CD', 'TUNER', 'PHONO', 'TV1', 'TV2', 'TAPE1', 'TAPE2'];
-for (const name of names) assert.match(html, new RegExp(`data-source="${name}"`));
-assert.match(html, /data-source="TAPE2"><span>TAPE2<\/span><small>MONITOR<\/small>/);
-assert.match(css, /\.source-grid button\[data-source="TAPE2"\] small/);
-assert.match(css, /button\[data-source="TAPE2"\] \{ position:relative; display:flex; align-items:center; justify-content:center; \}/);
+// Six selectable sources; the TAPE2 button is the separate MONITOR control.
+for (const name of names.slice(0, 6)) assert.match(html, new RegExp(`data-source="${name}"`));
+assert.doesNotMatch(html, /data-source="TAPE2"/);
+assert.match(html, /id="monitor-button" disabled type="button" data-monitor-state="UNKNOWN"[^>]*><span>TAPE2<\/span><small>MONITOR<\/small>/);
+assert.match(css, /\.source-grid #monitor-button small/);
+assert.match(css, /#monitor-button \{ position:relative; display:flex; align-items:center; justify-content:center; \}/);
 assert.match(css, /\.source-grid button \{ height: 54px; \}/);
 assert.match(css, /\.source-grid button\{height:52px\}/);
 
