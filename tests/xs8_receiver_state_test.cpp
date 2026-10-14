@@ -57,6 +57,49 @@ int main()
     state.observe(frame(11500, 0x7D), false);
     has(state.status_fields(), "receiver_source=PHONO"); // Older observation is stale.
 
+    // Back-to-back CONTEXT selection 0x17 -> 0x78 -> 0x07 (TV1): only each local
+    // frame's own window is excluded. The receiver's source broadcast between
+    // the key and the exit frame is observed although the exit ends later.
+    {
+        Xs8ReceiverState tv;
+        tv.observe(frame(1000, 0x73), false);
+        has(tv.status_fields(), "receiver_source=PHONO");
+        tv.note_tx(100000, 101000); // 0x17
+        tv.note_tx(101500, 102500); // 0x78
+        tv.note_tx(103000, 104000); // 0x07 (the service processes frames after it)
+        tv.observe(frame(100000, 0x7D), false); // Local frames: never state.
+        tv.observe(frame(101500, 0x7D), false);
+        tv.observe(frame(104000, 0x7D), false);
+        has(tv.status_fields(), "receiver_source=PHONO");
+        tv.observe(frame(102700, 0x7A), false);
+        has(tv.status_fields(), "receiver_source=TV1");
+        has(tv.status_fields(), "receiver_source_evidence=AFTER_LOCAL_TX");
+        // TV2 the same way; a broadcast long after the last TX is PASSIVE.
+        tv.note_tx(200000, 201000);
+        tv.note_tx(201500, 202500);
+        tv.note_tx(203000, 204000);
+        tv.observe(frame(202600, 0x71), false);
+        has(tv.status_fields(), "receiver_source=TV2");
+        tv.observe(frame(900000000, 0x7B), false);
+        has(tv.status_fields(), "receiver_source=TUNER");
+        has(tv.status_fields(), "receiver_source_evidence=PASSIVE");
+        // Bounded memory: once a window is evicted, everything up to its end
+        // is excluded, as the single horizon did before.
+        Xs8ReceiverState many;
+        for (uint64_t i = 0; i < 17; ++i) many.note_tx(1000000 + i * 10000, 1005000 + i * 10000);
+        many.observe(frame(1000500, 0x7D), false); // Up to the evicted end:
+        many.observe(frame(1004000, 0x7D), false); // excluded.
+        has(many.status_fields(), "receiver_source=UNKNOWN");
+        many.observe(frame(1018000, 0x7D), false); // Between retained windows.
+        has(many.status_fields(), "receiver_source=CD");
+        // Pending-query and suppressed frames stay excluded.
+        Xs8ReceiverState queried;
+        queried.observe(frame(5000, 0x7A), true);
+        queried.suppress_until(9000);
+        queried.observe(frame(8000, 0x7A), false);
+        has(queried.status_fields(), "receiver_source=UNKNOWN");
+    }
+
     Xs8QueryStatus query(20000, 22000);
     const xs8_monitor_record observations[] = {
         frame(20100, 0x37), frame(21000, 0x11), frame(23000, 0x14)

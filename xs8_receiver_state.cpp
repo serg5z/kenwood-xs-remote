@@ -37,10 +37,14 @@ const char *monitor_name(uint8_t legacy)
 
 void Xs8ReceiverState::note_tx(uint64_t start_ns, uint64_t end_ns)
 {
-    if (start_ns && end_ns >= start_ns && end_ns > ignore_through_ns_) {
-        ignore_through_ns_ = end_ns;
-        last_tx_end_ns_ = end_ns;
+    if (!start_ns || end_ns < start_ns) return;
+    if (tx_count_ == kTxWindows) {
+        const TxWindow& oldest = tx_windows_[0];
+        if (oldest.end_ns > evicted_through_ns_) evicted_through_ns_ = oldest.end_ns;
+        for (size_t i = 1; i < kTxWindows; ++i) tx_windows_[i - 1] = tx_windows_[i];
+        --tx_count_;
     }
+    tx_windows_[tx_count_++] = {start_ns, end_ns};
 }
 
 void Xs8ReceiverState::suppress_until(uint64_t time_ns)
@@ -71,13 +75,22 @@ void Xs8ReceiverState::observe(const xs8_monitor_record& record,
         integrity_ = false;
         return;
     }
+    const uint64_t time_ns = record.decoded.time_ns;
     if (!integrity_ || query_pending || !record.decoded.valid ||
-        record.decoded.time_ns <= ignore_through_ns_)
+        time_ns <= ignore_through_ns_ || time_ns <= evicted_through_ns_)
         return;
+    uint64_t previous_tx_end_ns = 0;
+    for (size_t i = 0; i < tx_count_; ++i) {
+        const TxWindow& tx = tx_windows_[i];
+        if (time_ns >= tx.start_ns && time_ns <= tx.end_ns)
+            return; // This frame's own local transmission.
+        if (tx.end_ns < time_ns && tx.end_ns > previous_tx_end_ns)
+            previous_tx_end_ns = tx.end_ns;
+    }
     // A recent local command may cause observed traffic, but the observation
     // itself, rather than TX completion, supplies the state evidence.
-    const char *evidence = last_tx_end_ns_ &&
-        record.decoded.time_ns - last_tx_end_ns_ <= 500000000ULL
+    const char *evidence = previous_tx_end_ns &&
+        time_ns - previous_tx_end_ns <= 500000000ULL
         ? "AFTER_LOCAL_TX" : "PASSIVE";
     update_source(record.decoded.legacy_msb_short1,
                   record.decoded.time_ns, evidence, false);
