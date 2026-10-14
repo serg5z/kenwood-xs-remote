@@ -92,6 +92,15 @@ int main()
         has(many.status_fields(), "receiver_source=UNKNOWN");
         many.observe(frame(1018000, 0x7D), false); // Between retained windows.
         has(many.status_fields(), "receiver_source=CD");
+        // CD_STOP is ROOT 0xA1, the TV1 broadcast value (legacy 0x7A): the
+        // service's own STOP frame never reads as TV1; a later broadcast does.
+        Xs8ReceiverState stop;
+        stop.observe(frame(1000, 0x7D), false);
+        stop.note_tx(300000, 301000);
+        stop.observe(frame(300000, 0x7A), false);
+        has(stop.status_fields(), "receiver_source=CD");
+        stop.observe(frame(302000, 0x7A), false);
+        has(stop.status_fields(), "receiver_source=TV1");
         // Pending-query and suppressed frames stay excluded.
         Xs8ReceiverState queried;
         queried.observe(frame(5000, 0x7A), true);

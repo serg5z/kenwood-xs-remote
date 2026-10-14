@@ -155,13 +155,13 @@ class ServiceSocketTest(unittest.TestCase):
                              ("CD_STOP", "STOP")):
             self.assertEqual(self.request(line), "OK CD_TRANSPORT_TX action=" + action +
                              " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED")
-        self.assertEqual(self.transmitted(), ["0x41", "0xBC", "0x9C"])
+        self.assertEqual(self.transmitted(), ["0x41", "0xBC", "0xA1"])
         token = self.press("SEEK_BACKWARD")
         for line in ("CD_PLAY", "CD_PLAY_PAUSE", "CD_STOP"):
             self.assertEqual(self.request(line), "ERR CD_TRACK_BUSY")
         self.assertTrue(self.request("CD_RELEASE " + token).startswith("OK CD_RELEASE_TX"))
         self.assertEqual(self.request("CD_STOP").split()[:2], ["OK", "CD_TRANSPORT_TX"])
-        self.assertEqual(self.transmitted(), ["0x41", "0xBC", "0x9C", "0x6A", "0x72", "0x9C"])
+        self.assertEqual(self.transmitted(), ["0x41", "0xBC", "0xA1", "0x6A", "0x72", "0xA1"])
         status = self.request("STATUS")
         for field in ("cd_state=IDLE", "cd_action=STOP", "cd_last_result=TX_VERIFIED"):
             self.assertIn(field, status)

@@ -544,8 +544,10 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
         return cd_press(0x6A, "SEEK_BACKWARD", now);
     if (line.compare(0, 9, "CD_PRESS ") == 0)
         return "ERR CD_UNKNOWN_ACTION\n";
-    // Single ROOT key frames with no KEY UP: 0x41 and 0x9C are physically
-    // observed; 0xBC is a historical PLAY/PAUSE mapping, not yet verified.
+    // Single ROOT key frames with no KEY UP: 0x41 is physically observed. CD STOP
+    // is ROOT 0xA1 (physically observed through CD_STOP on the KR-V6070; the earlier
+    // 0x9C could provoke a changer restart on a following TV1/TV2 selection).
+    // 0xBC is a historical PLAY/PAUSE mapping, not yet verified.
     // ROOT 0x52 is physically observed; 0x62 is historical. Never CONTEXT 0x39.
     if (line == "POWER_ON") return power(0x52, "ON");
     if (line == "POWER_OFF") return power(0x62, "OFF");
@@ -553,7 +555,7 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
     if (line == "TAPE2_MONITOR_TOGGLE") return context_key_command(0x48, "TAPE2_MONITOR", now);
     if (line == "CD_PLAY") return cd_transport(0x41, "PLAY");
     if (line == "CD_PLAY_PAUSE") return cd_transport(0xBC, "PLAY_PAUSE");
-    if (line == "CD_STOP") return cd_transport(0x9C, "STOP");
+    if (line == "CD_STOP") return cd_transport(0xA1, "STOP");
     if (line == "CD_TRACK_NEXT") return cd_track(0xFC, "NEXT");
     if (line == "CD_TRACK_PREVIOUS") return cd_track(0xEC, "PREVIOUS");
     if (line.compare(0, 14, "SELECT_SOURCE ") == 0) {

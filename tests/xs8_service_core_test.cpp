@@ -1325,7 +1325,7 @@ static void test_cd_transport_keys()
     using Bytes = std::vector<uint8_t>;
     struct Key { const char *line; uint8_t byte; const char *action; };
     const Key keys[] = {{"CD_PLAY", 0x41, "PLAY"}, {"CD_PLAY_PAUSE", 0xBC, "PLAY_PAUSE"},
-                        {"CD_STOP", 0x9C, "STOP"}};
+                        {"CD_STOP", 0xA1, "STOP"}};
     for (const auto& key : keys) {
         FakeTx tx;
         Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });

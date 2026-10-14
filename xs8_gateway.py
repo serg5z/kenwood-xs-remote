@@ -48,7 +48,8 @@ CD_TRACK_INTERVAL_RANGE_MS = (200, 1000)
 # Experimental: 0 removes the cooldown. Serialization, STATUS, CSRF and reply
 # checks still apply, and each XS8 pair still completes before the next starts.
 CD_TRACK_INTERVAL_OFF = 0
-# Single ROOT key frames. 0x9C STOP is physically observed; 0xBC PLAY/PAUSE is a
+# Single ROOT key frames, mapped to bytes only by the service. STOP (ROOT 0xA1,
+# formerly 0x9C) is physically observed; 0xBC PLAY/PAUSE is a
 # historical mapping that is not yet physically verified.
 CD_PLAYBACK_COMMANDS = {"PLAY_PAUSE": "CD_PLAY_PAUSE", "STOP": "CD_STOP"}
 CD_PLAYBACK_ACTIONS = tuple(CD_PLAYBACK_COMMANDS)
@@ -85,8 +86,9 @@ POWER_PROVISIONAL_ACTIONS = ("OFF",)
 POWER_INTERVAL_MS = 2000
 # CONTEXT 0x48: historical TAPE2 MONITOR toggle, not yet physically validated.
 TAPE2_MONITOR_INTERVAL_MS = 1000
-# Leaving a freshly observed CD source stops the changer first: CD_STOP (0x9C,
-# physically observed), then SELECT_SOURCE. Selecting CD never stops it.
+# Leaving a freshly observed CD source stops the changer first: the same CD_STOP
+# as the Web STOP button (ROOT 0xA1), then SELECT_SOURCE. Selecting CD never
+# stops it.
 SOURCES_STOPPING_CD = ("TUNER", "PHONO", "TV1", "TV2", "TAPE1")
 # Every server-wide control lock a source request holds, so no CD, volume, power
 # or MONITOR request can run between its CD_STOP and its SELECT_SOURCE.
@@ -615,7 +617,7 @@ def capabilities(mute_available=False, source_available=False, query_available=F
                 "available_actions": list(CD_PLAYBACK_ACTIONS),
                 "provisional_actions": list(CD_PROVISIONAL_ACTIONS),
                 "min_interval_ms": cd_track_interval_ms,
-                "reason": "STOP 0x9C is physically observed; PLAY/PAUSE 0xBC is a historical mapping not yet physically verified",
+                "reason": "STOP 0xA1 is physically observed; PLAY/PAUSE 0xBC is a historical mapping not yet physically verified",
             },
             "volume_hold": {
                 "classification": "unverified", "enabled": volume_hold_available,
