@@ -19,11 +19,14 @@ $(BUILD_DIR)/xs8_rt.o: xs8_rt.c xs8_rt.h | $(BUILD_DIR)
 $(BUILD_DIR)/xs8_decode.o: xs8_decode.c xs8_decode.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -std=c11 -c xs8_decode.c -o $@
 
-$(BUILD_DIR)/xs8_monitor.o: xs8_monitor.c xs8_monitor.h xs8_decode.h xs8_gpio.h | $(BUILD_DIR)
+$(BUILD_DIR)/xs8_monitor.o: xs8_monitor.c xs8_monitor.h xs8_monitor_fault.h xs8_decode.h xs8_gpio.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -std=c11 -pthread -c xs8_monitor.c -o $@
 
-$(BUILD_DIR)/cec-xs-bridge: main.cpp volume_control.cpp volume_control.h xs8_gpio.h xs8_monitor.h $(BUILD_DIR)/xs8_gpio.o $(BUILD_DIR)/xs8_rt.o $(BUILD_DIR)/xs8_decode.o $(BUILD_DIR)/xs8_monitor.o
-	$(CXX) $(CXXFLAGS) main.cpp volume_control.cpp $(BUILD_DIR)/xs8_gpio.o $(BUILD_DIR)/xs8_rt.o $(BUILD_DIR)/xs8_decode.o $(BUILD_DIR)/xs8_monitor.o -o $@ -lcec -ldl -pthread -lgpiod
+$(BUILD_DIR)/xs8_monitor_fault.o: xs8_monitor_fault.c xs8_monitor_fault.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -std=c11 -c xs8_monitor_fault.c -o $@
+
+$(BUILD_DIR)/cec-xs-bridge: main.cpp volume_control.cpp volume_control.h xs8_gpio.h xs8_monitor.h $(BUILD_DIR)/xs8_gpio.o $(BUILD_DIR)/xs8_rt.o $(BUILD_DIR)/xs8_decode.o $(BUILD_DIR)/xs8_monitor.o $(BUILD_DIR)/xs8_monitor_fault.o
+	$(CXX) $(CXXFLAGS) main.cpp volume_control.cpp $(BUILD_DIR)/xs8_gpio.o $(BUILD_DIR)/xs8_rt.o $(BUILD_DIR)/xs8_decode.o $(BUILD_DIR)/xs8_monitor.o $(BUILD_DIR)/xs8_monitor_fault.o -o $@ -lcec -ldl -pthread -lgpiod
 
 $(BUILD_DIR)/cec-xs-client: cec_xs_client.cpp cec_client_core.cpp cec_client_core.h cec_service_socket.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) cec_xs_client.cpp cec_client_core.cpp -o $@ -lcec -ldl -pthread
@@ -31,15 +34,17 @@ $(BUILD_DIR)/cec-xs-client: cec_xs_client.cpp cec_client_core.cpp cec_client_cor
 $(BUILD_DIR)/xs8_send: xs8_send.c xs8_gpio.h $(BUILD_DIR)/xs8_gpio.o $(BUILD_DIR)/xs8_rt.o
 	$(CC) $(CFLAGS) -std=c11 xs8_send.c $(BUILD_DIR)/xs8_gpio.o $(BUILD_DIR)/xs8_rt.o -o $@ -pthread -lgpiod
 
-$(BUILD_DIR)/xs8-service: xs8_service.cpp xs8_service_core.cpp xs8_service_core.h xs8_cd_probe.cpp xs8_cd_probe.h xs8_query_status.cpp xs8_query_status.h xs8_receiver_state.cpp xs8_receiver_state.h xs8_research.cpp xs8_research.h volume_control.cpp volume_control.h xs8_gpio.h xs8_monitor.h $(BUILD_DIR)/xs8_gpio.o $(BUILD_DIR)/xs8_rt.o $(BUILD_DIR)/xs8_decode.o $(BUILD_DIR)/xs8_monitor.o
-	$(CXX) $(CXXFLAGS) xs8_service.cpp xs8_service_core.cpp xs8_cd_probe.cpp xs8_query_status.cpp xs8_receiver_state.cpp xs8_research.cpp volume_control.cpp $(BUILD_DIR)/xs8_gpio.o $(BUILD_DIR)/xs8_rt.o $(BUILD_DIR)/xs8_decode.o $(BUILD_DIR)/xs8_monitor.o -o $@ -pthread -lgpiod
+$(BUILD_DIR)/xs8-service: xs8_service.cpp xs8_service_core.cpp xs8_service_core.h xs8_cd_probe.cpp xs8_cd_probe.h xs8_query_status.cpp xs8_query_status.h xs8_receiver_state.cpp xs8_receiver_state.h xs8_research.cpp xs8_research.h volume_control.cpp volume_control.h xs8_gpio.h xs8_monitor.h $(BUILD_DIR)/xs8_gpio.o $(BUILD_DIR)/xs8_rt.o $(BUILD_DIR)/xs8_decode.o $(BUILD_DIR)/xs8_monitor.o $(BUILD_DIR)/xs8_monitor_fault.o
+	$(CXX) $(CXXFLAGS) xs8_service.cpp xs8_service_core.cpp xs8_cd_probe.cpp xs8_query_status.cpp xs8_receiver_state.cpp xs8_research.cpp volume_control.cpp $(BUILD_DIR)/xs8_gpio.o $(BUILD_DIR)/xs8_rt.o $(BUILD_DIR)/xs8_decode.o $(BUILD_DIR)/xs8_monitor.o $(BUILD_DIR)/xs8_monitor_fault.o -o $@ -pthread -lgpiod
 
 $(BUILD_DIR)/volume_control_test: volume_control.cpp volume_control.h tests/volume_control_test.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -Werror -I. volume_control.cpp tests/volume_control_test.cpp -o $@
 
-test: $(BUILD_DIR)/volume_control_test $(BUILD_DIR)/xs8_decode_test $(BUILD_DIR)/xs8_rt_test $(BUILD_DIR)/xs8_service_core_test $(BUILD_DIR)/xs8_query_status_test $(BUILD_DIR)/xs8_cd_probe_test $(BUILD_DIR)/xs8_receiver_state_test $(BUILD_DIR)/xs8_research_test $(BUILD_DIR)/cec_client_core_test $(BUILD_DIR)/cec_service_socket_test $(BUILD_DIR)/xs8_service_socket_test
+test: $(BUILD_DIR)/volume_control_test $(BUILD_DIR)/xs8_decode_test $(BUILD_DIR)/xs8_monitor_fault_test $(BUILD_DIR)/xs8_monitor_test $(BUILD_DIR)/xs8_rt_test $(BUILD_DIR)/xs8_service_core_test $(BUILD_DIR)/xs8_query_status_test $(BUILD_DIR)/xs8_cd_probe_test $(BUILD_DIR)/xs8_receiver_state_test $(BUILD_DIR)/xs8_research_test $(BUILD_DIR)/cec_client_core_test $(BUILD_DIR)/cec_service_socket_test $(BUILD_DIR)/xs8_service_socket_test
 	./$(BUILD_DIR)/volume_control_test
 	./$(BUILD_DIR)/xs8_decode_test
+	./$(BUILD_DIR)/xs8_monitor_fault_test
+	./$(BUILD_DIR)/xs8_monitor_test
 	./$(BUILD_DIR)/xs8_rt_test
 	./$(BUILD_DIR)/xs8_service_core_test
 	./$(BUILD_DIR)/xs8_query_status_test
@@ -53,6 +58,13 @@ test: $(BUILD_DIR)/volume_control_test $(BUILD_DIR)/xs8_decode_test $(BUILD_DIR)
 
 $(BUILD_DIR)/xs8_decode_test: xs8_decode.c xs8_decode.h tests/xs8_decode_test.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -std=c11 -Werror -I. xs8_decode.c tests/xs8_decode_test.c -o $@
+
+$(BUILD_DIR)/xs8_monitor_fault_test: xs8_monitor_fault.c xs8_monitor_fault.h tests/xs8_monitor_fault_test.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -std=c11 -Werror -I. xs8_monitor_fault.c tests/xs8_monitor_fault_test.c -o $@
+
+# Real xs8_monitor.c against a scripted libgpiod (tests/stubs/monitor/gpiod.h).
+$(BUILD_DIR)/xs8_monitor_test: xs8_monitor.c xs8_monitor.h xs8_monitor_fault.c xs8_monitor_fault.h xs8_decode.c xs8_decode.h xs8_gpio.h tests/stubs/monitor/gpiod.h tests/xs8_monitor_test.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -std=c11 -Werror -pthread -Itests/stubs/monitor -I. xs8_monitor.c xs8_monitor_fault.c xs8_decode.c tests/xs8_monitor_test.c -o $@
 
 $(BUILD_DIR)/xs8_rt_test: xs8_rt.c xs8_rt.h tests/xs8_rt_test.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -std=c11 -Werror -pthread -I. xs8_rt.c tests/xs8_rt_test.c -o $@

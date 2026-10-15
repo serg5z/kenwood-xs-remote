@@ -2,6 +2,7 @@
 #include "xs8_monitor.h"
 #include "xs8_gpio.h"
 #include "xs8_decode.h"
+#include "xs8_monitor_fault.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -24,11 +25,9 @@ struct xs8_monitor {
     pthread_t thread;
     atomic_bool stop;
     uint64_t total_events, busy_edges, data_edges;
-    uint64_t sequence_gaps, missing_events, sequence_regressions;
-    uint64_t timestamp_regressions, last_sequence, last_timestamp;
+    struct xs8_capture_state capture;
     uint64_t incomplete_gap_frames, dropped_frame_logs;
     unsigned int max_batch;
-    bool timestamp_seen;
     pthread_mutex_t observation_lock;
     pthread_cond_t observation_changed;
     struct xs8_monitor_record observations[OBS_HISTORY];
@@ -77,10 +76,26 @@ static void monitor_failed(struct xs8_monitor *monitor)
     pthread_mutex_unlock(&monitor->observation_lock);
 }
 
+/* Reports the first capture fault once, outside the per-edge loop. */
+static void log_capture_fault(struct xs8_monitor *monitor)
+{
+    if (!monitor->capture.fault_recorded || monitor->capture.fault_logged)
+        return;
+    monitor->capture.fault_logged = true;
+    char line[384];
+    if (xs8_capture_format_fault(&monitor->capture, BUSY_GPIO, DATA_GPIO,
+                                 line, sizeof(line)) > 0)
+        fprintf(stderr, "%s\n", line);
+}
+
 static void log_decoded_batch(struct xs8_monitor *monitor,
                               struct decoded_batch *batch)
 {
-    if (batch->dropped) monitor_failed(monitor);
+    if (batch->dropped) {
+        xs8_capture_note_overflow(&monitor->capture, batch->dropped,
+                                  batch->current_event_ns);
+        monitor_failed(monitor);
+    }
     for (size_t i = 0; i < batch->count; ++i) {
         const struct xs8_decoded *result = &batch->results[i].decoded;
         record_observation(monitor, result, batch->results[i].end_ns);
@@ -135,29 +150,17 @@ static int read_events(struct xs8_monitor *monitor)
         ++monitor->total_events;
         if (edge.gpio == BUSY_GPIO) ++monitor->busy_edges;
         else if (edge.gpio == DATA_GPIO) ++monitor->data_edges;
-        if (edge.sequence > monitor->last_sequence + 1) {
+        if (xs8_capture_check(&monitor->capture, edge.gpio, edge.sequence,
+                gpiod_edge_event_get_line_seqno(event), edge.time_ns,
+                monitor->total_events))
             capture_fault = true;
-            ++monitor->sequence_gaps;
-            monitor->missing_events +=
-                edge.sequence - monitor->last_sequence - 1;
-        } else if (edge.sequence <= monitor->last_sequence) {
-            capture_fault = true;
-            ++monitor->sequence_regressions;
-        }
-        if (monitor->timestamp_seen &&
-            edge.time_ns < monitor->last_timestamp) {
-            capture_fault = true;
-            ++monitor->timestamp_regressions;
-        }
-        monitor->last_sequence = edge.sequence;
-        monitor->last_timestamp = edge.time_ns;
-        monitor->timestamp_seen = true;
         decoded.current_event_ns = edge.time_ns;
         xs8_decoder_edge(&monitor->decoder, &edge,
                          collect_decoded, &decoded);
     }
     log_decoded_batch(monitor, &decoded);
     if (capture_fault) monitor_failed(monitor);
+    log_capture_fault(monitor);
     return 0;
 }
 
@@ -196,9 +199,10 @@ int xs8_monitor_poll(struct xs8_monitor *monitor, int timeout_ms)
 static void finish_monitor(struct xs8_monitor *monitor)
 {
     struct decoded_batch decoded = {0};
-    decoded.current_event_ns = monitor->last_timestamp;
+    decoded.current_event_ns = monitor->capture.last_timestamp;
     xs8_decoder_flush(&monitor->decoder, collect_decoded, &decoded);
     log_decoded_batch(monitor, &decoded);
+    log_capture_fault(monitor);
     monitor_failed(monitor);
     fprintf(stderr, "XS8 OBSERVED_BUS summary total_events=%llu "
                     "busy_edges=%llu data_edges=%llu global_sequence_gaps=%llu "
@@ -208,10 +212,10 @@ static void finish_monitor(struct xs8_monitor *monitor)
             (unsigned long long)monitor->total_events,
             (unsigned long long)monitor->busy_edges,
             (unsigned long long)monitor->data_edges,
-            (unsigned long long)monitor->sequence_gaps,
-            (unsigned long long)monitor->missing_events,
-            (unsigned long long)monitor->sequence_regressions,
-            (unsigned long long)monitor->timestamp_regressions,
+            (unsigned long long)monitor->capture.sequence_gaps,
+            (unsigned long long)monitor->capture.missing_events,
+            (unsigned long long)monitor->capture.sequence_regressions,
+            (unsigned long long)monitor->capture.timestamp_regressions,
             monitor->max_batch,
             (unsigned long long)monitor->incomplete_gap_frames,
             (unsigned long long)monitor->dropped_frame_logs);
@@ -284,11 +288,19 @@ static int start_monitor(struct xs8_gpio *bus, struct xs8_monitor **out,
     }
     pthread_mutex_lock(&bus->rx_lock);
     int busy = gpiod_line_request_get_value(bus->rx_req, BUSY_GPIO);
+    /* Diagnostic only: an unreadable DATA level is reported, never fatal. */
+    int data = busy < 0 ? -1 : gpiod_line_request_get_value(bus->rx_req, DATA_GPIO);
     pthread_mutex_unlock(&bus->rx_lock);
     if (busy < 0) {
         goto start_fail;
     }
     xs8_decoder_init(&monitor->decoder, busy == 0);
+    int64_t armed_ns = xs8_gpio_now_ns();
+    monitor->capture.armed_ns = armed_ns > 0 ? (uint64_t)armed_ns : 0;
+    char armed[128];
+    if (xs8_capture_format_armed(monitor->capture.armed_ns, busy, data,
+                                 armed, sizeof(armed)) > 0)
+        fprintf(stderr, "%s\n", armed);
     atomic_init(&monitor->stop, false);
     atomic_init(&monitor->healthy, true);
     int error = 0;
