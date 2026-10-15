@@ -28,9 +28,9 @@ server {
         # Overwrite any client-supplied identity after nginx authentication.
         proxy_set_header X-Kenwood-Authenticated-User $remote_user;
         proxy_connect_timeout 2s;
-        # Above the Gateway's worst case for leaving CD (1 s STATUS + two 3 s
-        # replies) and below the browser's 9 s source timeout.
-        proxy_read_timeout 8s;
+        # Above the Gateway's worst case for leaving CD (1 s STATUS + three 3 s
+        # replies: SELECT_SOURCE, CD_STOP, SYNC) and below the browser's 12 s.
+        proxy_read_timeout 11s;
         proxy_next_upstream off;
     }
 }

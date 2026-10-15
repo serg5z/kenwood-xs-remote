@@ -41,16 +41,16 @@ function page(state) {
     async fetch(url, options = {}) {
       if (url === '/api/v1/status') return { ok: true, json: async () => ({
         gateway: 'online', xs8_service: 'connected', receiver: state.receiver,
-        status: { state: 'IDLE', monitor: 'HEALTHY', stop_owed: '0',
-          context_may_be_open: '0', last_byte: '0x07', last_gpio_tx: 'TX_OK',
+        status: { state: 'IDLE', monitor: 'HEALTHY', stop_owed: '0', cd_state: 'IDLE',
+          cd_release_owed: '0', context_may_be_open: '0', last_byte: '0x07', last_gpio_tx: 'TX_OK',
           last_waveform: 'MATCH' } }) };
       if (url === '/api/v1/session') return { ok: true, json: async () => ({
         csrf_token: `token-${state.tokens += 1}`, source_available: true,
-        receiver_query_available: true }) };
+        receiver_query_available: true, tape2_monitor_available: true }) };
       if (url === '/api/v1/capabilities') return { ok: true, json: async () => ({
         operations: { source: { enabled: true,
           available_sources: ['CD', 'TUNER', 'PHONO', 'VIDEO1', 'VIDEO2', 'TAPE1'] },
-        receiver_query: { enabled: true } } }) };
+        receiver_query: { enabled: true }, tape2_monitor: { enabled: true } } }) };
       if (options.method === 'POST') {
         ui.posts.push(url);
         const reply = state.onPost(url, JSON.parse(options.body));
@@ -154,9 +154,158 @@ async function monitorConsistency() {
   assert.match(css, /#monitor-button\[data-monitor-state="ON"\] small::after \{ content:" ON"; \}/);
 }
 
+// The Gateway ends a source or MONITOR control with SYNC. The indicators still
+// follow only the service's recorded observation, read by the refresh after the
+// POST: a recorded SYNC whose observation is not fresh and healthy stays neutral,
+// and a failed SYNC leaves the last observation in place. Exactly one POST each.
+async function automaticSync() {
+  const state = { tokens: 0, receiver: { source: fresh('CD'), monitor: fresh('OFF'),
+    integrity: 'HEALTHY' } };
+  const tx = { result: 'SERVICE_TX_OK', gpio_tx: 'TX_OK', waveform: 'MATCH',
+    receiver_execution: 'UNVERIFIED' };
+  const ui = page(state);
+  await settle();
+  const button = () => ui.element('monitor-button').dataset.monitorState;
+  const status = () => ui.element('availability-text').textContent;
+  assert.equal(button(), 'OFF');
+
+  // MONITOR -> SYNC recorded a fresh ON: shown from the observation.
+  state.onPost = (url) => {
+    assert.equal(url, '/api/v1/receiver/monitor');
+    state.receiver = { ...state.receiver, monitor: { ...fresh('ON'), evidence: 'QUERY' } };
+    return { ...tx, mapping: 'PROVISIONAL', sync: { result: 'OBSERVATION_RECORDED' } };
+  };
+  await ui.element('monitor-button').click();
+  await settle();
+  assert.equal(button(), 'ON');
+  assert.match(status(), /^MONITOR TOGGLE TX VERIFIED · SYNC RECORDED · SEE OBSERVED MONITOR/);
+
+  // SYNC failed: the TX result never moves the indicator; nothing is resent.
+  await new Promise((resolve) => setTimeout(resolve, 1050));
+  state.onPost = () => ({ ...tx, mapping: 'PROVISIONAL', sync: { result: 'SERVICE_UNCERTAIN' } });
+  await ui.element('monitor-button').click();
+  await settle();
+  assert.equal(button(), 'ON');
+  assert.match(status(), /SYNC SERVICE_UNCERTAIN · STATE SHOWN ONLY WHEN OBSERVED/);
+
+  // SYNC recorded but the observation is uncertain: neutral, never inferred.
+  state.onPost = () => {
+    state.receiver = { ...state.receiver, monitor: fresh('OFF'), integrity: 'UNCERTAIN' };
+    return { ...tx, mapping: 'PROVISIONAL', sync: { result: 'OBSERVATION_RECORDED' } };
+  };
+  await ui.element('monitor-button').click();
+  await settle();
+  assert.equal(button(), 'UNKNOWN');
+
+  // Source: the recorded VIDEO1 observation is shown; a stale one is not fresh.
+  state.receiver = { source: fresh('CD'), monitor: fresh('OFF'), integrity: 'HEALTHY' };
+  await ui.poll();
+  await settle();
+  const video1 = ui.sources.find((b) => b.dataset.source === 'VIDEO1');
+  state.onPost = (url, body) => {
+    assert.deepEqual([url, body], ['/api/v1/source', { source: 'VIDEO1' }]);
+    state.receiver = { ...state.receiver, source: { ...fresh('VIDEO1'), evidence: 'QUERY' } };
+    return { ...tx, source: 'VIDEO1', cd_stop: tx, sync: { result: 'OBSERVATION_RECORDED' } };
+  };
+  await video1.click();
+  await settle();
+  assert.deepEqual(observed(ui), ['VIDEO1']);
+  assert.match(sourceText(ui), /^OBSERVED SOURCE VIDEO1 · FRESH$/);
+  await new Promise((resolve) => setTimeout(resolve, 1050));
+  state.onPost = () => {
+    state.receiver = { ...state.receiver, source: { value: 'VIDEO1', freshness: 'LAST_KNOWN' } };
+    return { ...tx, sync: { result: 'OBSERVATION_FAILED' } };
+  };
+  await ui.sources.find((b) => b.dataset.source === 'TUNER').click();
+  await settle();
+  assert.doesNotMatch(sourceText(ui), /TUNER/);
+  assert.doesNotMatch(sourceText(ui), /FRESH/);
+  assert.deepEqual(ui.posts, ['/api/v1/receiver/monitor', '/api/v1/receiver/monitor',
+    '/api/v1/receiver/monitor', '/api/v1/source', '/api/v1/source'], 'one POST per press');
+}
+
+// SYNC readback: the message names what the receiver reported (and a mismatch),
+// a failure names the service's reason, and an observation made before the
+// latest command is never highlighted, even if the service still reports it.
+async function syncReadback() {
+  const seen = (value, ns) => ({ value, freshness: 'FRESH', observed_mono_ns: ns });
+  const state = { tokens: 0, receiver: { source: seen('CD', 100), monitor: seen('OFF', 100),
+    integrity: 'HEALTHY' } };
+  const tx = { result: 'SERVICE_TX_OK', gpio_tx: 'TX_OK', waveform: 'MATCH',
+    receiver_execution: 'UNVERIFIED' };
+  const ui = page(state);
+  await settle();
+  const status = () => ui.element('availability-text').textContent;
+  const click = async (name) => {
+    await ui.sources.find((b) => b.dataset.source === name).click();
+    await settle();
+  };
+  const pause = () => new Promise((resolve) => setTimeout(resolve, 1050));
+  assert.deepEqual(observed(ui), ['CD']);
+
+  state.onPost = () => {
+    state.receiver = { ...state.receiver, source: seen('TUNER', 600) };
+    return { ...tx, sync: { result: 'OBSERVATION_RECORDED', observed_source: 'TUNER',
+      observed_monitor: 'OFF', requested: 'TUNER', match: true, since_mono_ns: 500 } };
+  };
+  await click('TUNER');
+  assert.equal(status(), 'TUNER TX REPORTED · RECEIVER REPORTS TUNER');
+  assert.deepEqual(observed(ui), ['TUNER']);
+
+  // Mismatch: the receiver's report is what is highlighted, with a warning.
+  await pause();
+  state.onPost = () => {
+    state.receiver = { ...state.receiver, source: seen('CD', 1100) };
+    return { ...tx, sync: { result: 'OBSERVATION_RECORDED', observed_source: 'CD',
+      observed_monitor: 'OFF', requested: 'VIDEO1', match: false, since_mono_ns: 1000 } };
+  };
+  await click('VIDEO1');
+  assert.equal(status(), 'VIDEO1 TX REPORTED · RECEIVER REPORTS CD · CHECK RECEIVER');
+  assert.deepEqual(observed(ui), ['CD']);
+
+  // Failed SYNC: the pre-command CD is still reported but is not current.
+  await pause();
+  state.onPost = () => ({ ...tx, sync: { result: 'OBSERVATION_FAILED', reason: 'NO_REPLY',
+    requested: 'PHONO', match: null, since_mono_ns: 2000 } });
+  await click('PHONO');
+  assert.equal(status(), 'PHONO TX REPORTED · SYNC NO_REPLY · SELECTION UNVERIFIED');
+  assert.deepEqual(observed(ui), [], 'nothing highlighted from before the command');
+  assert.match(sourceText(ui), /^OBSERVED SOURCE UNKNOWN · AWAITING OBSERVATION$/);
+  // A later observation (passive broadcast) is shown by the ordinary poll.
+  state.receiver = { ...state.receiver, source: seen('PHONO', 2500) };
+  await ui.poll();
+  await settle();
+  assert.deepEqual(observed(ui), ['PHONO']);
+  assert.match(sourceText(ui), /^OBSERVED SOURCE PHONO · FRESH$/);
+
+  // MONITOR: the same guard applies to the indicator.
+  const monitor = () => ui.element('monitor-button').dataset.monitorState;
+  assert.equal(monitor(), 'OFF');
+  state.onPost = () => ({ ...tx, mapping: 'PROVISIONAL', sync: { result: 'OBSERVATION_FAILED',
+    reason: 'BUS_ACTIVE', expected_monitor: 'ON', match: null, since_mono_ns: 3000 } });
+  await ui.element('monitor-button').click();
+  await settle();
+  assert.equal(monitor(), 'UNKNOWN');
+  assert.match(ui.element('monitor-status').textContent, /AWAITING OBSERVATION/);
+  assert.equal(status(), 'MONITOR TOGGLE TX VERIFIED · SYNC BUS_ACTIVE · STATE SHOWN ONLY WHEN OBSERVED');
+  state.onPost = () => {
+    state.receiver = { ...state.receiver, monitor: seen('ON', 4100) };
+    return { ...tx, mapping: 'PROVISIONAL', sync: { result: 'OBSERVATION_RECORDED',
+      observed_source: 'PHONO', observed_monitor: 'ON', expected_monitor: null, match: null,
+      since_mono_ns: 4000 } };
+  };
+  await ui.element('monitor-button').click();
+  await settle();
+  assert.equal(monitor(), 'ON');
+  assert.equal(status(), 'MONITOR TOGGLE TX VERIFIED · RECEIVER REPORTS MONITOR ON');
+  assert.equal(ui.posts.length, 5, 'one POST per press, never repeated');
+}
+
 async function main() {
   await sourceAfterSelection();
   await monitorConsistency();
+  await automaticSync();
+  await syncReadback();
   process.stdout.write('Web state synchronization offline tests passed\n');
 }
 

@@ -106,6 +106,18 @@ async function main() {
     /^TUNER TX REPORTED · CD STOP REJECTED · CHECK CHANGER$/],
     [0, { ok: true, data: { result: 'SERVICE_TX_OK', receiver_execution: 'UNVERIFIED' } },
     /^CD TX REPORTED · SELECTION UNVERIFIED$/],
+    // The Gateway's final SYNC: reported apart from the control, never claimed
+    // as the selection itself; a failed SYNC never repeats the control.
+    [3, { ok: true, data: { result: 'SERVICE_TX_OK', source: 'VIDEO1', ...tx, cd_stop: tx,
+      sync: { result: 'OBSERVATION_RECORDED' } } },
+    /^VIDEO1 TX REPORTED · CD STOP TX REPORTED · SYNC RECORDED · SEE OBSERVED SOURCE$/],
+    [4, { ok: true, data: { result: 'SERVICE_TX_OK', ...tx, sync: { result: 'OBSERVATION_FAILED' } } },
+    /^VIDEO2 TX REPORTED · SYNC OBSERVATION_FAILED · SELECTION UNVERIFIED$/],
+    [2, { ok: true, data: { result: 'SERVICE_TX_OK', ...tx, cd_stop: tx,
+      sync: { result: 'TIMEOUT' } } },
+    /^PHONO TX REPORTED · CD STOP TX REPORTED · SYNC TIMEOUT · SELECTION UNVERIFIED$/],
+    [1, { ok: true, data: { result: 'SERVICE_TX_OK', ...tx, sync: { result: 'NOT_ENABLED' } } },
+    /^TUNER TX REPORTED · SELECTION UNVERIFIED$/],
     // A lost or timed-out response may have sent either command.
     [4, { lost: true }, /^SOURCE RESULT UNKNOWN · CHECK RECEIVER AND CHANGER$/],
   ];
@@ -116,8 +128,8 @@ async function main() {
     delays.length = 0;
     await buttons[index].click();
     assert.equal(posts.length, before + 1);
-    // Two service commands: the source request outlasts the Gateway's worst case.
-    assert.ok(delays.includes(9000) && !delays.includes(6000), String(delays));
+    // Up to three service commands: the request outlasts the Gateway's worst case.
+    assert.ok(delays.includes(12000) && !delays.includes(6000), String(delays));
     assert.match(text(), message);
     now += 1001;
     refresh();

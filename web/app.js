@@ -27,9 +27,11 @@ let enabledSeekDirections = [];
 let seekHeartbeatMs = 500;
 let seekMaxHoldMs = 10000;
 const SEEK_REQUEST_TIMEOUT_MS = 4000;
-// Leaving CD is two service commands (SELECT_SOURCE, then CD_STOP): the Gateway's
-// worst case is a 1 s STATUS read plus two 3 s replies. Other controls send one.
-const SOURCE_REQUEST_TIMEOUT_MS = 9000;
+// A source request is up to three service commands (SELECT_SOURCE, CD_STOP when
+// leaving CD, then SYNC) and MONITOR two (toggle, SYNC): the Gateway's worst case
+// is a 1 s STATUS read plus three 3 s replies, under nginx's 11 s. Other controls
+// send one command.
+const SYNCED_REQUEST_TIMEOUT_MS = 12000;
 const CONTROL_REQUEST_TIMEOUT_MS = 6000;
 // The active hold (CD seek or volume):
 // { kind, button, direction, token, holdId, phase, cancelled, reason, started, pointerId, timer, wake }
@@ -77,6 +79,10 @@ let controlResult = null;
 let refreshController = null;
 let refreshVersion = 0;
 let lastReceiver = null;
+// Monotonic time (service clock) just before the latest source / MONITOR command,
+// from the Gateway's SYNC result: an older observation is not post-command state.
+let sourceSince = 0;
+let monitorSince = 0;
 
 function updateControls() {
   muteButton.disabled = controlBusy || !csrfToken || !serviceReady || !muteReady;
@@ -139,27 +145,39 @@ function updateControls() {
       : 'CONTROLS UNAVAILABLE · SERVICE OR AUTHORIZATION NOT READY'));
 }
 
+// Observed at or after the last command of its kind (always true before one).
+function observedAfter(field, since) {
+  return !since || (!!field && Number.isFinite(field.observed_mono_ns) &&
+    field.observed_mono_ns >= since);
+}
+
 function renderReceiver(receiver, connected) {
   if (receiver && receiver.source && receiver.monitor) lastReceiver = receiver;
+  // A restarted host restarts the monotonic clock; a lost connection drops the guard.
+  if (!connected) { sourceSince = 0; monitorSince = 0; }
   const state = lastReceiver;
-  const source = state && state.source.value || 'UNKNOWN';
-  const monitor = state && state.monitor.value || 'UNKNOWN';
+  const sourceCurrent = !!state && observedAfter(state.source, sourceSince);
+  const monitorCurrent = !!state && observedAfter(state.monitor, monitorSince);
+  const source = sourceCurrent && state.source.value || 'UNKNOWN';
+  const monitor = monitorCurrent && state.monitor.value || 'UNKNOWN';
   const quality = !connected ? 'CONNECTION LOST' :
+    state && !sourceCurrent ? 'AWAITING OBSERVATION' :
     state && state.integrity !== 'HEALTHY' ? 'OBSERVATION UNCERTAIN' :
     state && state.source.freshness === 'LAST_KNOWN' ? 'LAST KNOWN' :
     state && state.source.freshness || 'UNKNOWN';
   text('source-status', `OBSERVED SOURCE ${source} · ${quality}`);
   text('monitor-status', `OBSERVED TAPE2 MONITOR ${monitor}${!connected ? ' · CONNECTION LOST' :
+    state && !monitorCurrent ? ' · AWAITING OBSERVATION' :
     state && state.monitor.freshness && state.monitor.freshness !== 'FRESH'
       ? ` · ${state.monitor.freshness}` : ''}`);
   for (const button of sourceButtons) {
-    if (connected && state && state.integrity === 'HEALTHY' &&
+    if (connected && sourceCurrent && state.integrity === 'HEALTHY' &&
         button.dataset.source === source) button.dataset.observed = 'true';
     else delete button.dataset.observed;
   }
   // The MONITOR indicator shows only a fresh, confirmed receiver report: never a
   // transmission result. Stale, uncertain or unknown is neutral.
-  const monitorFresh = connected && !!state && state.integrity === 'HEALTHY' &&
+  const monitorFresh = connected && monitorCurrent && state.integrity === 'HEALTHY' &&
     state.monitor.freshness === 'FRESH' && (monitor === 'ON' || monitor === 'OFF');
   monitorButton.dataset.monitorState = monitorFresh ? monitor : 'UNKNOWN';
 }
@@ -397,8 +415,9 @@ async function sendControl(url, body, success, failure, options = {}) {
   volumeHoldReady = false; powerReady = false; tape2MonitorReady = false;
   updateControls();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), url.endsWith('/source')
-    ? SOURCE_REQUEST_TIMEOUT_MS : CONTROL_REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(),
+    url.endsWith('/source') || url.endsWith('/receiver/monitor')
+      ? SYNCED_REQUEST_TIMEOUT_MS : CONTROL_REQUEST_TIMEOUT_MS);
   try {
     const response = await fetchJson(url, {
       method: 'POST', credentials: 'same-origin', signal: controller.signal,
@@ -411,6 +430,12 @@ async function sendControl(url, body, success, failure, options = {}) {
     }
     succeeded = response.ok;
     responseData = response.data;
+    const since = response.ok && response.data && response.data.sync &&
+      response.data.sync.since_mono_ns;
+    if (Number.isFinite(since)) {
+      if (url.endsWith('/source')) sourceSince = since;
+      else if (url.endsWith('/receiver/monitor')) monitorSince = since;
+    }
     controlResult = response.ok
       ? (typeof success === 'function' ? success(response.data) : success)
       : failure(response.data);
@@ -452,8 +477,24 @@ syncButton.addEventListener('click', async () => {
   if (syncButton.disabled || controlBusy) return;
   await sendControl('/api/v1/receiver/query', '{}',
     'SYNC OBSERVATIONS RECORDED · CHECK DISPLAYED STATE',
-    (data) => `SYNC ${data.result || 'FAILED'} · LAST OBSERVATION PRESERVED`);
+    (data) => `SYNC ${data.reason || data.result || 'FAILED'} · LAST OBSERVATION PRESERVED`);
 });
+
+// The Gateway's final SYNC after a verified source or MONITOR control. Only the
+// recorded observation, shown by the indicators after the refresh, says what the
+// receiver reports; a mismatch is shown, and a failed SYNC never repeats the control.
+function syncOutcome(data, unverified, kind) {
+  const sync = data && data.sync;
+  const result = sync && sync.result;
+  if (!result || result === 'NOT_ENABLED') return ` · ${unverified}`;
+  if (result === 'OBSERVATION_RECORDED') {
+    const value = kind === 'MONITOR' ? sync.observed_monitor : sync.observed_source;
+    if (typeof value !== 'string') return ` · SYNC RECORDED · SEE OBSERVED ${kind}`;
+    return ` · RECEIVER REPORTS ${kind === 'MONITOR' ? `MONITOR ${value}` : value}${
+      sync.match === false ? ' · CHECK RECEIVER' : ''}`;
+  }
+  return ` · SYNC ${sync.reason || result} · ${unverified}`;
+}
 
 for (const button of sourceButtons) {
   button.addEventListener('click', async () => {
@@ -463,9 +504,8 @@ for (const button of sourceButtons) {
     // Leaving a freshly observed CD source, the Gateway selects first, then stops
     // the CD. Neither is retried; nothing here claims the source or the changer.
     await sendControl('/api/v1/source', JSON.stringify({ source: name }),
-      (data) => (data && data.cd_stop
-        ? `${name} TX REPORTED · CD STOP TX REPORTED · SELECTION UNVERIFIED`
-        : `${name} TX REPORTED · SELECTION UNVERIFIED`),
+      (data) => `${name} TX REPORTED${data && data.cd_stop ? ' · CD STOP TX REPORTED' : ''}${
+        syncOutcome(data, 'SELECTION UNVERIFIED', 'SOURCE')}`,
       (data) => (data && data.stage === 'CD_STOP'
         ? `${name} TX REPORTED · CD STOP ${data.result || 'FAILED'} · CHECK CHANGER`
         : data && data.stage === 'SELECT_SOURCE'
@@ -784,7 +824,8 @@ for (const button of volumeButtons) {
 monitorButton.addEventListener('click', async () => {
   if (monitorButton.disabled || controlBusy || seek) return;
   await sendControl('/api/v1/receiver/monitor', '{}',
-    'MONITOR TOGGLE TX VERIFIED · STATE SHOWN ONLY WHEN OBSERVED',
+    (data) => `MONITOR TOGGLE TX VERIFIED${
+      syncOutcome(data, 'STATE SHOWN ONLY WHEN OBSERVED', 'MONITOR')}`,
     (data) => volumeFailure('MONITOR', data));
 });
 

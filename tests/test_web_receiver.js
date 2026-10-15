@@ -16,6 +16,7 @@ let receiver = {
   monitor: { value: 'UNKNOWN', freshness: 'UNKNOWN' }, integrity: 'HEALTHY',
 };
 let queryReply;
+let queryFailure = null;
 const posts = [];
 const context = {
   AbortController, Date, setTimeout, clearTimeout,
@@ -50,6 +51,7 @@ const context = {
       posts.push({ url, options });
       if (url === '/api/v1/receiver/query') {
         if (queryReply) await queryReply;
+        if (queryFailure) return { ok: false, json: async () => queryFailure };
         token = 'token-2';
         receiver = { source: { value: 'CD', freshness: 'FRESH' },
           monitor: { value: 'ON', freshness: 'FRESH' }, integrity: 'HEALTHY' };
@@ -115,6 +117,16 @@ async function main() {
   assert.match(elements.get('source-status').textContent, /UNKNOWN/);
   assert.equal(sources[0].dataset.observed, undefined);
   assert.equal(posts.length, 1);
+
+  // Manual SYNC failure names the service's specific reason; nothing is resent.
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  queryReply = null;
+  queryFailure = { result: 'OBSERVATION_FAILED', reason: 'NO_REPLY',
+    receiver_execution: 'UNVERIFIED' };
+  await sync.click();
+  assert.equal(elements.get('availability-text').textContent,
+    'SYNC NO_REPLY · LAST OBSERVATION PRESERVED');
+  assert.equal(posts.length, 2);
   process.stdout.write('Web receiver readback offline tests passed\n');
 }
 

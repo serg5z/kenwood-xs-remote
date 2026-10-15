@@ -5,6 +5,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import secrets
 import socket
 import socketserver
@@ -100,8 +101,12 @@ TAPE2_MONITOR_INTERVAL_MS = 1000
 # stopped. Selecting CD never stops it.
 SOURCES_STOPPING_CD = ("TUNER", "PHONO", "VIDEO1", "VIDEO2", "TAPE1")
 # Every server-wide control lock a source request holds, so no CD, volume, power
-# or MONITOR request can run between its SELECT_SOURCE and its CD_STOP.
+# or MONITOR request can run between its SELECT_SOURCE, its CD_STOP and its SYNC.
 SOURCE_CONTROL_LOCKS = ("cd_track", "volume_step", "power", "tape2_monitor")
+# A MONITOR toggle holds its own spacing lock and these until its SYNC answers.
+MONITOR_CONTROL_LOCKS = ("cd_track", "volume_step", "power")
+# Source selection and the MONITOR toggle end with one SYNC (QUERY_STATUS, ROOT
+# 0x13) when --enable-receiver-query is on, only after a verified control.
 # Server-wide spacing from one completed VOLUME_STEP dispatch to the next. Phase 1
 # exposes single taps only; this guards against duplicate submissions, not hold.
 VOLUME_STEP_INTERVAL_MS = 250
@@ -488,20 +493,43 @@ def send_volume_step(socket_path, direction, timeout=3.0):
     raise MuteServiceError("INVALID_REPLY", "Invalid XS8 volume step reply")
 
 
-def send_receiver_query(socket_path):
-    line = _send_control(socket_path, b"QUERY_STATUS\n", timeout=3.0,
+QUERY_REASON = re.compile(r"[A-Z][A-Z0-9_]{0,31}")
+MONITOR_VALUES = ("ON", "OFF")
+
+
+def send_receiver_query(socket_path, settle=False):
+    """One ROOT 0x13 QUERY_STATUS, never retried. With settle, the service first
+    waits (at most 1.5 s, sending nothing) for a quiet bus. Returns the recorded
+    observation; raises with the service's specific reason otherwise."""
+    command = b"QUERY_STATUS SETTLE\n" if settle else b"QUERY_STATUS\n"
+    line = _send_control(socket_path, command, timeout=3.0,
                          fake_only=False, max_reply=2048)
+    parts = line.split()
     if (line.startswith("OK QUERY_STATUS reason=NONE ") and
             " gpio_tx=TX_OK waveform=MATCH " in line and
             " tx=" in line and " rx1=" in line and " rx2=" in line and
-            " receiver_execution=UNVERIFIED" in line):
-        return "OBSERVATION_RECORDED"
-    if line.startswith("ERR QUERY_STATUS "):
-        result = ("SERVICE_UNCERTAIN" if "reason=TX_UNCERTAIN" in line else
-                  "OBSERVATION_FAILED")
-        raise MuteServiceError(result, line)
+            parts[-1] == "receiver_execution=UNVERIFIED"):
+        inferred = dict(part.split("=", 1) for part in parts
+                        if part.startswith(("source_inferred=", "monitor_inferred=")))
+        source = inferred.get("source_inferred")
+        monitor = inferred.get("monitor_inferred")
+        if source in SOURCES and monitor in MONITOR_VALUES:
+            return {"result": "OBSERVATION_RECORDED", "observed_source": source,
+                    "observed_monitor": monitor}
+        if source in SOURCES + ("UNKNOWN",) and monitor in MONITOR_VALUES + ("UNKNOWN",):
+            # Two frames arrived, but not a recognised source/MONITOR pair.
+            raise MuteServiceError("UNRECOGNIZED", line, {"reason": "UNRECOGNIZED"})
+        raise MuteServiceError("INVALID_REPLY", "Invalid XS8 query reply")
+    if parts[:2] == ["ERR", "QUERY_STATUS"]:
+        reason = (parts[2][len("reason="):]
+                  if len(parts) > 2 and parts[2].startswith("reason=") else "")
+        if not QUERY_REASON.fullmatch(reason):
+            raise MuteServiceError("INVALID_REPLY", "Invalid XS8 query reply")
+        result = "SERVICE_UNCERTAIN" if reason == "TX_UNCERTAIN" else "OBSERVATION_FAILED"
+        raise MuteServiceError(result, line, {"reason": reason})
     if line.startswith("ERR "):
-        raise MuteServiceError("REJECTED", line)
+        reason = parts[1] if len(parts) > 1 and QUERY_REASON.fullmatch(parts[1]) else None
+        raise MuteServiceError("REJECTED", line, {"reason": reason} if reason else None)
     raise MuteServiceError("INVALID_REPLY", "Invalid XS8 query reply")
 
 
@@ -976,10 +1004,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 status.get("state") not in ("HOLDING_UP", "HOLDING_DOWN")):
             end_cd_seek(self.server, "SERVICE_IDLE")
 
-    def take_source_locks(self):
-        """Hold every control lock for one source request, or none (refused)."""
+    def take_source_locks(self, names=SOURCE_CONTROL_LOCKS):
+        """Hold every named control lock for one request, or none (refused)."""
         taken = []
-        for name in SOURCE_CONTROL_LOCKS:
+        for name in names:
             lock = self.server.__dict__.setdefault(
                 name, {"lock": threading.Lock(), "completed": float("-inf")})["lock"]
             if not lock.acquire(blocking=False):
@@ -989,6 +1017,37 @@ class GatewayHandler(BaseHTTPRequestHandler):
             taken.append(lock)
         self.extra_locks = taken
         return True
+
+    def dispatch_sync(self, session, requested=None, expected_monitor=None):
+        """The final SYNC after a verified source or MONITOR control: one
+        QUERY_STATUS SETTLE, never retried, its outcome reported apart from the
+        control. Indicators change only from the observation the service records;
+        since_mono_ns lets the browser ignore anything observed before the control."""
+        if not self.receiver_query_enabled:
+            return {"result": "NOT_ENABLED"}
+        # Counts as this session's query for the manual SYNC spacing.
+        session["last_query_request"] = time.monotonic()
+        started = time.monotonic()
+        sync = {"since_mono_ns": self.control_started_ns}
+        try:
+            sync.update(send_receiver_query(self.socket_path, settle=True))
+        except MuteServiceError as exc:
+            sync.update({"result": exc.result, "error": str(exc)})
+            if exc.evidence:
+                sync.update(exc.evidence)
+        finally:
+            self.add_timing("xs8sync", started)
+        if requested is not None:
+            observed = sync.get("observed_source")
+            sync["requested"] = requested
+            sync["match"] = observed == requested if observed else None
+        else:
+            observed = sync.get("observed_monitor")
+            # Expected only when the MONITOR state before the toggle was known.
+            sync["expected_monitor"] = expected_monitor
+            sync["match"] = (observed == expected_monitor
+                             if observed and expected_monitor else None)
+        return sync
 
     @staticmethod
     def source_is_fresh_cd(status):
@@ -1138,6 +1197,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.cd_kind, self.cd_action = "TAPE2_MONITOR", "TOGGLE"
                 spacing = self.take_spacing("tape2_monitor", TAPE2_MONITOR_INTERVAL_MS, session)
                 if spacing is None:
+                    return
+                if not self.take_source_locks(MONITOR_CONTROL_LOCKS):
+                    session["csrf"] = secrets.token_urlsafe(32)
+                    self.send_json(409, {"result": "BUSY", "receiver_execution": "UNVERIFIED"})
                     return
         elif is_seek or is_volume_hold:
             kind = "cd" if is_seek else "volume"
@@ -1303,6 +1366,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     self.send_json(429, {"result": "TOO_FAST", "min_interval_ms": interval,
                                          "source": source, "receiver_execution": "UNVERIFIED"})
                     return
+        if is_monitor:
+            before = receiver_state(status)["monitor"]
+            expected_monitor = ({"ON": "OFF", "OFF": "ON"}.get(before["value"])
+                                if before["freshness"] == "FRESH" else None)
+        self.control_started_ns = time.monotonic_ns()
         try:
             reply = (send_mute(self.socket_path, fake_only=not self.production_mute_enabled)
                      if is_mute else send_receiver_query(self.socket_path) if is_query
@@ -1318,7 +1386,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             payload = {"result": exc.result, "error": str(exc),
                        "receiver_execution": "UNVERIFIED"}
             if (is_source or is_cd or is_volume or is_playback or is_power or
-                    is_monitor) and exc.evidence and not (
+                    is_monitor or is_query) and exc.evidence and not (
                         stop_cd and self.source_stage == "CD_STOP"):
                 payload.update(exc.evidence)
             if is_power or is_monitor:
@@ -1354,6 +1422,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.send_json(code, payload)
             return
         payload = {"result": "SERVICE_TX_OK", "receiver_execution": "UNVERIFIED"}
+        if is_source or is_monitor:
+            # Still under every lock this request holds; a failed SYNC never
+            # repeats the control and leaves the last observation in place.
+            payload["sync"] = (self.dispatch_sync(session, requested=source) if is_source
+                               else self.dispatch_sync(session,
+                                                       expected_monitor=expected_monitor))
         if is_volume:
             payload["direction"] = direction
             payload.update(reply)
@@ -1380,7 +1454,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             payload.update(reply)
             payload["mapping"] = "PROVISIONAL"
         elif is_query:
-            payload["result"] = reply
+            payload.update(reply)
         elif is_mute:
             payload["service_reply"] = reply
         else:

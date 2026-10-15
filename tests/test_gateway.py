@@ -3283,6 +3283,7 @@ def receiver_status(source="CD", age_s=0.0, integrity="HEALTHY", base=None):
 
 
 CD_STOP_OK = CD_TRANSPORT_OK
+SETTLE = b"QUERY_STATUS SETTLE\n"
 SOURCE_UNCERTAIN = (b"ERR SOURCE_UNCERTAIN gpio_tx=TX_OK waveform=MISSING "
                     b"receiver_execution=UNVERIFIED\n")
 CD_STOP_UNCERTAIN = (b"ERR CD_TRANSPORT_UNCERTAIN action=STOP gpio_tx=TX_OK "
@@ -3297,6 +3298,8 @@ class ScriptedService(RecordingService):
     def __init__(self, path, status, replies, delays=None):
         self.replies = replies
         self.delays = delays or {}
+        # Monotonic time each command arrived, before any delay or reply.
+        self.arrivals = []
         super().__init__(path, status=status)
 
     def run(self):
@@ -3310,6 +3313,7 @@ class ScriptedService(RecordingService):
     def answer(self, client):
         with client:
             command = client.recv(128)
+            self.arrivals.append((command, time.monotonic_ns()))
             self.commands.append(command)
             time.sleep(self.delays.get(command, 0))
             reply = self.status if command == b"STATUS\n" else self.replies.get(command)
@@ -3340,11 +3344,13 @@ class SourceCdStopGatewayTest(GatewayTest):
             self.fake.close()
         super().tearDown()
 
-    def service(self, status, stop=CD_STOP_OK, source=SOURCE_OK, delays=None):
+    def service(self, status, stop=CD_STOP_OK, source=SOURCE_OK, delays=None,
+                query=QUERY_REPLY, monitor=MONITOR_OK):
         if self.fake is not None:
             self.fake.close()
         replies = {b"CD_STOP\n": stop, b"CD_PLAY_PAUSE\n": CD_TRANSPORT_OK,
-                   b"VOLUME_STEP UP\n": None, b"TAPE2_MONITOR_TOGGLE\n": MONITOR_OK}
+                   b"VOLUME_STEP UP\n": None, b"TAPE2_MONITOR_TOGGLE\n": monitor,
+                   b"QUERY_STATUS\n": query, SETTLE: query}
         for name in xs8_gateway.EVIDENCED_SOURCES:
             replies[f"SELECT_SOURCE {name}\n".encode()] = source
         self.fake = ScriptedService(self.socket_path, status, replies, delays)
@@ -3611,6 +3617,384 @@ class SourceCdStopGatewayTest(GatewayTest):
         self.assertEqual(self.sent(), [b"SELECT_SOURCE VIDEO1\n", b"CD_STOP\n"])
         self.assertEqual(self.select("VIDEO1", token, cookie)[0], 403)
         self.assertEqual(len(self.sent()), 2)
+
+class SyncAfterControlGatewayTest(SourceCdStopGatewayTest):
+    """SYNC (QUERY_STATUS, ROOT 0x13) as the final step of a verified source or
+    TAPE2 MONITOR control, under the same locks, never retried."""
+
+    for _name in [n for n in dir(SourceCdStopGatewayTest) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name
+
+    SYNC_FAILURES = (
+        (b"ERR QUERY_STATUS reason=TX_UNCERTAIN gpio_tx=TX_OK waveform=MISSING "
+         b"receiver_execution=UNVERIFIED\n", "SERVICE_UNCERTAIN"),
+        (b"ERR QUERY_STATUS reason=NO_REPLY gpio_tx=TX_OK waveform=MATCH\n",
+         "OBSERVATION_FAILED"),
+        (b"ERR VOLUME_BUSY\n", "REJECTED"),
+        (b"OK SOMETHING_ELSE\n", "INVALID_REPLY"),
+        (None, "DISCONNECTED"))
+
+    def setUp(self):
+        super().setUp()
+        handler = self.server.RequestHandlerClass
+        handler.receiver_query_enabled = True
+        handler.tape2_monitor_enabled = True
+
+    def monitor(self, session=None):
+        token, cookie = session or self.session()
+        code, raw, _ = self.request_full("POST", "/api/v1/receiver/monitor", body="{}", headers={
+            "Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+            "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": token,
+            "Cookie": cookie, "Content-Type": "application/json"})
+        return code, json.loads(raw)
+
+    def elapse_monitor_interval(self):
+        state = self.server.__dict__.get("tape2_monitor")
+        if state:
+            state["completed"] = float("-inf")
+
+    def assert_sync(self, payload, result, **fields):
+        sync = payload["sync"]
+        self.assertEqual(sync["result"], result, sync)
+        self.assertIsInstance(sync["since_mono_ns"], int)
+        self.assertLessEqual(sync["since_mono_ns"], time.monotonic_ns())
+        for name, value in fields.items():
+            self.assertEqual(sync.get(name, "<absent>"), value, (name, sync))
+
+    def assert_consecutive(self, *commands):
+        sent = self.sent()
+        self.assertEqual(sent, list(commands))
+        # Nothing, not even a STATUS read, between the steps.
+        start = self.fake.commands.index(commands[0])
+        self.assertEqual(self.fake.commands[start:start + len(commands)], list(commands))
+
+    def test_leaving_fresh_cd_selects_stops_then_syncs(self):
+        for name in xs8_gateway.SOURCES_STOPPING_CD:
+            with self.subTest(source=name):
+                self.elapse_cd_interval()
+                self.service(receiver_status("CD"))
+                code, payload = self.select(name)
+                self.assertEqual(code, 200, payload)
+                self.assert_consecutive(f"SELECT_SOURCE {name}\n".encode(), b"CD_STOP\n",
+                                        SETTLE)
+                self.assertEqual((payload["result"], payload["gpio_tx"], payload["waveform"],
+                                  payload["receiver_execution"]),
+                                 ("SERVICE_TX_OK", "TX_OK", "MATCH", "UNVERIFIED"))
+                self.assert_sync(payload, "OBSERVATION_RECORDED", observed_source="CD",
+                                 observed_monitor="ON", requested=name, match=False)
+                self.assertEqual(payload["cd_stop"]["waveform"], "MATCH")
+
+    def test_other_transitions_select_then_sync_without_stop(self):
+        # CD -> CD, non-CD sources, and UNKNOWN, stale or UNCERTAIN observations.
+        cases = [("CD", receiver_status("CD")), ("VIDEO1", receiver_status("TUNER")),
+                 ("CD", receiver_status("VIDEO2")), ("VIDEO2", receiver_status("UNKNOWN")),
+                 ("VIDEO1", receiver_status("CD", age_s=31)),
+                 ("TUNER", receiver_status("CD", integrity="UNCERTAIN")),
+                 ("PHONO", CD_IDLE_STATUS)]
+        for name, status in cases:
+            with self.subTest(source=name, status=status[-120:]):
+                self.service(status)
+                code, payload = self.select(name)
+                self.assertEqual(code, 200, payload)
+                self.assert_consecutive(f"SELECT_SOURCE {name}\n".encode(), SETTLE)
+                self.assertNotIn("cd_stop", payload)
+                self.assert_sync(payload, "OBSERVATION_RECORDED", observed_source="CD",
+                                 requested=name, match=name == "CD")
+
+    def test_failed_or_uncertain_steps_never_sync(self):
+        for kwargs, expected in (
+                ({"source": SOURCE_UNCERTAIN}, [b"SELECT_SOURCE VIDEO1\n"]),
+                ({"source": b"ERR VOLUME_BUSY\n"}, [b"SELECT_SOURCE VIDEO1\n"]),
+                ({"source": None}, [b"SELECT_SOURCE VIDEO1\n"]),
+                ({"stop": CD_STOP_UNCERTAIN}, [b"SELECT_SOURCE VIDEO1\n", b"CD_STOP\n"]),
+                ({"stop": b"ERR CD_TRACK_BUSY\n"}, [b"SELECT_SOURCE VIDEO1\n", b"CD_STOP\n"]),
+                ({"stop": None}, [b"SELECT_SOURCE VIDEO1\n", b"CD_STOP\n"])):
+            with self.subTest(**{k: v[:40] if v else v for k, v in kwargs.items()}):
+                self.elapse_cd_interval()
+                self.service(receiver_status("CD"), **kwargs)
+                code, payload = self.select("VIDEO1")
+                self.assertNotEqual(code, 200)
+                self.assertEqual(self.sent(), expected, "no SYNC, no retry")
+                self.assertNotIn("sync", payload)
+        # A refusal before dispatch (spacing, eligibility) sends nothing at all.
+        self.service(receiver_status("CD", base=CD_HOLD_STATUS))
+        self.assertEqual(self.select("VIDEO1")[0], 409)
+        self.assertEqual(self.sent(), [])
+        for monitor in (b"ERR TAPE2_MONITOR_UNCERTAIN gpio_tx=TX_OK waveform=MISSING "
+                        b"receiver_execution=UNVERIFIED\n", b"ERR VOLUME_BUSY\n", None):
+            with self.subTest(monitor=monitor):
+                self.elapse_monitor_interval()
+                self.service(receiver_status("CD"), monitor=monitor)
+                code, payload = self.monitor()
+                self.assertNotEqual(code, 200)
+                self.assertEqual(self.sent(), [b"TAPE2_MONITOR_TOGGLE\n"])
+                self.assertNotIn("sync", payload)
+
+    def test_sync_failure_is_reported_separately_and_never_repeats(self):
+        for reply, result in self.SYNC_FAILURES:
+            with self.subTest(sync=result):
+                self.elapse_cd_interval()
+                self.service(receiver_status("CD"), query=reply)
+                code, payload = self.select("VIDEO2")
+                # The control outcome is unchanged; SYNC has its own result.
+                self.assertEqual((code, payload["result"], payload["waveform"],
+                                  payload["receiver_execution"]),
+                                 (200, "SERVICE_TX_OK", "MATCH", "UNVERIFIED"))
+                self.assertEqual(payload["sync"]["result"], result)
+                self.assertEqual(self.sent(), [b"SELECT_SOURCE VIDEO2\n", b"CD_STOP\n",
+                                               SETTLE])
+                self.elapse_monitor_interval()
+                self.service(receiver_status("TUNER"), query=reply)
+                code, payload = self.monitor()
+                self.assertEqual((code, payload["result"], payload["sync"]["result"]),
+                                 (200, "SERVICE_TX_OK", result))
+                self.assertEqual(self.sent(), [b"TAPE2_MONITOR_TOGGLE\n", SETTLE])
+        self.service(receiver_status("TUNER"))
+        with mock.patch.object(xs8_gateway, "send_receiver_query", side_effect=
+                               xs8_gateway.MuteServiceError("TIMEOUT", "timed out")) as query:
+            code, payload = self.select("PHONO")
+        self.assertEqual((code, payload["sync"]["result"]), (200, "TIMEOUT"))
+        query.assert_called_once()
+        self.assertEqual(self.sent(), [b"SELECT_SOURCE PHONO\n"])
+
+    def test_monitor_toggle_then_sync(self):
+        self.service(receiver_status("CD"))
+        code, payload = self.monitor()
+        self.assertEqual(code, 200, payload)
+        self.assert_consecutive(b"TAPE2_MONITOR_TOGGLE\n", SETTLE)
+        self.assertEqual(payload["mapping"], "PROVISIONAL")
+        # The MONITOR state before the toggle was unknown: nothing to compare.
+        self.assert_sync(payload, "OBSERVATION_RECORDED", observed_monitor="ON",
+                         expected_monitor=None, match=None)
+
+    def test_query_gate_off_sends_no_sync(self):
+        self.server.RequestHandlerClass.receiver_query_enabled = False
+        self.service(receiver_status("CD"))
+        code, payload = self.select("VIDEO1")
+        self.assertEqual((code, payload["sync"]), (200, {"result": "NOT_ENABLED"}))
+        code, payload = self.monitor()
+        self.assertEqual((code, payload["sync"]), (200, {"result": "NOT_ENABLED"}))
+        self.assertEqual(self.sent(), [b"SELECT_SOURCE VIDEO1\n", b"CD_STOP\n",
+                                       b"TAPE2_MONITOR_TOGGLE\n"])
+
+    def test_auto_sync_counts_for_manual_sync_spacing(self):
+        self.service(receiver_status("TUNER"))
+        token, cookie = self.session()
+        self.assertEqual(self.select("PHONO", token, cookie)[0], 200)
+        code, raw, _ = self.request_full("POST", "/api/v1/receiver/query", body="{}", headers={
+            "Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+            "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": self.fresh_token(cookie),
+            "Cookie": cookie, "Content-Type": "application/json"})
+        self.assertEqual((code, json.loads(raw)["result"]), (429, "TOO_FAST"))
+        self.assertEqual(self.sent(), [b"SELECT_SOURCE PHONO\n", SETTLE])
+
+    def test_queued_request_waits_for_sync(self):
+        self.service(receiver_status("CD"), delays={SETTLE: 0.6})
+        results = {}
+        first = threading.Thread(target=lambda: results.setdefault("first", self.select("VIDEO1")))
+        first.start()
+        deadline = time.monotonic() + 2
+        while SETTLE not in self.fake.commands:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        self.assertEqual(self.select("CD")[0], 200)
+        first.join(timeout=5)
+        self.assertEqual(results["first"][0], 200, results)
+        self.assertEqual(self.sent(), [b"SELECT_SOURCE VIDEO1\n", b"CD_STOP\n", SETTLE,
+                                       b"SELECT_SOURCE CD\n", SETTLE])
+
+    def test_control_locks_held_through_sync(self):
+        # Defense in depth for a concurrent server: source and MONITOR requests
+        # hold every control lock until their SYNC has answered.
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+        self.server.server_close()
+        threaded = type("ThreadedGateway", (socketserver.ThreadingMixIn,
+                                            xs8_gateway.GatewayHTTPServer),
+                        {"daemon_threads": True})
+        handler = self.server.RequestHandlerClass
+        handler.cd_playback_enabled = True
+        handler.volume_step_enabled = True
+        handler.power_enabled = True
+        self.server = threaded(("127.0.0.1", 0), handler)
+        self.server.proxy_peer_verified = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+        def post(path, body):
+            token, cookie = self.session()
+            code, raw, _ = self.request_full("POST", path, body=body, headers={
+                "Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+                "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": token,
+                "Cookie": cookie, "Content-Type": "application/json"})
+            return code, json.loads(raw)["result"]
+
+        for start, path, body in (("source", "/api/v1/source", '{"source":"VIDEO1"}'),
+                                  ("monitor", "/api/v1/receiver/monitor", "{}")):
+            with self.subTest(during=start):
+                self.elapse_cd_interval()
+                self.elapse_monitor_interval()
+                self.service(receiver_status("CD"), delays={SETTLE: 1.5})
+                results = {}
+                first = threading.Thread(target=lambda: results.setdefault("first", post(path, body)))
+                first.start()
+                deadline = time.monotonic() + 2
+                while SETTLE not in self.fake.commands:
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                during = time.monotonic()
+                self.assertEqual(post("/api/v1/source", '{"source":"TUNER"}'), (409, "BUSY"))
+                self.assertEqual(post("/api/v1/receiver/monitor", "{}"), (409, "BUSY"))
+                self.assertEqual(post("/api/v1/cd/playback", '{"action":"PLAY_PAUSE"}'),
+                                 (409, "CD_BUSY"))
+                self.assertEqual(post("/api/v1/volume/step", '{"direction":"UP"}'),
+                                 (409, "VOLUME_BUSY"))
+                self.assertEqual(post("/api/v1/power", '{"action":"ON"}'), (409, "BUSY"))
+                self.assertLess(time.monotonic() - during, 1.0, "refused while SYNC was in flight")
+                first.join(timeout=5)
+                self.assertEqual(results["first"][0], 200, results)
+                self.assertEqual(self.sent()[-1], SETTLE)
+                self.assertEqual(self.sent().count(SETTLE), 1)
+
+
+def query_reply(source="CD", monitor="ON"):
+    return QUERY_REPLY.replace(b"source_inferred=CD monitor_inferred=ON", (
+        f"source_inferred={source} monitor_inferred={monitor}").encode())
+
+
+def monitor_status(value, age_s=0.0, source="CD"):
+    """STATUS whose MONITOR observation is value, observed age_s ago."""
+    ns = time.monotonic_ns() - int(age_s * 1e9)
+    return receiver_status(source).replace(
+        b"receiver_monitor=UNKNOWN receiver_monitor_ns=0 receiver_monitor_evidence=NONE",
+        f"receiver_monitor={value} receiver_monitor_ns={ns} "
+        f"receiver_monitor_evidence=QUERY".encode())
+
+
+class SyncReadbackGatewayTest(SyncAfterControlGatewayTest):
+    """What the final SYNC reports: the observed source/MONITOR, whether it
+    matches the request, and the service's specific reason when it fails."""
+
+    for _name in [n for n in dir(SyncAfterControlGatewayTest) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name
+
+    def test_observed_source_matches_or_mismatches_the_request(self):
+        for requested, observed, match in (("TUNER", "TUNER", True), ("VIDEO1", "CD", False),
+                                           ("PHONO", "VIDEO2", False), ("CD", "CD", True)):
+            with self.subTest(requested=requested, observed=observed):
+                self.service(receiver_status("TUNER"), query=query_reply(observed, "OFF"))
+                before = time.monotonic_ns()
+                code, payload = self.select(requested)
+                self.assertEqual((code, payload["result"]), (200, "SERVICE_TX_OK"))
+                self.assert_sync(payload, "OBSERVATION_RECORDED", observed_source=observed,
+                                 observed_monitor="OFF", requested=requested, match=match)
+                # Taken before the control was dispatched: anything observed
+                # earlier is not post-command state.
+                self.assertGreaterEqual(payload["sync"]["since_mono_ns"], before)
+                self.assertEqual(self.sent(), [f"SELECT_SOURCE {requested}\n".encode(), SETTLE])
+
+    def test_since_is_captured_before_the_first_control_reaches_the_service(self):
+        # Every observation the Web may show is at or after since_mono_ns; that is
+        # only post-command state if since precedes the first control command.
+        def arrival(command):
+            return next(ns for sent, ns in self.fake.arrivals if sent == command)
+        for name, status, first in (
+                ("VIDEO1", receiver_status("CD"), b"SELECT_SOURCE VIDEO1\n"),   # then CD_STOP
+                ("TUNER", receiver_status("PHONO"), b"SELECT_SOURCE TUNER\n")):
+            with self.subTest(source=name):
+                self.elapse_cd_interval()
+                self.service(status)
+                code, payload = self.select(name)
+                self.assertEqual(code, 200, payload)
+                since = payload["sync"]["since_mono_ns"]
+                self.assertLessEqual(since, arrival(first))
+                # After the eligibility STATUS read, so it bounds this request only.
+                self.assertGreaterEqual(since, max(ns for sent, ns in self.fake.arrivals
+                                                   if sent == b"STATUS\n"))
+        self.elapse_monitor_interval()
+        self.service(monitor_status("OFF"))
+        code, payload = self.monitor()
+        self.assertEqual(code, 200, payload)
+        self.assertLessEqual(payload["sync"]["since_mono_ns"],
+                             arrival(b"TAPE2_MONITOR_TOGGLE\n"))
+
+    def test_failed_sync_reports_the_specific_reason_and_never_repeats(self):
+        for reason, result in (("NO_REPLY", "OBSERVATION_FAILED"),
+                               ("PARTIAL", "OBSERVATION_FAILED"),
+                               ("EXTRA", "OBSERVATION_FAILED"),
+                               ("EVENT_GAP", "OBSERVATION_FAILED"),
+                               ("BUS_ACTIVE", "OBSERVATION_FAILED"),
+                               ("PREEMPTED", "OBSERVATION_FAILED"),
+                               ("SESSION_BUSY", "OBSERVATION_FAILED"),
+                               ("TX_UNCERTAIN", "SERVICE_UNCERTAIN")):
+            with self.subTest(reason=reason):
+                self.service(receiver_status("TUNER"), query=(
+                    f"ERR QUERY_STATUS reason={reason} gpio_tx=TX_OK waveform=MATCH "
+                    "receiver_execution=UNVERIFIED\n").encode())
+                code, payload = self.select("PHONO")
+                self.assertEqual((code, payload["result"]), (200, "SERVICE_TX_OK"))
+                self.assert_sync(payload, result, reason=reason, requested="PHONO",
+                                 match=None, observed_source="<absent>")
+                self.assertEqual(self.sent(), [b"SELECT_SOURCE PHONO\n", SETTLE])
+        self.service(receiver_status("TUNER"), query=b"ERR CD_TRACK_BUSY\n")
+        code, payload = self.select("PHONO")
+        self.assert_sync(payload, "REJECTED", reason="CD_TRACK_BUSY", match=None)
+
+    def test_unrecognized_or_malformed_query_replies_record_nothing(self):
+        for reply, result in ((query_reply("UNKNOWN", "ON"), "UNRECOGNIZED"),
+                              (query_reply("CD", "UNKNOWN"), "UNRECOGNIZED"),
+                              (query_reply("TAPE9", "ON"), "INVALID_REPLY"),
+                              (query_reply("CD", "MAYBE"), "INVALID_REPLY"),
+                              (QUERY_REPLY.replace(b"source_inferred=CD ", b""), "INVALID_REPLY"),
+                              (b"ERR QUERY_STATUS reason=no_reply\n", "INVALID_REPLY"),
+                              (b"ERR QUERY_STATUS\n", "INVALID_REPLY"),
+                              (QUERY_REPLY.replace(b"gpio_tx=TX_OK", b"gpio_tx=TX_FAIL"),
+                               "INVALID_REPLY")):
+            with self.subTest(reply=reply[:60], result=result):
+                self.service(receiver_status("TUNER"), query=reply)
+                code, payload = self.select("CD")
+                self.assertEqual(code, 200)
+                self.assert_sync(payload, result, match=None, observed_source="<absent>")
+
+    def test_monitor_expectation_comes_only_from_a_fresh_prior_observation(self):
+        for status, observed, expected, match in (
+                (monitor_status("OFF"), "ON", "ON", True),
+                (monitor_status("ON"), "ON", "OFF", False),
+                (monitor_status("OFF", age_s=31), "ON", None, None),       # LAST_KNOWN
+                (monitor_status("ON").replace(b"receiver_integrity=HEALTHY",
+                                              b"receiver_integrity=UNCERTAIN"), "OFF", None, None),
+                (receiver_status("CD"), "OFF", None, None)):               # UNKNOWN
+            with self.subTest(expected=expected, observed=observed):
+                self.elapse_monitor_interval()
+                self.service(status, query=query_reply("CD", observed))
+                code, payload = self.monitor()
+                self.assertEqual(code, 200, payload)
+                self.assert_sync(payload, "OBSERVATION_RECORDED", observed_monitor=observed,
+                                 expected_monitor=expected, match=match)
+                self.assertNotIn("requested", payload["sync"])
+                self.assertEqual(self.sent(), [b"TAPE2_MONITOR_TOGGLE\n", SETTLE])
+
+    def test_manual_sync_keeps_plain_query_and_reports_reasons(self):
+        def manual():
+            token, cookie = self.session()
+            code, raw, _ = self.request_full("POST", "/api/v1/receiver/query", body="{}", headers={
+                "Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+                "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": token,
+                "Cookie": cookie, "Content-Type": "application/json"})
+            return code, json.loads(raw)
+        self.service(receiver_status("TUNER"), query=query_reply("PHONO", "OFF"))
+        code, payload = manual()
+        self.assertEqual((code, payload["result"], payload["observed_source"],
+                          payload["observed_monitor"]),
+                         (200, "OBSERVATION_RECORDED", "PHONO", "OFF"))
+        self.assertEqual(self.sent(), [b"QUERY_STATUS\n"], "manual SYNC never waits to settle")
+        self.service(receiver_status("TUNER"), query=b"ERR QUERY_STATUS reason=NO_REPLY\n")
+        code, payload = manual()
+        self.assertEqual((code, payload["result"], payload["reason"]),
+                         (502, "OBSERVATION_FAILED", "NO_REPLY"))
+        self.assertEqual(self.sent(), [b"QUERY_STATUS\n"])
 
 
 class BindingTest(unittest.TestCase):
