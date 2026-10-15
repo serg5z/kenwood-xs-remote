@@ -3300,6 +3300,7 @@ class ScriptedService(RecordingService):
         self.delays = delays or {}
         # Monotonic time each command arrived, before any delay or reply.
         self.arrivals = []
+        self.lock = threading.Lock()
         super().__init__(path, status=status)
 
     def run(self):
@@ -3317,6 +3318,10 @@ class ScriptedService(RecordingService):
             self.commands.append(command)
             time.sleep(self.delays.get(command, 0))
             reply = self.status if command == b"STATUS\n" else self.replies.get(command)
+            if isinstance(reply, list):
+                # A sequence answers successive requests; the last answer repeats.
+                with self.lock:
+                    reply = reply.pop(0) if len(reply) > 1 else reply[0]
             if reply is not None:
                 try:
                     client.sendall(reply)
@@ -3995,6 +4000,338 @@ class SyncReadbackGatewayTest(SyncAfterControlGatewayTest):
         self.assertEqual((code, payload["result"], payload["reason"]),
                          (502, "OBSERVATION_FAILED", "NO_REPLY"))
         self.assertEqual(self.sent(), [b"QUERY_STATUS\n"])
+
+
+NO_REPLY = (b"ERR QUERY_STATUS reason=NO_REPLY gpio_tx=TX_OK waveform=MATCH "
+            b"bytes=lsb/legacy@start_ns-end_ns:validity tx=0x13/0x37@1-2:VALID "
+            b"gap_events=0 source_inferred=UNKNOWN monitor_inferred=UNKNOWN "
+            b"attribution=TEMPORAL origin=UNATTRIBUTED receiver_execution=UNVERIFIED\n")
+
+
+def query_error(reason):
+    return (f"ERR QUERY_STATUS reason={reason} gpio_tx=TX_OK waveform=MATCH "
+            "receiver_execution=UNVERIFIED\n").encode()
+
+
+POWER_OFF_OK = POWER_OK.replace(b"action=ON", b"action=OFF")
+POWER_UNCERTAIN = (b"ERR POWER_UNCERTAIN action=OFF gpio_tx=TX_OK waveform=MISSING "
+                   b"receiver_execution=UNVERIFIED\n")
+
+
+class PowerObservationTest(unittest.TestCase):
+    """The Gateway's diagnostic power observation, from query outcomes only."""
+
+    S = 1_000_000_000
+
+    def silence(self):
+        return xs8_gateway.MuteServiceError("OBSERVATION_FAILED", "x", {"reason": "NO_REPLY"})
+
+    def test_rules(self):
+        power = xs8_gateway.PowerObservation()
+        self.assertEqual(power.snapshot(1)["value"], "UNKNOWN")
+        power.record({"result": "OBSERVATION_RECORDED"}, True, 10 * self.S)
+        self.assertEqual((power.snapshot(10 * self.S)["value"], power.evidence), ("ON", "QUERY"))
+        # A single clean silence is never OFF; it makes ON unknown.
+        power.record(self.silence(), True, 11 * self.S)
+        self.assertEqual((power.value, power.evidence), ("UNKNOWN", "SINGLE_SILENCE"))
+        # Less than 1 s later does not count; at least 1 s after the first does.
+        power.record(self.silence(), True, 11 * self.S + self.S // 2)
+        self.assertEqual(power.value, "UNKNOWN")
+        power.record(self.silence(), True, 12 * self.S)
+        self.assertEqual((power.value, power.evidence), ("OFF_INFERRED", "QUERY_SILENCE"))
+        snap = power.snapshot(13 * self.S)
+        self.assertEqual((snap["freshness"], snap["age_ms"]), ("FRESH", 1000))
+        self.assertEqual(power.snapshot(43 * self.S)["freshness"], "STALE")
+        # More than 10 s between silences restarts the run.
+        power.record(self.silence(), True, 50 * self.S)
+        power.record(self.silence(), True, 61 * self.S)
+        self.assertEqual(power.value, "UNKNOWN")
+        power.record(self.silence(), True, 62 * self.S)
+        self.assertEqual(power.value, "OFF_INFERRED")
+        # A fault between silences breaks the run; an unsettled silence is not clean.
+        power.record(self.silence(), True, 70 * self.S)
+        power.record(xs8_gateway.MuteServiceError("OBSERVATION_FAILED", "x",
+                                                  {"reason": "PARTIAL"}), True, 70 * self.S + 1)
+        power.record(self.silence(), True, 72 * self.S)
+        self.assertEqual(power.value, "UNKNOWN")
+        power.record(self.silence(), False, 74 * self.S)
+        self.assertEqual((power.value, power.evidence), ("UNKNOWN", "UNSETTLED_SILENCE"))
+        power.record(self.silence(), True, 75 * self.S)
+        self.assertEqual(power.value, "UNKNOWN")
+        # A fault leaves an observation to age; a POWER TX always clears it.
+        power.record({"result": "OBSERVATION_RECORDED"}, False, 80 * self.S)
+        power.record(xs8_gateway.MuteServiceError("TIMEOUT", "x"), True, 81 * self.S)
+        self.assertEqual(power.value, "ON")
+        power.invalidate(82 * self.S)
+        self.assertEqual((power.snapshot(82 * self.S)["value"], power.evidence,
+                          power.snapshot(82 * self.S)["freshness"]),
+                         ("UNKNOWN", "POWER_TX", "UNKNOWN"))
+
+
+class PowerToggleGatewayTest(GatewayTest):
+    """One-click POWER: the Gateway decides from fresh QUERY_STATUS SETTLE
+    observations and sends at most one POWER frame, never retried."""
+
+    for _name in [n for n in dir(GatewayTest) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name
+
+    STATUS_BEFORE = receiver_status("CD")
+    STATUS_AFTER = receiver_status("CD").replace(b"last_byte=0x09", b"last_byte=0x13")
+
+    def setUp(self):
+        super().setUp()
+        handler = self.server.RequestHandlerClass
+        handler.power_enabled = True
+        handler.receiver_query_enabled = True
+        handler.https_origin = "https://woodland-pi.local"
+        self.server.proxy_peer_verified = True
+        self.fake = None
+
+    def tearDown(self):
+        if self.fake is not None:
+            self.fake.close()
+        super().tearDown()
+
+    def service(self, queries, statuses=None, power_on=POWER_OK, power_off=POWER_OFF_OK,
+                delays=None):
+        if self.fake is not None:
+            self.fake.close()
+        self.fake = ScriptedService(self.socket_path, None, {
+            SETTLE: list(queries), b"QUERY_STATUS\n": list(queries),
+            b"POWER_ON\n": power_on, b"POWER_OFF\n": power_off}, delays)
+        self.fake.status = list(statuses or [self.STATUS_BEFORE, self.STATUS_AFTER])
+        return self.fake
+
+    def post(self, body, session=None):
+        token, cookie = session or self.session()
+        code, raw, _ = self.request_full("POST", "/api/v1/power", body=body, headers={
+            "Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+            "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": token,
+            "Cookie": cookie, "Content-Type": "application/json"})
+        return code, json.loads(raw)
+
+    def toggle(self, expected="ON", session=None):
+        return self.post(json.dumps({"action": "TOGGLE", "expected": expected}), session)
+
+    def sent(self):
+        return [c for c in self.fake.commands if c != b"STATUS\n"]
+
+    def power_status(self):
+        code, raw, _ = self.request_full("GET", "/api/v1/status")
+        self.assertEqual(code, 200)
+        return json.loads(raw)["power"]
+
+    def test_receiver_on_sends_power_off_once(self):
+        self.service([QUERY_REPLY])
+        code, payload = self.toggle("ON")
+        self.assertEqual(code, 200, payload)
+        self.assertEqual((payload["result"], payload["action"], payload["sent"],
+                          payload["power_sent"], payload["gpio_tx"], payload["waveform"],
+                          payload["receiver_execution"]),
+                         ("SERVICE_TX_OK", "TOGGLE", "OFF", True, "TX_OK", "MATCH", "UNVERIFIED"))
+        self.assertEqual(payload["decision"], {"state": "ON", "observations": [
+            {"result": "OBSERVATION_RECORDED"}]})
+        self.assertEqual(self.sent(), [SETTLE, b"POWER_OFF\n"])
+        # The TX result never sets power: the observation is cleared.
+        power = self.power_status()
+        self.assertEqual((power["value"], power["evidence"], power["freshness"]),
+                         ("UNKNOWN", "POWER_TX", "UNKNOWN"))
+
+    def test_two_clean_silences_send_power_on_once(self):
+        self.service([NO_REPLY, NO_REPLY])
+        code, payload = self.toggle("OFF_INFERRED")
+        self.assertEqual(code, 200, payload)
+        self.assertEqual((payload["sent"], payload["decision"]["state"]), ("ON", "OFF_INFERRED"))
+        self.assertEqual(payload["decision"]["observations"],
+                         [{"result": "OBSERVATION_FAILED", "reason": "NO_REPLY"}] * 2)
+        self.assertEqual(self.sent(), [SETTLE, SETTLE, b"POWER_ON\n"])
+        settles = [ns for command, ns in self.fake.arrivals if command == SETTLE]
+        self.assertGreaterEqual(settles[1] - settles[0], 1_000_000_000, "at least 1 s apart")
+        self.assertEqual(self.power_status()["value"], "UNKNOWN")
+
+    def test_every_other_outcome_is_unknown_and_sends_nothing(self):
+        cases = [[query_error(r)] for r in ("PARTIAL", "EXTRA", "PREEMPTED", "BUS_ACTIVE",
+                                            "SESSION_BUSY", "TX_UNCERTAIN", "EVENT_GAP")]
+        cases += [[query_reply("UNKNOWN", "ON")], [b"OK GARBAGE\n"], [b"ERR CD_TRACK_BUSY\n"],
+                  [None],                                              # lost reply
+                  [NO_REPLY, QUERY_REPLY],                             # inconsistent
+                  [NO_REPLY, query_error("PARTIAL")], [NO_REPLY, query_error("BUS_ACTIVE")],
+                  [NO_REPLY, None]]
+        for queries in cases:
+            for expected in ("ON", "OFF_INFERRED"):
+                with self.subTest(queries=[q[:40] if q else q for q in queries],
+                                  expected=expected):
+                    self.service(queries)
+                    code, payload = self.toggle(expected)
+                    self.assertEqual((code, payload["result"], payload["power_sent"],
+                                      payload["physical_check_required"]),
+                                     (409, "POWER_STATE_UNKNOWN", False, False), payload)
+                    self.assertEqual(payload["decision"]["state"], "UNKNOWN")
+                    self.assertEqual(len(payload["decision"]["observations"]), len(queries))
+                    self.assertEqual(self.sent(), [SETTLE] * len(queries), "no POWER frame")
+        self.service([QUERY_REPLY])
+        with mock.patch.object(xs8_gateway, "send_receiver_query", side_effect=
+                               xs8_gateway.MuteServiceError("TIMEOUT", "timed out")) as query:
+            code, payload = self.toggle("ON")
+        self.assertEqual((code, payload["result"], payload["decision"]["observations"]),
+                         (409, "POWER_STATE_UNKNOWN", [{"result": "TIMEOUT"}]))
+        query.assert_called_once_with(self.socket_path, settle=True)
+        self.assertEqual(self.sent(), [])
+
+    def test_observation_contradicting_the_display_sends_nothing(self):
+        for queries, expected, observed in (([QUERY_REPLY], "OFF_INFERRED", "ON"),
+                                            ([NO_REPLY, NO_REPLY], "ON", "OFF_INFERRED")):
+            with self.subTest(expected=expected):
+                self.service(queries)
+                code, payload = self.toggle(expected)
+                self.assertEqual((code, payload["result"], payload["power_sent"],
+                                  payload["decision"]["state"]),
+                                 (409, "STATE_CHANGED", False, observed))
+                self.assertEqual(self.sent(), [SETTLE] * len(queries))
+                # Nothing was sent, so the fresh observation stands.
+                self.assertEqual(self.power_status()["value"], observed)
+
+    def test_eligibility_is_checked_again_before_power_tx(self):
+        holding = self.STATUS_AFTER.replace(b"OK state=IDLE", b"OK state=HOLDING_UP")
+        cd_busy = receiver_status("CD", base=CD_HOLD_STATUS).replace(
+            b"last_byte=0x09", b"last_byte=0x13")
+        intervening = self.STATUS_AFTER.replace(b"last_byte=0x13", b"last_byte=0xD8")
+        for after, code, result in ((holding, 409, "VOLUME_BUSY"), (cd_busy, 409, "CD_BUSY"),
+                                    (intervening, 409, "INTERVENING_TX"),
+                                    (None, 503, "UNAVAILABLE")):
+            with self.subTest(result=result):
+                session = self.session()  # Before scripting: STATUS reads are main + recheck.
+                self.service([QUERY_REPLY], statuses=[self.STATUS_BEFORE, after])
+                status, payload = self.toggle("ON", session)
+                self.assertEqual((status, payload["result"], payload["power_sent"],
+                                  payload["physical_check_required"]),
+                                 (code, result, False, False))
+                self.assertEqual(self.sent(), [SETTLE], "no POWER frame")
+
+    def test_power_failure_or_lost_reply_is_never_retried(self):
+        for reply, code, result in ((POWER_UNCERTAIN, 502, "SERVICE_UNCERTAIN"),
+                                    (None, 502, "DISCONNECTED"),
+                                    (b"ERR VOLUME_BUSY\n", 409, "REJECTED")):
+            with self.subTest(result=result):
+                self.server.__dict__.pop("power", None)  # Fresh spacing for each case.
+                self.service([QUERY_REPLY], power_off=reply)
+                status, payload = self.toggle("ON")
+                self.assertEqual((status, payload["result"], payload["sent"],
+                                  payload["power_sent"], payload["decision"]["state"]),
+                                 (code, result, "OFF", True, "ON"))
+                self.assertEqual(payload["physical_check_required"], result != "REJECTED")
+                self.assertEqual(self.sent(), [SETTLE, b"POWER_OFF\n"], "exactly one, no retry")
+                self.assertEqual(self.power_status()["evidence"], "POWER_TX")
+
+    def test_spacing_csrf_and_body_validation(self):
+        self.service([QUERY_REPLY])
+        session = self.session()
+        for body in ('{"action":"TOGGLE"}', '{"action":"TOGGLE","expected":"OFF"}',
+                     '{"action":"TOGGLE","expected":"UNKNOWN"}',
+                     '{"action":"ON","expected":"ON"}',
+                     '{"action":"TOGGLE","expected":"ON","extra":1}',
+                     '{"action":"TOGGLE","action":"TOGGLE","expected":"ON"}',
+                     '{"expected":"ON"}', '[]', 'null', '{"action":"toggle","expected":"ON"}',
+                     '{"action":{}}', '{"action":["ON"]}', '{"action":"TOGGLE","expected":{}}',
+                     '{"action":"TOGGLE","expected":["ON"]}'):
+            with self.subTest(body=body):
+                self.assertEqual(self.post(body, session)[0], 400)
+        token, cookie = session
+        self.assertEqual(self.toggle("ON", ("bad", cookie))[0], 403)
+        self.assertEqual(self.toggle("ON", (token, "xs8_session=bad"))[0], 401)
+        self.assertEqual(self.sent(), [], "nothing reaches the service")
+        self.assertEqual(self.toggle("ON", session)[0], 200)
+        # The token was single use, and the 2 s POWER spacing applies to TOGGLE.
+        self.assertEqual(self.toggle("ON", session)[0], 403)
+        code, payload = self.toggle("ON")
+        self.assertEqual((code, payload["result"]), (429, "TOO_FAST"))
+        self.assertEqual(self.sent(), [SETTLE, b"POWER_OFF\n"])
+
+    def test_toggle_needs_the_query_gate_and_power_gate(self):
+        self.service([QUERY_REPLY], statuses=[self.STATUS_BEFORE])
+        token, cookie = self.session()
+        headers = {"X-Kenwood-Authenticated-User": "remote", "Cookie": cookie}
+        power = json.loads(self.request_full("GET", "/api/v1/capabilities",
+                                             headers=headers)[1])["operations"]["power"]
+        self.assertTrue(power["toggle_available"])
+        self.server.RequestHandlerClass.receiver_query_enabled = False
+        power = json.loads(self.request_full("GET", "/api/v1/capabilities",
+                                             headers=headers)[1])["operations"]["power"]
+        self.assertFalse(power["toggle_available"])
+        code, payload = self.toggle("ON", (token, cookie))
+        self.assertEqual((code, payload["result"], payload["power_sent"]),
+                         (409, "TOGGLE_UNAVAILABLE", False))
+        # Explicit ON/OFF still work without the query gate.
+        self.assertEqual(self.post('{"action":"ON"}')[0], 200)
+        self.assertEqual(self.sent(), [b"POWER_ON\n"])
+
+    def test_power_disabled_toggle_is_inert(self):
+        self.server.RequestHandlerClass.power_enabled = False
+        code, _, _ = self.request_full("POST", "/api/v1/power",
+                                       body='{"action":"TOGGLE","expected":"ON"}')
+        self.assertEqual(code, 501)
+
+    def test_queries_and_explicit_power_feed_the_observation(self):
+        self.service([QUERY_REPLY])
+        session = self.session()
+        token, cookie = session
+        code, raw, _ = self.request_full("POST", "/api/v1/receiver/query", body="{}", headers={
+            "Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+            "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": token,
+            "Cookie": cookie, "Content-Type": "application/json"})
+        self.assertEqual(code, 200, raw)
+        power = self.power_status()
+        self.assertEqual((power["value"], power["evidence"], power["freshness"]),
+                         ("ON", "QUERY", "FRESH"))
+        self.assertEqual(self.post('{"action":"OFF"}')[0], 200)
+        self.assertEqual(self.power_status()["evidence"], "POWER_TX")
+        self.assertEqual(self.sent(), [b"QUERY_STATUS\n", b"POWER_OFF\n"])
+
+    def test_toggle_holds_every_control_lock(self):
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+        self.server.server_close()
+        threaded = type("ThreadedGateway", (socketserver.ThreadingMixIn,
+                                            xs8_gateway.GatewayHTTPServer),
+                        {"daemon_threads": True})
+        handler = self.server.RequestHandlerClass
+        handler.cd_playback_enabled = True
+        handler.volume_step_enabled = True
+        handler.tape2_monitor_enabled = True
+        handler.production_source_enabled = True
+        self.server = threaded(("127.0.0.1", 0), handler)
+        self.server.proxy_peer_verified = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.service([NO_REPLY, NO_REPLY], delays={SETTLE: 0.3})
+        self.fake.replies.update({b"SELECT_SOURCE TUNER\n": SOURCE_OK})
+        results = {}
+        first = threading.Thread(target=lambda: results.setdefault(
+            "toggle", self.toggle("OFF_INFERRED")))
+        first.start()
+        deadline = time.monotonic() + 2
+        while SETTLE not in self.fake.commands:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+
+        def post(path, body):
+            token, cookie = self.session()
+            code, raw, _ = self.request_full("POST", path, body=body, headers={
+                "Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+                "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": token,
+                "Cookie": cookie, "Content-Type": "application/json"})
+            return code, json.loads(raw)["result"]
+        self.assertEqual(post("/api/v1/power", '{"action":"TOGGLE","expected":"ON"}'),
+                         (409, "BUSY"))
+        self.assertEqual(post("/api/v1/power", '{"action":"ON"}'), (409, "BUSY"))
+        self.assertEqual(post("/api/v1/source", '{"source":"TUNER"}'), (409, "BUSY"))
+        self.assertEqual(post("/api/v1/receiver/monitor", "{}"), (409, "BUSY"))
+        self.assertEqual(post("/api/v1/cd/playback", '{"action":"PLAY_PAUSE"}'), (409, "CD_BUSY"))
+        self.assertEqual(post("/api/v1/volume/step", '{"direction":"UP"}'), (409, "VOLUME_BUSY"))
+        first.join(timeout=8)
+        self.assertEqual(results["toggle"][0], 200, results)
+        self.assertEqual(self.sent(), [SETTLE, SETTLE, b"POWER_ON\n"], "nothing interleaved")
 
 
 class BindingTest(unittest.TestCase):

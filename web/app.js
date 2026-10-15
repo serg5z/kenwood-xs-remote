@@ -29,10 +29,13 @@ let seekMaxHoldMs = 10000;
 const SEEK_REQUEST_TIMEOUT_MS = 4000;
 // A source request is up to three service commands (SELECT_SOURCE, CD_STOP when
 // leaving CD, then SYNC) and MONITOR two (toggle, SYNC): the Gateway's worst case
-// is a 1 s STATUS read plus three 3 s replies, under nginx's 11 s. Other controls
+// is a 1 s STATUS read plus three 3 s replies, under nginx's 14 s. Other controls
 // send one command.
 const SYNCED_REQUEST_TIMEOUT_MS = 12000;
 const CONTROL_REQUEST_TIMEOUT_MS = 6000;
+// One-click POWER: up to two settled queries 1 s apart, two STATUS reads and one
+// POWER frame in the Gateway (worst case about 11 s; nginx example 14 s).
+const POWER_TOGGLE_TIMEOUT_MS = 15000;
 // The active hold (CD seek or volume):
 // { kind, button, direction, token, holdId, phase, cancelled, reason, started, pointerId, timer, wake }
 let seek = null;
@@ -49,6 +52,10 @@ let suppressVolumeClickUntil = -Infinity;
 let volumePointerDown = false;
 let powerReady = false;
 let enabledPowerActions = [];
+let powerToggleReady = false;
+// The Gateway's power observation, only when fresh: ON, OFF_INFERRED or UNKNOWN.
+// It never changes from a TX result in the browser.
+let powerState = 'UNKNOWN';
 let tape2MonitorReady = false;
 let enabledVolumeDirections = [];
 // Phase 1: single taps only. Spacing guards duplicate taps; the Gateway enforces it too.
@@ -182,8 +189,20 @@ function renderReceiver(receiver, connected) {
   monitorButton.dataset.monitorState = monitorFresh ? monitor : 'UNKNOWN';
 }
 
+function renderPower(power) {
+  powerState = power && power.freshness === 'FRESH' &&
+    (power.value === 'ON' || power.value === 'OFF_INFERRED') ? power.value : 'UNKNOWN';
+  powerTrigger.dataset.powerState = powerState;
+  if (typeof powerTrigger.setAttribute === 'function') {
+    powerTrigger.setAttribute('aria-label', powerState === 'ON'
+      ? 'Receiver power: observed on' : powerState === 'OFF_INFERRED'
+        ? 'Receiver power: no reply, probably standby' : 'Receiver power: state unknown');
+  }
+}
+
 function renderStatus(data) {
   text('gateway', data && data.gateway === 'online' ? 'Online' : 'Unavailable');
+  renderPower(data && data.xs8_service === 'connected' && data.power);
   if (!data || data.xs8_service !== 'connected' || !data.status) {
     renderReceiver(null, false);
     text('service', data ? 'Unavailable' : 'Unknown');
@@ -257,6 +276,7 @@ function applyRefresh(statusData, sessionData, capabilitiesData) {
     !!powerOperation && powerOperation.enabled === true &&
     Array.isArray(powerOperation.available_actions);
   enabledPowerActions = powerReady ? powerOperation.available_actions : [];
+  powerToggleReady = powerReady && powerOperation.toggle_available === true;
   const monitorOperation = operations && operations.tape2_monitor;
   tape2MonitorReady = !!csrfToken && sessionData.tape2_monitor_available === true && cdIdle &&
     !!monitorOperation && monitorOperation.enabled === true;
@@ -399,7 +419,8 @@ function recordCdRefresh(steps, total) {
 // options.token: a single-use token returned by the previous CD POST.
 // options.onSettled(ok, data): runs after the response, before the display refresh.
 async function sendControl(url, body, success, failure, options = {}) {
-  const { pendingPrev = false, token: tokenOverride = null, onSettled = null } = options;
+  const { pendingPrev = false, token: tokenOverride = null, onSettled = null,
+    timeoutMs = null } = options;
   if (!pendingPrev && prevGesture && prevGesture.pending) cancelPrev('OTHER CONTROL');
   let succeeded = false;
   let responseData = null;
@@ -415,9 +436,9 @@ async function sendControl(url, body, success, failure, options = {}) {
   volumeHoldReady = false; powerReady = false; tape2MonitorReady = false;
   updateControls();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(),
-    url.endsWith('/source') || url.endsWith('/receiver/monitor')
-      ? SYNCED_REQUEST_TIMEOUT_MS : CONTROL_REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs ||
+    (url.endsWith('/source') || url.endsWith('/receiver/monitor')
+      ? SYNCED_REQUEST_TIMEOUT_MS : CONTROL_REQUEST_TIMEOUT_MS));
   try {
     const response = await fetchJson(url, {
       method: 'POST', credentials: 'same-origin', signal: controller.signal,
@@ -829,8 +850,11 @@ monitorButton.addEventListener('click', async () => {
     (data) => volumeFailure('MONITOR', data));
 });
 
-// POWER: the round button opens a small ON / OFF chooser and never sends. Only an
-// explicit choice sends one POWER ON or POWER OFF; no power state is read back.
+// POWER: with a fresh observed ON or OFF_INFERRED (and TOGGLE available), one click
+// asks the Gateway to toggle; the Gateway re-observes and decides, sending at most
+// one frame. Otherwise, or after a refused toggle, the button opens the explicit
+// ON / OFF chooser. Nothing is retried, and the shown state changes only from a
+// later observation.
 function setPowerMenu(open) {
   powerMenu.hidden = !open;
   if (typeof powerTrigger.setAttribute === 'function') {
@@ -838,8 +862,30 @@ function setPowerMenu(open) {
   }
 }
 
-powerTrigger.addEventListener('click', () => {
+async function togglePower(expected) {
+  setPowerMenu(false);
+  let refused = false;
+  await sendControl('/api/v1/power', JSON.stringify({ action: 'TOGGLE', expected }),
+    (data) => `POWER ${data.sent} TX VERIFIED · RECEIVER WAS ${
+      data.decision && data.decision.state === 'ON' ? 'ON' : 'SILENT TWICE'
+    } · RECEIVER POWER UNVERIFIED`,
+    (data) => {
+      refused = !!data && data.power_sent === false;
+      return refused
+        ? `POWER TOGGLE ${(data.result || 'REFUSED').replace(/_/g, ' ')} · NOTHING SENT · CHOOSE ON OR OFF`
+        : volumeFailure(`POWER ${data && data.sent || 'TOGGLE'}`, data);
+    }, { timeoutMs: POWER_TOGGLE_TIMEOUT_MS });
+  // Refused with nothing sent: offer the explicit choice, never a retry.
+  if (refused && !powerTrigger.disabled) setPowerMenu(true);
+}
+
+powerTrigger.addEventListener('click', async () => {
   if (powerTrigger.disabled || controlBusy || seek) return;
+  if (powerMenu.hidden && powerToggleReady &&
+      (powerState === 'ON' || powerState === 'OFF_INFERRED')) {
+    await togglePower(powerState);
+    return;
+  }
   setPowerMenu(powerMenu.hidden);
 });
 const closePowerMenuOutside = (event) => {

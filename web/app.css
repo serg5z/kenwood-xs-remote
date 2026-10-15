@@ -53,6 +53,10 @@
 .power-button svg { width:20px; height:20px; fill:none; stroke:currentColor; stroke-width:2.2; stroke-linecap:round; }
 .remote .power-button:disabled { background:#f1e9e5; border-color:#dcc3bb; color:#c79f94; box-shadow:none; cursor:not-allowed; }
 .power-button[aria-expanded="true"] { box-shadow:0 0 0 3px #a6453233; }
+/* Observed power (Gateway, fresh only): a green ring for ON, a dashed ring for
+   OFF_INFERRED; UNKNOWN keeps the plain button and the ON / OFF chooser. */
+.power-button[data-power-state="ON"]:not(:disabled) { box-shadow:0 0 0 3px #3f8f5a; }
+.power-button[data-power-state="OFF_INFERRED"]:not(:disabled) { outline:2px dashed #a64532; outline-offset:3px; }
 .power-menu { position:absolute; top:52px; right:0; display:grid; gap:6px; width:112px; padding:10px; border:1px solid #d1d0c9; border-radius:16px; background:#f6f5f0; box-shadow:0 10px 24px #373b3426; }
 .power-menu[hidden] { display:none; }
 .power-menu-title { font-size:9px; font-weight:700; letter-spacing:.18em; color:#7d827e; text-align:center; }

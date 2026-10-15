@@ -93,6 +93,10 @@ KEY_HOLDS = {
 POWER_COMMANDS = {"ON": "POWER_ON", "OFF": "POWER_OFF"}
 POWER_PROVISIONAL_ACTIONS = ()
 POWER_INTERVAL_MS = 2000
+# One-click POWER: the Gateway decides from fresh QUERY_STATUS SETTLE observations
+# (never from TX evidence or a browser value) and sends at most one POWER frame.
+POWER_TOGGLE_STATES = ("ON", "OFF_INFERRED")
+POWER_SILENCE_GAP_S = 1.0
 # CONTEXT 0x48: historical TAPE2 MONITOR toggle, not yet physically validated.
 TAPE2_MONITOR_INTERVAL_MS = 1000
 # Leaving a freshly observed CD source: SELECT_SOURCE first, then the same CD_STOP
@@ -121,6 +125,75 @@ class MuteServiceError(Exception):
         super().__init__(message)
         self.result = result
         self.evidence = evidence
+
+
+class PowerToggleRefused(MuteServiceError):
+    """A TOGGLE refused before any POWER frame was sent."""
+
+
+class PowerObservation:
+    """Gateway-owned, diagnostic receiver power observation. It changes only from
+    QUERY_STATUS outcomes and is cleared by any POWER transmission; a TX result
+    never sets it. A recognised reply is ON. Two clean (settled) NO_REPLY results
+    1-10 s apart are OFF_INFERRED; a single one is never OFF. Other query faults
+    leave the value to age."""
+
+    FRESH_NS = 30_000_000_000
+    SILENCE_GAP_NS = int(POWER_SILENCE_GAP_S * 1e9)
+    SILENCE_SPAN_NS = 10_000_000_000
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.value, self.observed_ns, self.evidence = "UNKNOWN", 0, "NONE"
+        self.silence_ns = None  # The first of a run of clean silences.
+
+    def record(self, outcome, settled, now_ns=None):
+        """outcome: a send_receiver_query result dict, or the MuteServiceError."""
+        now_ns = now_ns or time.monotonic_ns()
+        with self.lock:
+            if isinstance(outcome, dict):
+                if outcome.get("result") == "OBSERVATION_RECORDED":
+                    self.value, self.observed_ns, self.evidence = "ON", now_ns, "QUERY"
+                    self.silence_ns = None
+                return
+            silent = (outcome.result == "OBSERVATION_FAILED" and
+                      (outcome.evidence or {}).get("reason") == "NO_REPLY")
+            if not silent:
+                self.silence_ns = None
+                return
+            if not settled:
+                self.value, self.observed_ns, self.evidence = (
+                    "UNKNOWN", now_ns, "UNSETTLED_SILENCE")
+                self.silence_ns = None
+                return
+            first = self.silence_ns
+            if first is not None and now_ns - first > self.SILENCE_SPAN_NS:
+                first = None
+            if first is not None and now_ns - first >= self.SILENCE_GAP_NS:
+                self.value, self.observed_ns, self.evidence = (
+                    "OFF_INFERRED", now_ns, "QUERY_SILENCE")
+                self.silence_ns = None
+                return
+            if first is None:
+                self.silence_ns = now_ns
+            self.value, self.observed_ns, self.evidence = "UNKNOWN", now_ns, "SINGLE_SILENCE"
+
+    def invalidate(self, now_ns=None):
+        with self.lock:
+            self.value, self.observed_ns, self.evidence = (
+                "UNKNOWN", now_ns or time.monotonic_ns(), "POWER_TX")
+            self.silence_ns = None
+
+    def snapshot(self, now_ns=None):
+        now_ns = now_ns or time.monotonic_ns()
+        with self.lock:
+            age_ms = (max(0, now_ns - self.observed_ns) // 1_000_000
+                      if self.observed_ns else None)
+            freshness = ("UNKNOWN" if self.value == "UNKNOWN" else
+                         "FRESH" if now_ns - self.observed_ns <= self.FRESH_NS else "STALE")
+            return {"value": self.value, "observed_mono_ns": self.observed_ns,
+                    "age_ms": age_ms, "evidence": self.evidence, "freshness": freshness,
+                    "diagnostic": True, "receiver_execution": "UNVERIFIED"}
 
 
 def _send_control(socket_path, command, timeout=1.0, fake_only=True,
@@ -647,7 +720,7 @@ def capabilities(mute_available=False, source_available=False, query_available=F
                  volume_step_available=False, cd_playback_available=False,
                  cd_seek_available=False, cd_blocked_actions=CD_BLOCKED_ACTIONS,
                  volume_hold_available=False, power_available=False,
-                 tape2_monitor_available=False):
+                 tape2_monitor_available=False, power_toggle_available=False):
     return {
         "api_version": "v0.1",
         "operations": {
@@ -695,6 +768,8 @@ def capabilities(mute_available=False, source_available=False, query_available=F
                 "classification": "unverified", "enabled": power_available,
                 "available_actions": list(POWER_COMMANDS),
                 "provisional_actions": list(POWER_PROVISIONAL_ACTIONS),
+                # TOGGLE needs fresh receiver queries, so also --enable-receiver-query.
+                "toggle_available": power_toggle_available,
                 "reason": "ROOT 0x52 ON and ROOT 0x62 OFF are physically verified; TX does not confirm execution and no power state is read back",
             },
             "tape2_monitor": {
@@ -916,7 +991,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, {"gateway": "online", "xs8_service": "connected",
                                  "status": status, "receiver": receiver_state(status),
-                                 "cd_changer": cd_changer_state(status)})
+                                 "cd_changer": cd_changer_state(status),
+                                 "power": self.power_observation().snapshot()})
             return
         if path == "/api/v1/capabilities":
             status = self.service_status() if self.current_session() is not None else None
@@ -928,7 +1004,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                               available["cd_playback"], available["cd_seek"],
                                               self.cd_blocked_actions(),
                                               available["volume_hold"], available["power"],
-                                              available["tape2_monitor"]))
+                                              available["tape2_monitor"],
+                                              power_toggle_available=available["power"] and
+                                              self.receiver_query_enabled))
             return
         if path == "/api/v1/session" and self.control_enabled():
             user = self.authenticated_user()
@@ -1030,7 +1108,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         started = time.monotonic()
         sync = {"since_mono_ns": self.control_started_ns}
         try:
-            sync.update(send_receiver_query(self.socket_path, settle=True))
+            sync.update(self.observed_query(settle=True))
         except MuteServiceError as exc:
             sync.update({"result": exc.result, "error": str(exc)})
             if exc.evidence:
@@ -1048,6 +1126,86 @@ class GatewayHandler(BaseHTTPRequestHandler):
             sync["match"] = (observed == expected_monitor
                              if observed and expected_monitor else None)
         return sync
+
+    def power_observation(self):
+        return self.server.__dict__.setdefault("power_observation", PowerObservation())
+
+    def observed_query(self, settle):
+        """One QUERY_STATUS whose outcome also feeds the diagnostic power observation."""
+        try:
+            reply = send_receiver_query(self.socket_path, settle=settle)
+        except MuteServiceError as exc:
+            self.power_observation().record(exc, settle)
+            raise
+        self.power_observation().record(reply, settle)
+        return reply
+
+    def power_refusal(self, status):
+        """Why a POWER frame may not be sent now, or None."""
+        return ("CD_FAULT_LATCHED" if self.cd_fault(status) else
+                "FAULT_LATCHED" if status.get("state") == "FAULT_LATCHED" else
+                "CD_BUSY" if status.get("cd_state") in ("ACTIVE", "HOLDING") else
+                "VOLUME_BUSY" if status.get("state") in ("HOLDING_UP", "HOLDING_DOWN") else
+                None if self.status_allows_cd_track(status) else "NOT_ELIGIBLE")
+
+    def dispatch_power_toggle(self, spacing, expected):
+        """One-click POWER: decide from fresh QUERY_STATUS SETTLE observations made
+        under every control lock, then send at most one POWER frame, never retried.
+        Recognised reply: ON -> POWER_OFF. Two clean NO_REPLY results at least 1 s
+        apart: OFF_INFERRED -> POWER_ON. Anything else sends nothing. Direct service
+        clients and the receiver's own controls can still act between the last
+        observation and the POWER frame; this is not globally atomic."""
+        observations = []
+
+        def observe():
+            started = time.monotonic()
+            try:
+                self.observed_query(settle=True)
+                observations.append({"result": "OBSERVATION_RECORDED"})
+                return "REPLY"
+            except MuteServiceError as exc:
+                entry = {"result": exc.result}
+                if exc.evidence and exc.evidence.get("reason"):
+                    entry["reason"] = exc.evidence["reason"]
+                observations.append(entry)
+                return "NO_REPLY" if entry == {"result": "OBSERVATION_FAILED",
+                                               "reason": "NO_REPLY"} else "FAULT"
+            finally:
+                self.add_timing("xs8powerquery", started)
+
+        first = observe()
+        state = "ON" if first == "REPLY" else "UNKNOWN"
+        if first == "NO_REPLY":
+            time.sleep(POWER_SILENCE_GAP_S)
+            state = "OFF_INFERRED" if observe() == "NO_REPLY" else "UNKNOWN"
+        decision = {"state": state, "observations": observations}
+        refused = {"decision": decision, "power_sent": False}
+        if state == "UNKNOWN":
+            raise PowerToggleRefused("POWER_STATE_UNKNOWN",
+                                     "Receiver power could not be observed reliably", refused)
+        if state != expected:
+            raise PowerToggleRefused("STATE_CHANGED",
+                                     f"Receiver power observed {state}, expected {expected}",
+                                     refused)
+        # Eligibility again immediately before TX; no other frame since our query.
+        try:
+            status = self.read_service_status()
+        except ServiceError as exc:
+            raise PowerToggleRefused("UNAVAILABLE", "XS8 service unavailable", refused) from exc
+        refusal = self.power_refusal(status)
+        if refusal is None and status.get("last_byte") != "0x13":
+            refusal = "INTERVENING_TX"
+        if refusal:
+            raise PowerToggleRefused(refusal, "POWER no longer eligible", refused)
+        command = "OFF" if state == "ON" else "ON"
+        self.power_observation().invalidate()
+        try:
+            reply = self.dispatch_spaced(spacing, send_power, command)
+        except MuteServiceError as exc:
+            exc.evidence = dict(exc.evidence or {}, decision=decision, sent=command,
+                                power_sent=True)
+            raise
+        return dict(reply, decision=decision, sent=command, power_sent=True)
 
     @staticmethod
     def source_is_fresh_cd(status):
@@ -1084,6 +1242,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                  "receiver_execution": "UNVERIFIED"})
             return None
         return state
+
+    def dispatch_explicit_power(self, spacing, action):
+        # Any POWER transmission makes the power observation unknown.
+        self.power_observation().invalidate()
+        return self.dispatch_spaced(spacing, send_power, action)
 
     def dispatch_spaced(self, state, send, *args):
         started = time.monotonic()
@@ -1151,6 +1314,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         is_seek = path == "/api/v1/cd/seek" and self.cd_seek_enabled
         is_volume_hold = path == "/api/v1/volume/hold" and self.volume_hold_enabled
         is_power = path == "/api/v1/power" and self.power_enabled
+        is_toggle = False
         is_monitor = path == "/api/v1/receiver/monitor" and self.tape2_monitor_enabled
         if (not (is_mute or is_source or is_query or is_cd or is_volume or
                  is_playback or is_seek or is_volume_hold or is_power or is_monitor) or
@@ -1213,19 +1377,39 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.handle_seek(session, request, kind)
             return
         elif is_power:
+            # {"action": "ON"|"OFF"}, or {"action": "TOGGLE", "expected": "ON"|"OFF_INFERRED"}:
+            # expected is what the browser showed; it only guards, never decides.
             try:
                 pairs = json.loads(body, object_pairs_hook=list)
-                action = (pairs[0][1] if isinstance(pairs, list) and
-                          len(pairs) == 1 and isinstance(pairs[0], tuple) and
-                          pairs[0][0] == "action" else None)
-            except (UnicodeError, ValueError, TypeError, IndexError):
-                action = None
-            if not isinstance(action, str) or action not in POWER_COMMANDS:
+                fields = (dict(pairs) if isinstance(pairs, list) and
+                          all(isinstance(p, tuple) for p in pairs) and
+                          len(dict(pairs)) == len(pairs) else {})
+            except (UnicodeError, ValueError, TypeError):
+                fields = {}
+            action = fields.get("action")
+            expected = fields.get("expected")
+            if not isinstance(action, str) or not (
+                    (set(fields) == {"action"} and action in POWER_COMMANDS) or
+                    (set(fields) == {"action", "expected"} and action == "TOGGLE" and
+                     expected in POWER_TOGGLE_STATES)):
                 self.send_json(400, {"error": "Expected one allowlisted power action"})
                 return
+            is_toggle = action == "TOGGLE"
             self.cd_kind, self.cd_action = "POWER", action
             spacing = self.take_spacing("power", POWER_INTERVAL_MS, session)
             if spacing is None:
+                return
+            if is_toggle and not self.receiver_query_enabled:
+                session["csrf"] = secrets.token_urlsafe(32)
+                self.send_json(409, {"result": "TOGGLE_UNAVAILABLE", "power_sent": False,
+                                     "receiver_execution": "UNVERIFIED"})
+                return
+            # TOGGLE holds every control lock through its queries and POWER frame.
+            if is_toggle and not self.take_source_locks(
+                    ("cd_track", "volume_step", "tape2_monitor")):
+                session["csrf"] = secrets.token_urlsafe(32)
+                self.send_json(409, {"result": "BUSY", "power_sent": False,
+                                     "receiver_execution": "UNVERIFIED"})
                 return
         elif is_cd or is_playback:
             try:
@@ -1373,16 +1557,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.control_started_ns = time.monotonic_ns()
         try:
             reply = (send_mute(self.socket_path, fake_only=not self.production_mute_enabled)
-                     if is_mute else send_receiver_query(self.socket_path) if is_query
+                     if is_mute else self.observed_query(settle=False) if is_query
                      else self.dispatch_cd_track(action) if is_cd
                      else self.dispatch_cd_playback(action) if is_playback
                      else self.dispatch_volume_step(direction) if is_volume
-                     else self.dispatch_spaced(spacing, send_power, action) if is_power
+                     else self.dispatch_power_toggle(spacing, expected) if is_toggle
+                     else self.dispatch_explicit_power(spacing, action) if is_power
                      else self.dispatch_spaced(spacing, send_tape2_monitor) if is_monitor
                      else self.dispatch_source(source, stop_cd))
         except MuteServiceError as exc:
             code = {"UNAVAILABLE": 503, "REJECTED": 409, "CD_FAULT_LATCHED": 409,
                     "FAULT_LATCHED": 409, "TIMEOUT": 504}.get(exc.result, 502)
+            if isinstance(exc, PowerToggleRefused):
+                code = 503 if exc.result == "UNAVAILABLE" else 409
             payload = {"result": exc.result, "error": str(exc),
                        "receiver_execution": "UNVERIFIED"}
             if (is_source or is_cd or is_volume or is_playback or is_power or
@@ -1393,8 +1580,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if is_power:
                     payload["action"] = action
                 # Never retried; only a clean refusal certainly sent nothing.
-                payload["physical_check_required"] = exc.result not in (
-                    "UNAVAILABLE", "REJECTED")
+                payload["physical_check_required"] = (
+                    not isinstance(exc, PowerToggleRefused) and
+                    exc.result not in ("UNAVAILABLE", "REJECTED"))
             if stop_cd:
                 payload["source"] = source
                 payload["stage"] = self.source_stage

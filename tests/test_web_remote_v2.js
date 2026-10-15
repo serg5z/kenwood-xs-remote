@@ -88,7 +88,8 @@ let rotations = 0;
 let monitorReport = { value: 'UNKNOWN', freshness: 'UNKNOWN' };
 let integrity = 'HEALTHY';
 let connected = true;
-let flags = { hold: true, power: true, monitor: true, step: true };
+let flags = { hold: true, power: true, monitor: true, step: true, toggle: false };
+let powerReport = { value: 'UNKNOWN', freshness: 'UNKNOWN' };
 let holdMaxMs = 20000;
 let hold = null;
 let holds = 0;
@@ -140,7 +141,8 @@ const context = {
         last_byte: '0x07', last_gpio_tx: 'TX_OK', last_waveform: 'MATCH', cd_state: 'IDLE',
         cd_action: 'NONE', cd_release_owed: '0', cd_lease_expired: '0', cd_last_result: 'NONE' },
         receiver: { source: { value: 'VIDEO1', freshness: 'FRESH' }, monitor: monitorReport,
-          integrity, receiver_execution: 'UNVERIFIED' } } });
+          integrity, receiver_execution: 'UNVERIFIED' },
+        power: { ...powerReport, diagnostic: true, receiver_execution: 'UNVERIFIED' } } });
     }
     if (url === '/api/v1/session') {
       return respond({ status: 200, data: { csrf_token: gatewayToken, mute_available: false,
@@ -154,7 +156,8 @@ const context = {
         volume_step: { enabled: flags.step, available_directions: ['UP', 'DOWN'], min_interval_ms: 250 },
         volume_hold: { enabled: flags.hold, available_directions: ['UP', 'DOWN'], hold_delay_ms: 400,
           heartbeat_ms: 500, lease_ms: 1200, max_hold_ms: holdMaxMs },
-        power: { enabled: flags.power, available_actions: ['ON', 'OFF'] },
+        power: { enabled: flags.power, available_actions: ['ON', 'OFF'],
+          toggle_available: flags.toggle },
         tape2_monitor: { enabled: flags.monitor, provisional: true } } } });
     }
     const record = { url, body: JSON.parse(options.body), token: options.headers['X-CSRF-Token'], at: now };
@@ -231,6 +234,107 @@ async function main() {
   assert.deepEqual(requests.map((r) => [r.url, r.body]),
     [['/api/v1/power', { action: 'ON' }], ['/api/v1/power', { action: 'OFF' }]]);
   await idle();
+
+  // 3b. One-click POWER: only a fresh observed ON / OFF_INFERRED (and TOGGLE
+  //     available) sends TOGGLE with what was shown; the Gateway decides. The shown
+  //     state never changes from the reply, and nothing is retried.
+  const menu = element('power-menu');
+  const powerShown = async (report, toggle = true) => {
+    powerReport = report;
+    flags = { ...flags, toggle };
+    await advance(5000);
+    return powerButton.dataset.powerState;
+  };
+  assert.equal(await powerShown({ value: 'ON', freshness: 'FRESH' }), 'ON');
+  reset();
+  plans.push({ status: 200, data: { result: 'SERVICE_TX_OK', action: 'TOGGLE', sent: 'OFF',
+    decision: { state: 'ON', observations: [{ result: 'OBSERVATION_RECORDED' }] },
+    power_sent: true, gpio_tx: 'TX_OK', waveform: 'MATCH' } });
+  await powerButton.fire('click');
+  await settle();
+  assert.deepEqual(requests.map((r) => [r.url, r.body]),
+    [['/api/v1/power', { action: 'TOGGLE', expected: 'ON' }]]);
+  assert.equal(menu.hidden, true, 'no chooser for a fresh observation');
+  assert.match(availability(), /^POWER OFF TX VERIFIED · RECEIVER WAS ON · RECEIVER POWER UNVERIFIED$/);
+  assert.equal(powerButton.dataset.powerState, 'ON', 'never changed by the TX reply');
+  assert.equal(await powerShown({ value: 'UNKNOWN', freshness: 'UNKNOWN', evidence: 'POWER_TX' }),
+    'UNKNOWN');
+
+  assert.equal(await powerShown({ value: 'OFF_INFERRED', freshness: 'FRESH' }), 'OFF_INFERRED');
+  reset();
+  plans.push({ status: 200, data: { result: 'SERVICE_TX_OK', action: 'TOGGLE', sent: 'ON',
+    decision: { state: 'OFF_INFERRED' }, power_sent: true } });
+  await powerButton.fire('click');
+  await settle();
+  assert.deepEqual(requests.map((r) => r.body), [{ action: 'TOGGLE', expected: 'OFF_INFERRED' }]);
+  assert.match(availability(), /^POWER ON TX VERIFIED · RECEIVER WAS SILENT TWICE/);
+  await idle();
+
+  // Refused with nothing sent: the explicit chooser opens; no automatic retry.
+  for (const result of ['POWER_STATE_UNKNOWN', 'STATE_CHANGED', 'INTERVENING_TX', 'BUSY']) {
+    reset();
+    plans.push({ status: 409, data: { result, power_sent: false } });
+    await powerButton.fire('click');
+    await settle();
+    assert.equal(availability(),
+      `POWER TOGGLE ${result.replace(/_/g, ' ')} · NOTHING SENT · CHOOSE ON OR OFF`);
+    assert.equal(menu.hidden, false, `${result}: chooser offered`);
+    await advance(3000);
+    assert.equal(requests.length, 1, `${result}: never retried`);
+    await powerOn.fire('click');
+    await settle();
+    assert.deepEqual(requests.map((r) => r.body),
+      [{ action: 'TOGGLE', expected: 'OFF_INFERRED' }, { action: 'ON' }]);
+    await idle();
+  }
+
+  // A sent-but-uncertain POWER, a lost reply and a timeout: no chooser, no retry.
+  for (const plan of [{ status: 502, data: { result: 'SERVICE_UNCERTAIN', sent: 'ON',
+    power_sent: true, physical_check_required: true } }, 'drop']) {
+    reset();
+    plans.push(plan);
+    await powerButton.fire('click');
+    await settle();
+    assert.match(availability(), plan === 'drop' ? /^POWER RESULT UNKNOWN · CHECK RECEIVER$/
+      : /^POWER ON SERVICE_UNCERTAIN · CHECK RECEIVER$/);
+    assert.equal(menu.hidden, true);
+    await advance(3000);
+    assert.equal(requests.length, 1);
+    await idle();
+  }
+  reset();
+  plans.push('defer');
+  const pending = powerButton.fire('click');
+  await advance(14000);
+  assert.equal(deferred.length, 1, 'the toggle may take up to 15 s');
+  assert.equal(powerButton.disabled, true, 'still in flight at 14 s');
+  await advance(1001);
+  await pending;
+  deferred.length = 0;
+  assert.match(availability(), /^POWER RESULT UNKNOWN · CHECK RECEIVER$/);
+  assert.equal(menu.hidden, true);
+  assert.equal(requests.length, 1);
+  await idle();
+
+  // Stale, unknown or TOGGLE unavailable: the click only opens the chooser.
+  for (const [report, toggle] of [[{ value: 'ON', freshness: 'STALE' }, true],
+    [{ value: 'UNKNOWN', freshness: 'UNKNOWN' }, true], [{ value: 'ON', freshness: 'FRESH' }, false]]) {
+    reset();
+    await powerShown(report, toggle);
+    await powerButton.fire('click');
+    await settle();
+    assert.equal(menu.hidden, false);
+    assert.deepEqual(requests, [], 'opening the chooser sends nothing');
+    await powerButton.fire('click');
+    assert.equal(menu.hidden, true);
+  }
+  // A lost connection never leaves a stale power state behind.
+  await powerShown({ value: 'ON', freshness: 'FRESH' });
+  connected = false;
+  await advance(5000);
+  assert.equal(powerButton.dataset.powerState, 'UNKNOWN');
+  connected = true;
+  await powerShown({ value: 'UNKNOWN', freshness: 'UNKNOWN' }, false);
 
   // 4. Volume tap (< 400 ms): exactly one VOLUME_STEP, no hold.
   reset();
@@ -362,12 +466,22 @@ async function main() {
   await idle();
 
   // 10. Capabilities off: controls disabled; a long press only steps on click.
-  flags = { hold: false, power: false, monitor: false, step: true };
+  flags = { hold: false, power: false, monitor: false, step: true, toggle: false };
   await advance(6000);
   assert.equal(powerOn.disabled, true);
   assert.equal(powerOff.disabled, true);
   assert.equal(powerButton.disabled, true);
   assert.equal(monitor.disabled, true);
+  // With --enable-power off, a fresh observation still never makes POWER clickable.
+  powerReport = { value: 'ON', freshness: 'FRESH' };
+  flags = { ...flags, toggle: true };
+  await advance(6000);
+  assert.equal(powerButton.disabled, true);
+  reset();
+  await powerButton.fire('click');
+  await settle();
+  assert.deepEqual(requests, []);
+  flags = { ...flags, toggle: false };
   reset();
   await up.fire('pointerdown');
   await advance(800);
