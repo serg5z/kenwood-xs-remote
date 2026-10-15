@@ -614,7 +614,8 @@ function enteredTrack() {
 
 trackInput.addEventListener('input', () => updateControls());
 
-trackGo.addEventListener('click', async () => {
+// GO and Enter share this one path, so both pass the same gates.
+async function submitTrack() {
   if (trackGo.disabled || controlBusy || seek ||
       Date.now() - lastCdCompleted < cdIntervalMs) return;
   const track = enteredTrack();
@@ -622,6 +623,17 @@ trackGo.addEventListener('click', async () => {
   await sendControl('/api/v1/cd/track/select', JSON.stringify({ track }),
     `TRACK ${track} TX VERIFIED · TRACK SELECTION UNVERIFIED`,
     (data) => cdFailure(`TRACK ${track}`, data), { timeoutMs: TRACK_SELECT_TIMEOUT_MS });
+}
+
+trackGo.addEventListener('click', submitTrack);
+
+// Enter (or a keyboard's Go key) acts as GO. A held key's auto-repeats and IME
+// composition are ignored, so one press sends at most one request.
+trackInput.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter') return;
+  event.preventDefault();
+  if (event.repeat || event.isComposing) return;
+  submitTrack();
 });
 
 // Held controls: CD FF/REW and Web volume. Both use one connection-owned

@@ -11,7 +11,8 @@ for (const [id, attribute] of [['cd-rew', 'data-cd-seek="BACKWARD"'], ['cd-ff', 
 }
 assert.match(html, /id="cd-track-number" disabled type="text" inputmode="numeric"/);
 assert.match(html, /id="cd-track-go" disabled type="button"/);
-assert.ok(!/<form/.test(html), 'no form: Enter in the field never submits');
+assert.ok(!/<form/.test(html), 'no form: Enter never triggers a browser submission or reload');
+assert.match(html, /id="cd-track-number"[^>]* enterkeyhint="go"/);
 for (const label of ['TIME DISP.', 'REPEAT', 'DISC SKIP']) {
   assert.ok(html.includes(`<small>${label}</small>`), label);
 }
@@ -618,6 +619,64 @@ async function main() {
   }
   await advance(6000);
   assert.equal(trackGo.disabled, false, 'restored');
+  assert.deepEqual(forbidden, []);
+
+  // 13f. Enter in the field acts exactly like GO, through the same gates.
+  let prevented = 0;
+  const key = (k, extra = {}) => trackInput.fire('keydown',
+    { key: k, preventDefault() { prevented += 1; }, ...extra });
+  await advance(1000);
+  const enterBefore = selectPosts.length;
+  for (const text of ['', '0', '40', '1a']) {
+    trackInput.value = text;
+    await trackInput.fire('input');
+    await key('Enter');
+  }
+  await settle();
+  assert.equal(selectPosts.length, enterBefore, 'invalid or empty input never submits');
+  assert.equal(prevented, 4, 'Enter never reaches a default action');
+  trackInput.value = '13';
+  await trackInput.fire('input');
+  await key('3');
+  await key('Tab');
+  await settle();
+  assert.equal(selectPosts.length, enterBefore, 'other keys never submit');
+  assert.equal(prevented, 4, 'other keys keep their default behavior');
+  await key('Enter', { repeat: true });
+  await key('Enter', { isComposing: true });
+  await settle();
+  assert.equal(selectPosts.length, enterBefore, 'auto-repeat and composition never submit');
+  // One press, one POST; Enter again while it is in flight sends nothing.
+  selectPlans.push('hang');
+  const inFlight = key('Enter');
+  await settle();
+  assert.deepEqual(selectPosts.slice(enterBefore).map((p) => p.body), [{ track: 13 }]);
+  await key('Enter');
+  await trackGo.fire('click');
+  await settle();
+  assert.equal(selectPosts.length, enterBefore + 1, 'no duplicate while busy');
+  await advance(12500);
+  await inFlight;
+  assert.match(availability(), /^CD RESULT UNKNOWN · CHECK CHANGER/);
+  // After it settles, Enter submits again with the normal success message.
+  await advance(1000);
+  trackInput.value = '23';
+  await trackInput.fire('input');
+  await key('Enter');
+  await settle();
+  assert.deepEqual(selectPosts.slice(enterBefore).map((p) => p.body), [{ track: 13 }, { track: 23 }]);
+  assert.match(availability(), /^TRACK 23 TX VERIFIED · TRACK SELECTION UNVERIFIED/);
+  await key('Enter');
+  await settle();
+  assert.equal(selectPosts.length, enterBefore + 2, 'Enter obeys the shared CD spacing');
+  // With the gate off Enter does nothing either.
+  trackSelectAvailable = false;
+  await advance(6000);
+  await key('Enter');
+  await settle();
+  assert.equal(selectPosts.length, enterBefore + 2);
+  trackSelectAvailable = true;
+  await advance(6000);
   assert.deepEqual(forbidden, []);
 
   // 14. Unavailable capability or a CD hold keeps the controls disabled.
