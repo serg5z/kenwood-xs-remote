@@ -1,0 +1,122 @@
+{
+ "api_version": "v0.1",
+ "operations": {
+  "status": {
+   "classification": "supported",
+   "enabled": true
+  },
+  "receiver_query": {
+   "classification": "supported",
+   "enabled": true
+  },
+  "mute": {
+   "classification": "unverified",
+   "enabled": true,
+   "reason": "Receiver execution is unverified"
+  },
+  "volume_step": {
+   "classification": "unverified",
+   "enabled": true,
+   "available_directions": [
+    "UP",
+    "DOWN"
+   ],
+   "min_interval_ms": 250,
+   "reason": "TX and waveform do not confirm a volume change; hold and repeat are not exposed"
+  },
+  "source": {
+   "classification": "unverified",
+   "enabled": true,
+   "available_sources": [
+    "CD",
+    "TUNER",
+    "PHONO",
+    "VIDEO1",
+    "VIDEO2",
+    "TAPE1"
+   ],
+   "blocked_sources": [
+    "TAPE2"
+   ],
+   "reason": "TX and waveform do not confirm receiver execution; TAPE2 is a MONITOR, not a source selection"
+  },
+  "cd_track_select": {
+   "classification": "unverified",
+   "enabled": true,
+   "min_track": 1,
+   "max_track": 39,
+   "frame_gap_ms": 200,
+   "min_interval_ms": 0,
+   "reason": "Track N is floor(N/10) ROOT 0xDA then one digit frame; 1-39 is an operational limit; TX and waveform do not confirm the track"
+  },
+  "cd_transport": {
+   "classification": "unverified",
+   "enabled": true,
+   "available_actions": [
+    "NEXT",
+    "PREVIOUS"
+   ],
+   "blocked_actions": [],
+   "min_interval_ms": 0,
+   "reason": "TX and waveform do not confirm a track change; blocked actions are not exposed by this Gateway"
+  },
+  "cd_playback": {
+   "classification": "unverified",
+   "enabled": true,
+   "available_actions": [
+    "PLAY_PAUSE",
+    "STOP",
+    "TIME_DISPLAY",
+    "REPEAT",
+    "DISC_SKIP"
+   ],
+   "provisional_actions": [
+    "PLAY_PAUSE"
+   ],
+   "min_interval_ms": 0,
+   "reason": "STOP 0xA1, TIME_DISPLAY 0xEA, REPEAT 0xCC and DISC_SKIP 0x8A are physically observed; PLAY/PAUSE 0xBC is a historical mapping not yet physically verified; TX and waveform do not confirm a changer action"
+  },
+  "volume_hold": {
+   "classification": "unverified",
+   "enabled": true,
+   "available_directions": [
+    "UP",
+    "DOWN"
+   ],
+   "hold_delay_ms": 400,
+   "heartbeat_ms": 500,
+   "lease_ms": 1200,
+   "max_hold_ms": 20000,
+   "reason": "Held VOL+/VOL- on a service connection; a short press stays one VOLUME_STEP"
+  },
+  "power": {
+   "classification": "unverified",
+   "enabled": true,
+   "available_actions": [
+    "ON",
+    "OFF"
+   ],
+   "provisional_actions": [],
+   "toggle_available": true,
+   "reason": "ROOT 0x52 ON and ROOT 0x62 OFF are physically verified; TX does not confirm execution and no power state is read back"
+  },
+  "tape2_monitor": {
+   "classification": "unverified",
+   "enabled": true,
+   "provisional": true,
+   "reason": "CONTEXT 0x48 is a historical MONITOR toggle, not yet physically validated; the indicator shows only observed receiver reports"
+  },
+  "cd_seek": {
+   "classification": "unverified",
+   "enabled": true,
+   "available_directions": [
+    "FORWARD",
+    "BACKWARD"
+   ],
+   "heartbeat_ms": 500,
+   "lease_ms": 1200,
+   "max_hold_ms": 10000,
+   "reason": "Held KEY DOWN with a service lease and maximum; TX and waveform do not confirm seeking"
+  }
+ }
+}

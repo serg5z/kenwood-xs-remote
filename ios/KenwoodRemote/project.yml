@@ -1,0 +1,57 @@
+name: KenwoodRemote
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    DEVELOPMENT_TEAM: TWMHP49N84
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  KenwoodRemote:
+    type: application
+    platform: iOS
+    sources:
+      - path: KenwoodRemote
+      # The private CA (public certificate only). Not tracked; see README.md.
+      - path: Local/KenwoodCA.der
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.woodland.KenwoodRemote
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Kenwood
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Kenwood Remote connects to the Raspberry Pi gateway (woodland-pi.local) on your home network.
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        ENABLE_PREVIEWS: YES
+  KenwoodRemoteTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: KenwoodRemoteTests
+        excludes:
+          - Fixtures
+      - path: KenwoodRemoteTests/Fixtures
+        buildPhase: resources
+    dependencies:
+      - target: KenwoodRemote
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.woodland.KenwoodRemoteTests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  KenwoodRemote:
+    build:
+      targets:
+        KenwoodRemote: all
+        KenwoodRemoteTests: [test]
+    test:
+      targets:
+        - KenwoodRemoteTests

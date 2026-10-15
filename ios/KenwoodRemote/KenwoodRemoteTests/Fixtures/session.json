@@ -1,0 +1,14 @@
+{
+ "csrf_token": "TOKEN-NOT-USED-IN-READ-ONLY-CLIENT",
+ "mute_available": true,
+ "source_available": true,
+ "receiver_query_available": true,
+ "cd_track_available": true,
+ "volume_step_available": true,
+ "cd_playback_available": true,
+ "cd_seek_available": true,
+ "volume_hold_available": true,
+ "power_available": true,
+ "tape2_monitor_available": true,
+ "cd_track_select_available": true
+}

@@ -1,0 +1,55 @@
+{
+ "gateway": "online",
+ "xs8_service": "connected",
+ "status": {
+  "state": "IDLE",
+  "stop_owed": "0",
+  "context_may_be_open": "0",
+  "monitor": "HEALTHY",
+  "last_byte": "0x13",
+  "last_gpio_tx": "TX_OK",
+  "last_waveform": "MATCH",
+  "last_stop_waveform": "NOT_OBSERVED",
+  "receiver_execution": "UNVERIFIED",
+  "receiver_source": "CD",
+  "receiver_source_ns": "2587765305239333",
+  "receiver_source_evidence": "QUERY",
+  "receiver_monitor": "OFF",
+  "receiver_monitor_ns": "2587724305239333",
+  "receiver_monitor_evidence": "QUERY",
+  "receiver_integrity": "HEALTHY",
+  "cd_state": "IDLE",
+  "cd_action": "NONE",
+  "cd_release_owed": "0",
+  "cd_lease_expired": "0",
+  "cd_last_result": "NONE"
+ },
+ "receiver": {
+  "source": {
+   "value": "CD",
+   "observed_mono_ns": 2587765305239333,
+   "evidence": "QUERY",
+   "age_ms": 4000,
+   "freshness": "FRESH"
+  },
+  "monitor": {
+   "value": "OFF",
+   "observed_mono_ns": 2587724305239333,
+   "evidence": "QUERY",
+   "age_ms": 45000,
+   "freshness": "LAST_KNOWN"
+  },
+  "integrity": "HEALTHY",
+  "receiver_execution": "UNVERIFIED"
+ },
+ "cd_changer": null,
+ "power": {
+  "value": "ON",
+  "observed_mono_ns": 2587767305239333,
+  "age_ms": 2000,
+  "evidence": "QUERY",
+  "freshness": "FRESH",
+  "diagnostic": true,
+  "receiver_execution": "UNVERIFIED"
+ }
+}
