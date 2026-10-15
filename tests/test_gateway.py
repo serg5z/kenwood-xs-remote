@@ -469,12 +469,13 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(code, 200)
         parser = DisabledControls()
         parser.feed(body.decode())
-        self.assertEqual(len(parser.buttons), 23)
+        self.assertEqual(len(parser.buttons), 24)
         self.assertTrue(all("disabled" in button for button in parser.buttons))
         for path in ("/api/v1/source", "/api/v1/mute",
                      "/api/v1/receiver/query",
                      "/api/v1/volume/step", "/api/v1/cd/transport",
-                     "/api/v1/cd/track", "/api/v1/cd/playback", "/api/v1/cd/seek",
+                     "/api/v1/cd/track", "/api/v1/cd/track/select",
+                     "/api/v1/cd/playback", "/api/v1/cd/seek",
                      "/api/v1/volume/hold", "/api/v1/power", "/api/v1/receiver/monitor",
                      "/api/v1/status", "/anything"):
             code, _ = self.request("POST", path)
@@ -2146,6 +2147,261 @@ class VolumeStepGatewayTest(GatewayTest):
                 with contextlib.redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit):
                         xs8_gateway.parse_args(list(options))
+
+
+def track_select_reply(track, sent=None, result="TX_VERIFIED", gpio="TX_OK", waveform="MATCH",
+                       head=None):
+    frames = track // 10 + 1
+    sent = frames if sent is None else sent
+    head = head or ("OK CD_TRACK_SELECT_TX" if result == "TX_VERIFIED"
+                    else "ERR CD_TRACK_SELECT_UNCERTAIN")
+    return (f"{head} track={track} frames={frames} sent={sent} gpio_tx={gpio} "
+            f"waveform={waveform} cd_result={result} receiver_execution=UNVERIFIED\n").encode()
+
+
+class CdTrackSelectGatewayTest(CdTrackGatewayTest):
+    """Direct track entry: one track number, one service transaction, never retried."""
+
+    for _name in [n for n in dir(CdTrackGatewayTest) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name
+
+    def enable_cd(self):
+        # The dedicated gate only: --enable-cd-track does not open track entry.
+        handler = self.server.RequestHandlerClass
+        handler.cd_track_select_enabled = True
+        handler.cd_track_enabled = False
+        handler.https_origin = "https://woodland-pi.local"
+        self.server.proxy_peer_verified = True
+
+    def select(self, token, cookie, track=13, body=None):
+        return self.track(token, cookie, body=body if body is not None else
+                          json.dumps({"track": track}))
+
+    def track(self, token, cookie, action="NEXT", **overrides):
+        headers = {"Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+                   "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": token,
+                   "Cookie": cookie, "Content-Type": "application/json"}
+        return self.request_full("POST", "/api/v1/cd/track/select",
+                                 body=overrides.pop("body"), headers=headers)
+
+    def fresh_token(self, cookie):
+        code, body, _ = self.request_full("GET", "/api/v1/session", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        return json.loads(body)["csrf_token"]
+
+    def test_gate_off_and_capabilities(self):
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                mute_reply=track_select_reply(13))
+        self.assertEqual(self.select("x", "x")[0], 501)
+        handler = self.server.RequestHandlerClass
+        handler.https_origin = "https://woodland-pi.local"
+        self.server.proxy_peer_verified = True
+        for other in ("cd_track_enabled", "cd_playback_enabled"):
+            with self.subTest(gate=other):
+                self.handler_flag(other, True)
+                token, cookie = self.session()
+                self.assertEqual(self.select(token, cookie)[0], 501,
+                                 f"{other} does not open track entry")
+                code, body, _ = self.request_full("GET", "/api/v1/session", headers={
+                    "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+                self.assertIs(json.loads(body)["cd_track_select_available"], False)
+                self.handler_flag(other, False)
+        operations = json.loads(self.request("GET", "/api/v1/capabilities")[1])["operations"]
+        select = operations["cd_track_select"]
+        self.assertEqual((select["min_track"], select["max_track"], select["frame_gap_ms"]),
+                         (1, 39, 200))
+        self.assertFalse(select["enabled"])
+        self.assertNotIn("track_select", operations["cd_transport"])
+        self.enable_cd()
+        token, cookie = self.session()
+        code, body, _ = self.request_full("GET", "/api/v1/session", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        self.assertIs(json.loads(body)["cd_track_select_available"], True)
+        self.assertIs(json.loads(body)["cd_track_available"], False)
+        code, body, _ = self.request_full("GET", "/api/v1/capabilities", headers={
+            "X-Kenwood-Authenticated-User": "remote", "Cookie": cookie})
+        operations = json.loads(body)["operations"]
+        self.assertTrue(operations["cd_track_select"]["enabled"])
+        self.assertFalse(operations["cd_transport"]["enabled"])
+        fake.close()
+        self.assertEqual(self.dispatched(fake), [])
+
+    def handler_flag(self, name, value):
+        setattr(self.server.RequestHandlerClass, name, value)
+
+    def test_each_track_dispatches_one_exact_command(self):
+        self.enable_cd()
+        for track in (1, 9, 10, 13, 20, 23, 39):
+            with self.subTest(track=track):
+                token, cookie = self.session()
+                self.elapse_interval()
+                fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                        mute_reply=track_select_reply(track))
+                code, body, _ = self.select(token, cookie, track)
+                replay = self.select(token, cookie, track)[0]
+                fake.close()
+                payload = json.loads(body)
+                self.assertEqual(code, 200)
+                self.assertEqual(fake.commands, [b"STATUS\n",
+                                                 f"CD_TRACK_SELECT {track}\n".encode()])
+                frames = str(track // 10 + 1)
+                self.assertEqual(
+                    {k: payload[k] for k in ("result", "action", "track", "frames", "sent",
+                                             "gpio_tx", "waveform", "cd_result",
+                                             "receiver_execution")},
+                    {"result": "SERVICE_TX_OK", "action": "SELECT", "track": track,
+                     "frames": frames, "sent": frames, "gpio_tx": "TX_OK",
+                     "waveform": "MATCH", "cd_result": "TX_VERIFIED",
+                     "receiver_execution": "UNVERIFIED"})
+                # Transmission only: nothing claims the track was selected or plays.
+                self.assertFalse({"selected", "playing", "current_track", "mapping"} &
+                                 set(payload))
+                self.assertEqual(replay, 403, "the CSRF token was single use")
+
+    def test_malformed_bodies_never_dispatch(self):
+        self.enable_cd()
+        token, cookie = self.session()
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                mute_reply=track_select_reply(13))
+        for body in ('{"track":0}', '{"track":40}', '{"track":99}', '{"track":100}',
+                     '{"track":-1}', '{"track":13.0}',
+                     '{"track":1e1}', '{"track":"13"}', '{"track":true}', '{"track":null}',
+                     '{"track":[13]}', '{"track":13,"x":1}', '{"track":13,"track":14}',
+                     '{"action":"SELECT"}', '{"track":"0xDA"}',
+                     '{"bytes":["0xDA","0x38"]}', '{"sequence":"DA 38"}', '{}', '[]',
+                     '13', '"13"', ''):
+            with self.subTest(body=body):
+                self.assertEqual(self.select(token, cookie, body=body)[0], 400)
+        fake.close()
+        self.assertEqual(self.dispatched(fake), [])
+
+    def test_status_gates_lock_and_shared_spacing(self):
+        self.enable_cd()
+        for status, result in ((CD_HOLD_STATUS, "CD_BUSY"), (CD_FAULT_STATUS, "CD_FAULT_LATCHED"),
+                               (STATUS, "NOT_ELIGIBLE")):
+            with self.subTest(result=result):
+                token, cookie = self.session()
+                self.elapse_interval()
+                fake = RecordingService(self.socket_path, status=status,
+                                        mute_reply=track_select_reply(13))
+                code, body, _ = self.select(token, cookie)
+                fake.close()
+                self.assertEqual((code, json.loads(body)["result"]), (409, result))
+                self.assertEqual(self.dispatched(fake), [])
+        self.handler_flag("cd_track_interval_ms", 1000)
+        self.handler_flag("cd_track_enabled", True)  # NEXT shares the lock and spacing.
+        token, cookie = self.session()
+        self.elapse_interval()
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                mute_reply=track_select_reply(13))
+        try:
+            self.assertEqual(self.select(token, cookie)[0], 200)
+            code, body, _ = self.track_next(self.fresh_token(cookie), cookie)
+            self.assertEqual((code, json.loads(body)["result"]), (429, "TOO_FAST"))
+            self.elapse_interval()
+            with self.server.__dict__["cd_track"]["lock"]:
+                code, body, _ = self.select(self.fresh_token(cookie), cookie)
+            self.assertEqual((code, json.loads(body)["result"]), (409, "CD_BUSY"))
+        finally:
+            fake.close()
+        self.assertEqual(self.dispatched(fake), [b"CD_TRACK_SELECT 13\n"])
+
+    def track_next(self, token, cookie):
+        headers = {"Origin": "https://woodland-pi.local", "X-Forwarded-Proto": "https",
+                   "X-Kenwood-Authenticated-User": "remote", "X-CSRF-Token": token,
+                   "Cookie": cookie, "Content-Type": "application/json"}
+        return self.request_full("POST", "/api/v1/cd/track",
+                                 body=json.dumps({"action": "NEXT"}), headers=headers)
+
+    def test_uncertain_lost_and_malformed_replies_are_never_retried(self):
+        self.enable_cd()
+        for reply, code, result, check in (
+                (track_select_reply(23, sent=2, result="TX_UNCERTAIN", waveform="MISSING"),
+                 502, "SERVICE_UNCERTAIN", True),
+                (track_select_reply(23, sent=1, result="CANCELLED"), 502,
+                 "SERVICE_UNCERTAIN", True),
+                (track_select_reply(13).replace(b"track=13", b"track=14"), 502,
+                 "INVALID_REPLY", True),
+                (track_select_reply(13).replace(b"frames=2", b"frames=3"), 502,
+                 "INVALID_REPLY", True),
+                (track_select_reply(13).replace(b"sent=2", b"sent=1"), 502,
+                 "INVALID_REPLY", True),
+                (track_select_reply(13, sent=3, result="TX_UNCERTAIN"), 502,
+                 "INVALID_REPLY", True),
+                (track_select_reply(13, sent=1, result="TX_UNCERTAIN").replace(
+                    b"frames=2", b"frames=3"), 502, "INVALID_REPLY", True),
+                (track_select_reply(13).replace(b" receiver_execution=UNVERIFIED", b""), 502,
+                 "INVALID_REPLY", True),
+                (b"ERR CD_FAULT_LATCHED\n", 409, "CD_FAULT_LATCHED", True),
+                (b"ERR CD_TRACK_BUSY\n", 409, "REJECTED", False),
+                (b"ERR CD_TRACK_SELECT_INVALID\n", 409, "REJECTED", False),
+                (None, 502, "DISCONNECTED", True)):
+            with self.subTest(reply=reply):
+                token, cookie = self.session()
+                self.elapse_interval()
+                fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                        mute_reply=reply)
+                status, body, _ = self.select(token, cookie, 13 if b"=23" not in (reply or b"")
+                                              else 23)
+                fake.close()
+                payload = json.loads(body)
+                self.assertEqual((status, payload["result"]), (code, result))
+                self.assertIs(payload["physical_check_required"], check)
+                self.assertEqual((payload["action"], payload["receiver_execution"]),
+                                 ("SELECT", "UNVERIFIED"))
+                self.assertNotIn("csrf_token", payload)
+                self.assertEqual(len(self.dispatched(fake)), 1, "sent once, never retried")
+                if result == "SERVICE_UNCERTAIN":
+                    self.assertIn(payload["cd_result"], ("TX_UNCERTAIN", "CANCELLED"))
+                    self.assertTrue(payload["sent"].isdecimal())
+        # A late reply is a timeout: reported, never retried.
+        token, cookie = self.session()
+        self.elapse_interval()
+        with mock.patch.object(xs8_gateway, "read_status", return_value={
+                "state": "IDLE", "monitor": "HEALTHY", "stop_owed": "0",
+                "context_may_be_open": "0", "cd_state": "IDLE", "cd_release_owed": "0"}):
+            fake = FakeService(self.socket_path, track_select_reply(13), delay=0.3)
+            original = xs8_gateway.send_cd_track_select
+            with mock.patch.object(xs8_gateway, "send_cd_track_select",
+                                   side_effect=lambda path, t: original(path, t, timeout=0.1)
+                                   ) as dispatch:
+                code, body, _ = self.select(token, cookie)
+            fake.close()
+        self.assertEqual((code, json.loads(body)["result"]), (504, "TIMEOUT"))
+        self.assertTrue(json.loads(body)["physical_check_required"])
+        dispatch.assert_called_once()
+        self.assertEqual(fake.commands, [b"CD_TRACK_SELECT 13\n"])
+
+    def test_sender_validates_before_any_connection_and_scales_its_timeout(self):
+        for bad in (0, 40, 99, -1, True, 13.0, "13", None):
+            with self.subTest(track=bad):
+                with self.assertRaises(xs8_gateway.MuteServiceError) as raised:
+                    xs8_gateway.send_cd_track_select("/nonexistent/xs8.sock", bad)
+                self.assertEqual(raised.exception.result, "REJECTED")
+        with mock.patch.object(xs8_gateway, "_send_control",
+                               return_value=track_select_reply(39).decode().strip()) as send:
+            xs8_gateway.send_cd_track_select("/unused", 39)
+        self.assertEqual(send.call_args[0][1], b"CD_TRACK_SELECT 39\n")
+        self.assertEqual(send.call_args[0][2], 5.0, "3 s + 0.5 s per frame for 4 frames")
+
+    def test_cli_gate_is_separate_and_default_off(self):
+        base = ["--systemd-socket", "--nginx-uid", "33", "--https-origin",
+                "https://woodland-pi.local"]
+        self.assertFalse(xs8_gateway.parse_args([]).enable_cd_track_select)
+        self.assertFalse(xs8_gateway.parse_args(["--enable-cd-track"] + base)
+                         .enable_cd_track_select)
+        self.assertTrue(xs8_gateway.parse_args(["--enable-cd-track-select"] + base)
+                        .enable_cd_track_select)
+        for options in (["--enable-cd-track-select"],
+                        ["--enable-cd-track-select", "--systemd-socket", "--nginx-uid", "33"],
+                        ["--enable-cd-track-select"] + base + ["--socket", self.socket_path],
+                        ["--enable-cd-track-select", "--enable-offline-mute"] + base +
+                        ["--socket", self.socket_path]):
+            with self.subTest(options=options):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        xs8_gateway.parse_args(options)
 
 
 class CdPlaybackGatewayTest(GatewayTest):

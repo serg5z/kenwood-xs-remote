@@ -67,6 +67,11 @@ public:
     // Absolute limit on one explicit CD hold, measured from the successful
     // CD_PRESS request; heartbeats renew only the lease, never this limit.
     static constexpr VolumeControl::Ms kCdMaxHold{10000};
+    // CD_TRACK_SELECT: tracks 1..39, a conservative operational limit (at most
+    // three +10 frames), not a changer limit; the 200 ms TX-end-to-next-TX-start
+    // gap is that of the physically verified research chains.
+    static constexpr int kTrackSelectMax = 39;
+    static constexpr VolumeControl::Ms kTrackSelectGap{200};
     // Inactivity limit for a connection-owned (KEY_DOWN) hold; repeated KEY_DOWN
     // from the owner renews it. Token holds keep the cd_lease argument.
     static constexpr VolumeControl::Ms kCdKeyInactivity{1200};
@@ -80,6 +85,7 @@ private:
     std::string volume_step(VolumeControl::Direction direction, Time now);
     std::string cd_track(uint8_t press_byte, const char *action);
     std::string cd_transport(uint8_t byte, const char *action);
+    std::string cd_track_select(const std::string& argument);
     // owner: the socket client of a connection-owned (KEY_DOWN) hold, or null
     // for a token hold. key_action: reply in KEY_UP form.
     std::string cd_press(uint8_t press_byte, const char *action, Time now,
@@ -97,6 +103,7 @@ private:
     ServiceTransmitter& tx_;
     VolumeControl volume_;
     std::function<void(Time)> wait_until_;
+    std::function<bool()> stopping_;
     VolumeControl::Ms cd_lease_;
     VolumeControl::Ms cd_max_hold_;
     std::unordered_set<uint64_t> clients_;

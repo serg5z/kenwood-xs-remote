@@ -1136,6 +1136,7 @@ int main(int argc, char **argv)
                 }
                 if (line == "CD_TRACK_NEXT" ||
                     line == "CD_TRACK_PREVIOUS" ||
+                    line.compare(0, 16, "CD_TRACK_SELECT ") == 0 ||
                     line.compare(0, 9, "CD_PRESS ") == 0 ||
                     line.compare(0, 9, "KEY_DOWN ") == 0 ||
                     line == "SELECT_SOURCE VIDEO1" || line == "SELECT_SOURCE VIDEO2" ||

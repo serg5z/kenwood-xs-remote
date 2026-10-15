@@ -36,6 +36,16 @@
 /* Held FF/REW: no long-press menu, selection or scrolling while pressed. */
 .transport-grid button[data-cd-seek] { touch-action:none; user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; }
 .transport-grid button[data-active="true"] { border-color:#a64532; box-shadow:inset 0 0 0 2px #a64532; color:#a64532; }
+/* Track # + GO: one row under the transport keys. */
+.track-entry { display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px; margin-top:12px; }
+.track-entry label { font-size:11px; font-weight:700; letter-spacing:.14em; color:#7d827e; }
+.track-entry input { width:3.6em; height:44px; padding:0 6px; border:1px solid #d6d7d0; border-radius:12px; background:#fff; color:#343b37; font:600 18px Arial,Helvetica,sans-serif; text-align:center; }
+.track-entry input:disabled { background:#edeee9; color:#90958f; }
+.track-entry button { height:44px; min-width:56px; border:1px solid #d6d7d0; border-radius:12px; background:#edeee9; color:#90958f; font:700 14px Arial,Helvetica,sans-serif; letter-spacing:.08em; }
+.track-entry button:not(:disabled) { background:#f6f5f0; color:#343b37; cursor:pointer; }
+/* Narrow phones: the label above, so the field and GO share one line. */
+@media (max-width: 379px) { .track-entry label { flex-basis:100%; } }
+.track-hint { flex-basis:100%; font-size:9px; font-weight:700; letter-spacing:.14em; color:#9a9f99; }
 .source-grid #monitor-button { position:relative; display:flex; align-items:center; justify-content:center; }
 .source-grid #monitor-button small { position:absolute; top:calc(50% + 10px); left:0; right:0; font-size:9px; line-height:1; font-weight:600; color:#7d827e; letter-spacing:.12em; }
 /* Observed MONITOR state only: fresh ON lit green; fresh OFF stays unlit like an

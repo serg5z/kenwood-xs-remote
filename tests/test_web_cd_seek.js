@@ -9,6 +9,9 @@ for (const [id, attribute] of [['cd-rew', 'data-cd-seek="BACKWARD"'], ['cd-ff', 
   ['cd-disc-skip', 'data-cd-playback="DISC_SKIP"']]) {
   assert.match(html, new RegExp(`id="${id}" disabled type="button" ${attribute}`));
 }
+assert.match(html, /id="cd-track-number" disabled type="text" inputmode="numeric"/);
+assert.match(html, /id="cd-track-go" disabled type="button"/);
+assert.ok(!/<form/.test(html), 'no form: Enter in the field never submits');
 for (const label of ['TIME DISP.', 'REPEAT', 'DISC SKIP']) {
   assert.ok(html.includes(`<small>${label}</small>`), label);
 }
@@ -55,7 +58,7 @@ const datasets = {
 function element(id) {
   if (!elements.has(id)) {
     elements.set(id, {
-      id, textContent: '', disabled: true, dataset: { ...(datasets[id] || {}) }, listeners: {},
+      id, textContent: '', value: '', disabled: true, dataset: { ...(datasets[id] || {}) }, listeners: {},
       captured: null,
       addEventListener(type, handler) { (this.listeners[type] ||= []).push(handler); },
       fire(type, event = {}) {
@@ -75,6 +78,12 @@ const stop = element('cd-stop');
 const timeDisplay = element('cd-time-display');
 const repeat = element('cd-repeat');
 const discSkip = element('cd-disc-skip');
+const trackInput = element('cd-track-number');
+const trackGo = element('cd-track-go');
+const selectPosts = [];
+const selectPlans = [];
+let trackSelect = { enabled: true, min_track: 1, max_track: 39, frame_gap_ms: 200 };
+let trackSelectAvailable = true;
 const momentary = [[timeDisplay, 'TIME_DISPLAY', 'TIME DISP\\.'], [repeat, 'REPEAT', 'REPEAT'],
   [discSkip, 'DISC_SKIP', 'DISC SKIP']];
 const next = element('cd-next');
@@ -157,11 +166,12 @@ const context = {
       return respond({ status: 200, data: { csrf_token: gatewayToken, mute_available: false,
         source_available: false, receiver_query_available: false, cd_track_available: true,
         volume_step_available: true, cd_playback_available: playbackAvailable,
-        cd_seek_available: seekAvailable } });
+        cd_seek_available: seekAvailable, cd_track_select_available: trackSelectAvailable } });
     }
     if (url === '/api/v1/capabilities') {
       return respond({ status: 200, data: { operations: {
         cd_transport: { enabled: true, available_actions: ['NEXT', 'PREVIOUS'], min_interval_ms: 250 },
+        cd_track_select: trackSelect,
         volume_step: { enabled: true, available_directions: ['UP', 'DOWN'], min_interval_ms: 250 },
         cd_playback: { enabled: playbackAvailable, available_actions: playbackActions },
         cd_seek: { enabled: seekAvailable, available_directions: ['FORWARD', 'BACKWARD'],
@@ -180,6 +190,27 @@ const context = {
         receiver_execution: 'UNVERIFIED' } });
       return respond({ status: 200, data: { result: 'SERVICE_TX_OK', action: record.body.action,
         receiver_execution: 'UNVERIFIED' } });
+    }
+    if (url === '/api/v1/cd/track/select') {
+      const record = { body: JSON.parse(options.body), token: options.headers['X-CSRF-Token'],
+        signal: options.signal };
+      selectPosts.push(record);
+      if (record.token !== gatewayToken) {
+        forbidden.push(record);
+        return respond({ status: 403, data: { error: 'Invalid CSRF token' } });
+      }
+      gatewayToken = `t${++rotations}`;
+      const plan = selectPlans.shift();
+      const track = record.body.track;
+      if (plan === 'hang') {
+        return new Promise((resolve, reject) => {
+          options.signal.addEventListener('abort', () => reject(new Error('aborted')));
+        });
+      }
+      if (plan) return respond({ status: plan.status, data: { ...plan.data, action: 'SELECT', track,
+        receiver_execution: 'UNVERIFIED' } });
+      return respond({ status: 200, data: { result: 'SERVICE_TX_OK', action: 'SELECT', track,
+        cd_result: 'TX_VERIFIED', receiver_execution: 'UNVERIFIED' } });
     }
     if (url === '/api/v1/cd/seek') {
       const plan = plans.shift();
@@ -508,13 +539,96 @@ async function main() {
   playbackActions = ['PLAY_PAUSE', 'STOP', 'TIME_DISPLAY', 'REPEAT', 'DISC_SKIP'];
   await advance(6000);
 
+  // 13e. Track # + GO: only a valid number enables GO; one POST carries only it.
+  await advance(1000);
+  for (const text of ['', ' ', '0', '00', '013', '40', '99', '100', '1a', '-1', '+5', '1.5', '1e1',
+    '٣']) {
+    trackInput.value = text;
+    await trackInput.fire('input');
+    assert.equal(trackInput.disabled, false, 'the field is usable');
+    assert.equal(trackGo.disabled, true, `GO disabled for ${JSON.stringify(text)}`);
+    await trackGo.fire('click');
+  }
+  await settle();
+  assert.equal(selectPosts.length, 0, 'invalid input never sends');
+  for (const track of [1, 9, 10, 13, 20, 23, 39]) {
+    await advance(1000);
+    trackInput.value = String(track);
+    await trackInput.fire('input');
+    assert.equal(trackGo.disabled, false, `GO enabled for ${track}`);
+    const before = selectPosts.length;
+    await trackGo.fire('click');
+    await settle();
+    assert.deepEqual(selectPosts.slice(before).map((p) => p.body), [{ track }]);
+    assert.match(availability(), new RegExp(`^TRACK ${track} TX VERIFIED · TRACK SELECTION UNVERIFIED`));
+    assert.doesNotMatch(availability(), /PLAYING|SELECTED(?! ?UNVERIFIED)/);
+    // A second click inside the shared CD spacing sends nothing.
+    await trackGo.fire('click');
+    await settle();
+    assert.equal(selectPosts.length, before + 1, `spacing after ${track}`);
+  }
+  // Failures are shown, never retried; a refusal says nothing was sent.
+  for (const [plan, pattern] of [
+    [{ status: 502, data: { result: 'SERVICE_UNCERTAIN', cd_result: 'TX_UNCERTAIN', sent: '2',
+      physical_check_required: true } }, /^TRACK 23 SERVICE_UNCERTAIN · CHECK CHANGER/],
+    [{ status: 502, data: { result: 'DISCONNECTED', physical_check_required: true } },
+      /^TRACK 23 DISCONNECTED · CHECK CHANGER/],
+    [{ status: 409, data: { result: 'CD_BUSY' } }, /^TRACK 23 CD_BUSY · NOTHING SENT/]]) {
+    await advance(1000);
+    trackInput.value = '23';
+    await trackInput.fire('input');
+    const before = selectPosts.length;
+    selectPlans.push(plan);
+    await trackGo.fire('click');
+    await settle();
+    assert.match(availability(), pattern);
+    await advance(6000);
+    assert.equal(selectPosts.length, before + 1, 'never retried');
+  }
+  // A lost response ends at the 12 s browser timeout, unretried.
+  await advance(1000);
+  trackInput.value = '13';
+  await trackInput.fire('input');
+  selectPlans.push('hang');
+  const lostBefore = selectPosts.length;
+  const pending = trackGo.fire('click');
+  await advance(11000);
+  assert.equal(trackGo.disabled, true, 'still waiting at 11 s');
+  await advance(1500);
+  await pending;
+  assert.match(availability(), /^CD RESULT UNKNOWN · CHECK CHANGER/);
+  await advance(6000);
+  assert.equal(selectPosts.length, lostBefore + 1, 'a lost reply is never resent');
+  // The dedicated gate off (session flag or capability), or a range above the v1
+  // limit: the field and GO stay disabled and nothing is sent.
+  for (const change of [() => { trackSelectAvailable = false; },
+    () => { trackSelect = { ...trackSelect, enabled: false }; },
+    () => { trackSelect = { ...trackSelect, max_track: 99 }; }]) {
+    change();
+    await advance(6000);
+    trackInput.value = '5';
+    await trackInput.fire('input');
+    assert.equal(trackInput.disabled, true);
+    assert.equal(trackGo.disabled, true);
+    await trackGo.fire('click');
+    await settle();
+    assert.equal(selectPosts.length, lostBefore + 1);
+    trackSelectAvailable = true;
+    trackSelect = { enabled: true, min_track: 1, max_track: 39, frame_gap_ms: 200 };
+  }
+  await advance(6000);
+  assert.equal(trackGo.disabled, false, 'restored');
+  assert.deepEqual(forbidden, []);
+
   // 14. Unavailable capability or a CD hold keeps the controls disabled.
   for (const change of [() => { seekAvailable = false; playbackAvailable = false; },
     () => { cdState = 'HOLDING'; }]) {
     seekAvailable = true; playbackAvailable = true; cdState = 'IDLE';
     change();
     await advance(6000);
-    for (const button of [ff, rew, playPause, stop, timeDisplay, repeat, discSkip]) {
+    // Track # + GO follows the CD track gate, so only a CD hold disables it here.
+    const track = cdState === 'HOLDING' ? [trackInput, trackGo] : [];
+    for (const button of [ff, rew, playPause, stop, timeDisplay, repeat, discSkip, ...track]) {
       assert.equal(button.disabled, true, button.id);
     }
     const before = requests.length + playbackPosts.length;

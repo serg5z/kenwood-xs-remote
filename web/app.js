@@ -10,6 +10,12 @@ const playbackButtons = ['cd-play-pause', 'cd-stop', 'cd-time-display', 'cd-repe
 const PLAYBACK_LABELS = { PLAY_PAUSE: 'PLAY/PAUSE', STOP: 'STOP', TIME_DISPLAY: 'TIME DISP.',
   REPEAT: 'REPEAT', DISC_SKIP: 'DISC SKIP' };
 const seekButtons = [document.getElementById('cd-rew'), document.getElementById('cd-ff')];
+const trackInput = document.getElementById('cd-track-number');
+const trackGo = document.getElementById('cd-track-go');
+// Direct track entry has its own Gateway gate and range (at most 1..39 in v1).
+let trackSelectReady = false;
+let trackSelectMax = 39;
+const TRACK_SELECT_TIMEOUT_MS = 12000;
 const monitorButton = document.getElementById('monitor-button');
 const powerButtons = [document.getElementById('power-on'), document.getElementById('power-off')];
 const powerTrigger = document.getElementById('power-button');
@@ -103,6 +109,10 @@ function updateControls() {
       !enabledSources.includes(button.dataset.source);
   }
   const gesture = prevGestureActive();
+  // The field and GO follow the CD track controls; GO also needs a valid number.
+  trackInput.disabled = controlBusy || !csrfToken || !serviceReady ||
+    !trackSelectReady || !!gesture || !!seek;
+  trackGo.disabled = trackInput.disabled || enteredTrack() === null;
   for (const button of cdButtons) {
     const receptive = gesture && button.dataset.cdAction === 'PREVIOUS';
     // During a PREV gesture the PREV button stays clickable so a second tap reaches
@@ -246,6 +256,13 @@ function applyRefresh(statusData, sessionData, capabilitiesData) {
     !!status && status.cd_state === 'IDLE' && status.cd_release_owed === '0' &&
     !!cd && cd.enabled === true && Array.isArray(cd.available_actions);
   enabledCdActions = cdReady ? cd.available_actions : [];
+  const select = capabilitiesData && capabilitiesData.operations &&
+    capabilitiesData.operations.cd_track_select;
+  trackSelectReady = !!csrfToken && sessionData.cd_track_select_available === true &&
+    !!status && status.cd_state === 'IDLE' && status.cd_release_owed === '0' &&
+    !!select && select.enabled === true && select.min_track === 1 &&
+    Number.isInteger(select.max_track) && select.max_track >= 1 && select.max_track <= 39;
+  if (trackSelectReady) trackSelectMax = select.max_track;
   cdIntervalMs = cd && Number.isInteger(cd.min_interval_ms) && (cd.min_interval_ms === 0 ||
     (cd.min_interval_ms >= 200 && cd.min_interval_ms <= 1000)) ? cd.min_interval_ms : 1000;
   const cdIdle = !!status && status.cd_state === 'IDLE' && status.cd_release_owed === '0';
@@ -377,7 +394,8 @@ async function refresh() {
               session.data.cd_seek_available === true ||
               session.data.volume_hold_available === true ||
               session.data.power_available === true ||
-              session.data.tape2_monitor_available === true) {
+              session.data.tape2_monitor_available === true ||
+              session.data.cd_track_select_available === true) {
             try {
               const capabilities = await fetchJson('/api/v1/capabilities', {
                 cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
@@ -467,7 +485,8 @@ async function sendControl(url, body, success, failure, options = {}) {
   } catch (_) {
     controlResult = url.endsWith('/mute') ? 'MUTE RESULT UNKNOWN · CHECK RECEIVER'
       : url.endsWith('/query') ? 'SYNC RESULT UNKNOWN · CHECK RECEIVER'
-      : url.endsWith('/cd/track') || url.endsWith('/cd/playback')
+      : url.endsWith('/cd/track') || url.endsWith('/cd/playback') ||
+        url.endsWith('/cd/track/select')
         ? 'CD RESULT UNKNOWN · CHECK CHANGER'
       : url.endsWith('/volume/step') ? 'VOLUME RESULT UNKNOWN · CHECK RECEIVER'
       : url.endsWith('/power') ? 'POWER RESULT UNKNOWN · CHECK RECEIVER'
@@ -476,7 +495,9 @@ async function sendControl(url, body, success, failure, options = {}) {
   } finally {
     clearTimeout(timeout);
     if (url.endsWith('/volume/step')) lastVolumeCompleted = Date.now();
-    if (url.endsWith('/cd/playback')) lastCdCompleted = Date.now();
+    if (url.endsWith('/cd/playback') || url.endsWith('/cd/track/select')) {
+      lastCdCompleted = Date.now();
+    }
     if (url.endsWith('/cd/track')) {
       lastCdCompleted = Date.now();
       if (cdTiming) { cdTiming.completed = lastCdCompleted; cdTiming.awaitingRefresh = true; }
@@ -581,6 +602,27 @@ for (const button of playbackButtons) {
       (data) => cdFailure(label, data));
   });
 }
+
+// Track # + GO: one request carrying only the track number. The service sends
+// the +10 and digit frames; the Web reports transmission, never the track.
+function enteredTrack() {
+  const text = String(trackInput.value || '').trim();
+  if (!/^[1-9][0-9]?$/.test(text)) return null;
+  const track = Number(text);
+  return track <= trackSelectMax ? track : null;
+}
+
+trackInput.addEventListener('input', () => updateControls());
+
+trackGo.addEventListener('click', async () => {
+  if (trackGo.disabled || controlBusy || seek ||
+      Date.now() - lastCdCompleted < cdIntervalMs) return;
+  const track = enteredTrack();
+  if (track === null) return;
+  await sendControl('/api/v1/cd/track/select', JSON.stringify({ track }),
+    `TRACK ${track} TX VERIFIED · TRACK SELECTION UNVERIFIED`,
+    (data) => cdFailure(`TRACK ${track}`, data), { timeoutMs: TRACK_SELECT_TIMEOUT_MS });
+});
 
 // Held controls: CD FF/REW and Web volume. Both use one connection-owned
 // service hold through the Gateway; only one hold of either kind exists at once.

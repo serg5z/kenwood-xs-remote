@@ -65,6 +65,12 @@ CD_PLAYBACK_COMMANDS = {"PLAY_PAUSE": "CD_PLAY_PAUSE", "STOP": "CD_STOP",
                         "TIME_DISPLAY": "CD_TIME_DISPLAY", "REPEAT": "CD_REPEAT",
                         "DISC_SKIP": "CD_DISC_SKIP"}
 CD_PLAYBACK_ACTIONS = tuple(CD_PLAYBACK_COMMANDS)
+# Direct track entry. The service sends floor(N/10) ROOT 0xDA (+10) frames, then
+# one digit frame, 200 ms apart; only the track number crosses this API. 1-39 is
+# a conservative operational limit (at most three +10 frames), not a changer
+# limit: the operator verified tracks 10, 13 and 23 (two +10 frames at most).
+CD_TRACK_SELECT_RANGE = (1, 39)
+CD_TRACK_SELECT_GAP_MS = 200
 CD_PROVISIONAL_ACTIONS = ("PLAY_PAUSE",)
 # Held FF/REW through the service's CD hold API. The service lease (2 s) and
 # maximum (10 s) stay authoritative; these values only pace and bound clients.
@@ -329,6 +335,50 @@ def send_cd_track(socket_path, action, timeout=3.0):
             parts[1] not in ("CD_TRACK_TX", "CD_TRACK_UNCERTAIN")):
         raise MuteServiceError("REJECTED", line)
     raise MuteServiceError("INVALID_REPLY", "Invalid XS8 CD track reply")
+
+
+def cd_track_select_frames(track):
+    return track // 10 + 1
+
+
+def send_cd_track_select(socket_path, track, timeout=None):
+    """One direct track entry as a single service transaction; never retried."""
+    if (not isinstance(track, int) or isinstance(track, bool) or
+            not CD_TRACK_SELECT_RANGE[0] <= track <= CD_TRACK_SELECT_RANGE[1]):
+        raise MuteServiceError("REJECTED", "CD track is outside the allowed range")
+    frames = cd_track_select_frames(track)
+    if timeout is None:
+        # Each frame is about 0.1 s and each gap 0.2 s; leave a wide margin
+        # (5 s for the four frames of tracks 30-39).
+        timeout = 3.0 + 0.5 * frames
+    line = _send_control(socket_path, f"CD_TRACK_SELECT {track}\n".encode("ascii"),
+                         timeout, fake_only=False, max_reply=512)
+    parts = line.split()
+    if len(parts) == 9 and parts[8] == "receiver_execution=UNVERIFIED":
+        evidence = _evidence(parts[2:8], ("track", "frames", "sent", "gpio_tx",
+                                          "waveform", "cd_result"))
+        if (evidence and evidence["track"] == str(track) and
+                evidence["frames"] == str(frames) and evidence["sent"].isdecimal() and
+                1 <= int(evidence["sent"]) <= frames and
+                evidence["gpio_tx"] in ("TX_OK", "TX_FAIL") and
+                evidence["waveform"] in CD_WAVEFORMS):
+            del evidence["track"]
+            evidence["receiver_execution"] = "UNVERIFIED"
+            if parts[:2] == ["OK", "CD_TRACK_SELECT_TX"] and evidence == {
+                    "frames": str(frames), "sent": str(frames), "gpio_tx": "TX_OK",
+                    "waveform": "MATCH", "cd_result": "TX_VERIFIED",
+                    "receiver_execution": "UNVERIFIED"}:
+                return evidence
+            if (parts[:2] == ["ERR", "CD_TRACK_SELECT_UNCERTAIN"] and
+                    evidence["cd_result"] in ("TX_UNCERTAIN", "CANCELLED")):
+                raise MuteServiceError("SERVICE_UNCERTAIN", line, evidence)
+    if line == "ERR CD_FAULT_LATCHED":
+        raise MuteServiceError("CD_FAULT_LATCHED", line)
+    # A malformed TX report is uncertain, never a clean pre-TX refusal.
+    if (line.startswith("ERR ") and len(parts) >= 2 and
+            parts[1] not in ("CD_TRACK_SELECT_TX", "CD_TRACK_SELECT_UNCERTAIN")):
+        raise MuteServiceError("REJECTED", line)
+    raise MuteServiceError("INVALID_REPLY", "Invalid XS8 CD track selection reply")
 
 
 def _evidence(parts, keys):
@@ -724,7 +774,8 @@ def capabilities(mute_available=False, source_available=False, query_available=F
                  volume_step_available=False, cd_playback_available=False,
                  cd_seek_available=False, cd_blocked_actions=CD_BLOCKED_ACTIONS,
                  volume_hold_available=False, power_available=False,
-                 tape2_monitor_available=False, power_toggle_available=False):
+                 tape2_monitor_available=False, power_toggle_available=False,
+                 cd_track_select_available=False):
     return {
         "api_version": "v0.1",
         "operations": {
@@ -745,6 +796,14 @@ def capabilities(mute_available=False, source_available=False, query_available=F
                 "available_sources": list(EVIDENCED_SOURCES),
                 "blocked_sources": [s for s in SOURCES if s not in EVIDENCED_SOURCES],
                 "reason": "TX and waveform do not confirm receiver execution; TAPE2 is a MONITOR, not a source selection",
+            },
+            "cd_track_select": {
+                "classification": "unverified", "enabled": cd_track_select_available,
+                "min_track": CD_TRACK_SELECT_RANGE[0],
+                "max_track": CD_TRACK_SELECT_RANGE[1],
+                "frame_gap_ms": CD_TRACK_SELECT_GAP_MS,
+                "min_interval_ms": cd_track_interval_ms,
+                "reason": "Track N is floor(N/10) ROOT 0xDA then one digit frame; 1-39 is an operational limit; TX and waveform do not confirm the track",
             },
             "cd_transport": {
                 "classification": "unverified", "enabled": cd_track_available,
@@ -852,6 +911,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
     volume_hold_enabled = False
     power_enabled = False
     tape2_monitor_enabled = False
+    cd_track_select_enabled = False
     https_origin = None
     sessions = None
 
@@ -863,7 +923,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.receiver_query_enabled or self.cd_track_enabled or
                 self.volume_step_enabled or self.cd_playback_enabled or
                 self.cd_seek_enabled or self.volume_hold_enabled or
-                self.power_enabled or self.tape2_monitor_enabled)
+                self.power_enabled or self.tape2_monitor_enabled or
+                self.cd_track_select_enabled)
 
     def authenticated_user(self):
         # nginx overwrites this header with $remote_user after Basic Auth.
@@ -952,7 +1013,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "power": (self.power_enabled and status is not None and
                           self.status_allows_cd_track(status)),
                 "tape2_monitor": (self.tape2_monitor_enabled and status is not None and
-                                  self.status_allows_volume_step(status))}
+                                  self.status_allows_volume_step(status)),
+                "cd_track_select": (self.cd_track_select_enabled and status is not None and
+                                    self.status_allows_cd_track(status))}
 
     def cd_blocked_actions(self):
         enabled = ((CD_PLAYBACK_ACTIONS if self.cd_playback_enabled else ()) +
@@ -1010,7 +1073,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                               available["volume_hold"], available["power"],
                                               available["tape2_monitor"],
                                               power_toggle_available=available["power"] and
-                                              self.receiver_query_enabled))
+                                              self.receiver_query_enabled,
+                                              cd_track_select_available=available[
+                                                  "cd_track_select"]))
             return
         if path == "/api/v1/session" and self.control_enabled():
             user = self.authenticated_user()
@@ -1037,7 +1102,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                  "cd_seek_available": available["cd_seek"],
                                  "volume_hold_available": available["volume_hold"],
                                  "power_available": available["power"],
-                                 "tape2_monitor_available": available["tape2_monitor"]}, headers)
+                                 "tape2_monitor_available": available["tape2_monitor"],
+                                 "cd_track_select_available": available["cd_track_select"]},
+                           headers)
             return
         assets = {
             "/": ("index.html", "text/html; charset=utf-8"),
@@ -1061,6 +1128,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return send_cd_track(self.socket_path, action)
         finally:
             # Any dispatch outcome, including timeout, starts the interval.
+            self.cd_track_state()["completed"] = time.monotonic()
+            self.add_timing("xs8cd", started)
+
+    def dispatch_cd_track_select(self, track):
+        started = time.monotonic()
+        try:
+            return send_cd_track_select(self.socket_path, track)
+        finally:
+            # Any outcome, including a timeout, starts the shared CD interval.
             self.cd_track_state()["completed"] = time.monotonic()
             self.add_timing("xs8cd", started)
 
@@ -1316,6 +1392,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         is_source = path == "/api/v1/source" and self.production_source_enabled
         is_query = path == "/api/v1/receiver/query" and self.receiver_query_enabled
         is_cd = path == "/api/v1/cd/track" and self.cd_track_enabled
+        # Direct track entry has its own default-off gate; it shares the CD track
+        # locks, spacing and checks.
+        is_select = path == "/api/v1/cd/track/select" and self.cd_track_select_enabled
         is_volume = path == "/api/v1/volume/step" and self.volume_step_enabled
         is_playback = path == "/api/v1/cd/playback" and self.cd_playback_enabled
         is_seek = path == "/api/v1/cd/seek" and self.cd_seek_enabled
@@ -1323,7 +1402,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         is_power = path == "/api/v1/power" and self.power_enabled
         is_toggle = False
         is_monitor = path == "/api/v1/receiver/monitor" and self.tape2_monitor_enabled
-        if (not (is_mute or is_source or is_query or is_cd or is_volume or
+        if (not (is_mute or is_source or is_query or is_cd or is_select or is_volume or
                  is_playback or is_seek or is_volume_hold or is_power or is_monitor) or
                 not getattr(self.server, "proxy_peer_verified", False)):
             length = self.headers.get("Content-Length", "")
@@ -1420,21 +1499,36 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.send_json(409, {"result": "BUSY", "power_sent": False,
                                      "receiver_execution": "UNVERIFIED"})
                 return
-        elif is_cd or is_playback:
+        elif is_cd or is_playback or is_select:
+            key = "track" if is_select else "action"
             try:
                 pairs = json.loads(body, object_pairs_hook=list)
-                action = (pairs[0][1] if isinstance(pairs, list) and
-                          len(pairs) == 1 and isinstance(pairs[0], tuple) and
-                          pairs[0][0] == "action" else None)
+                value = (pairs[0][1] if isinstance(pairs, list) and
+                         len(pairs) == 1 and isinstance(pairs[0], tuple) and
+                         pairs[0][0] == key else None)
             except (UnicodeError, ValueError, TypeError, IndexError):
-                action = None
-            if not isinstance(action, str) or action not in (
+                value = None
+            if is_select:
+                # Exactly {"track": N}: a JSON integer in range, never a string,
+                # float, boolean, byte value or list.
+                if (not isinstance(value, int) or isinstance(value, bool) or
+                        not CD_TRACK_SELECT_RANGE[0] <= value <= CD_TRACK_SELECT_RANGE[1]):
+                    self.send_json(400, {"error": "Expected one track number from %d to %d"
+                                         % CD_TRACK_SELECT_RANGE})
+                    return
+                track, action = value, "SELECT"
+                self.cd_kind = "CD_TRACK_SELECT"
+                # The rest of the request follows the CD track path exactly.
+                is_cd = True
+            elif not isinstance(value, str) or value not in (
                     CD_TRACK_ACTIONS if is_cd else CD_PLAYBACK_ACTIONS):
                 self.send_json(400, {"error": "Expected one allowlisted CD action"})
                 return
+            else:
+                action = value
             if is_playback:
                 self.cd_kind = "CD_PLAYBACK"
-            self.cd_action = action
+            self.cd_action = str(track) if is_select else action
             state = self.cd_track_state()
             if state["completed"] != float("-inf"):
                 # Not work time: how long since the previous CD dispatch completed.
@@ -1567,6 +1661,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         try:
             reply = (send_mute(self.socket_path, fake_only=not self.production_mute_enabled)
                      if is_mute else self.observed_query(settle=False) if is_query
+                     else self.dispatch_cd_track_select(track) if is_select
                      else self.dispatch_cd_track(action) if is_cd
                      else self.dispatch_cd_playback(action) if is_playback
                      else self.dispatch_volume_step(direction) if is_volume
@@ -1613,6 +1708,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "UNAVAILABLE", "REJECTED")
             if is_cd or is_playback:
                 payload["action"] = action
+                if is_select:
+                    payload["track"] = track
                 # Anything but a clean refusal may have moved the changer.
                 payload["physical_check_required"] = exc.result not in (
                     "UNAVAILABLE", "REJECTED")
@@ -1632,6 +1729,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             payload["csrf_token"] = session["csrf"]
         elif is_cd or is_playback:
             payload["action"] = action
+            if is_select:
+                payload["track"] = track
             if action in CD_PROVISIONAL_ACTIONS:
                 payload["mapping"] = "PROVISIONAL"
             payload.update(reply)
@@ -1914,6 +2013,9 @@ def parse_args(argv=None):
                         help="enable one explicit authenticated receiver status query")
     parser.add_argument("--enable-cd-track", action="store_true",
                         help="enable discrete CD NEXT/PREVIOUS through the real local XS8 Service")
+    parser.add_argument("--enable-cd-track-select", action="store_true",
+                        help="enable direct CD track entry (tracks 1-39) through the real local "
+                             "XS8 Service; independent of --enable-cd-track")
     parser.add_argument("--enable-volume", action="store_true",
                         help="enable single atomic VOLUME_STEP taps through the real local XS8 Service")
     parser.add_argument("--enable-cd-playback", action="store_true",
@@ -1954,12 +2056,13 @@ def parse_args(argv=None):
                                     args.enable_receiver_query or args.enable_cd_track or
                                     args.enable_volume or args.enable_cd_playback or
                                     args.enable_cd_seek or args.enable_volume_hold or
-                                    args.enable_power or args.enable_tape2_monitor):
+                                    args.enable_power or args.enable_tape2_monitor or
+                                    args.enable_cd_track_select):
         parser.error("offline and production MUTE modes are mutually exclusive")
     if (args.enable_offline_mute or args.enable_mute or args.enable_source or
             args.enable_receiver_query or args.enable_cd_track or args.enable_volume or
             args.enable_cd_playback or args.enable_cd_seek or args.enable_volume_hold or
-            args.enable_power or args.enable_tape2_monitor):
+            args.enable_power or args.enable_tape2_monitor or args.enable_cd_track_select):
         if not args.systemd_socket or not args.https_origin:
             parser.error("active controls require --systemd-socket and --https-origin")
         try:
@@ -2025,6 +2128,7 @@ def main(argv=None):
                     "volume_hold_enabled": args.enable_volume_hold,
                     "power_enabled": args.enable_power,
                     "tape2_monitor_enabled": args.enable_tape2_monitor,
+                    "cd_track_select_enabled": args.enable_cd_track_select,
                     "https_origin": args.https_origin, "sessions": {}})
     if args.systemd_socket:
         try:
@@ -2043,7 +2147,8 @@ def main(argv=None):
                     ("CD SEEK", args.enable_cd_seek),
                     ("VOLUME HOLD", args.enable_volume_hold),
                     ("POWER", args.enable_power),
-                    ("TAPE2 MONITOR", args.enable_tape2_monitor))
+                    ("TAPE2 MONITOR", args.enable_tape2_monitor),
+                    ("CD TRACK SELECT", args.enable_cd_track_select))
                     if enabled) or "read-only")
         print(f"XS8 gateway listening on {GATEWAY_SOCKET} ({mode})")
     else:

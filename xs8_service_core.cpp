@@ -91,11 +91,12 @@ Xs8ServiceCore::Xs8ServiceCore(ServiceTransmitter& tx,
     std::function<void(Time)> wait_until, VolumeControl::Ms cd_lease,
     VolumeControl::Ms cd_max_hold)
     : tx_(tx), volume_(tx, VolumeControl::Ms(1200), max_hold,
-                       std::move(stopping), std::move(now)),
+                       stopping, std::move(now)),
       wait_until_(wait_until ? std::move(wait_until) :
           std::function<void(Time)>([](Time deadline) {
               std::this_thread::sleep_until(deadline);
-          })), cd_lease_(cd_lease), cd_max_hold_(cd_max_hold)
+          })), stopping_(std::move(stopping)), cd_lease_(cd_lease),
+      cd_max_hold_(cd_max_hold)
 {
     // This sends no command. No automatic recovery is available in phase 1.
     volume_.startup(false, operator_authorized);
@@ -310,6 +311,74 @@ std::string Xs8ServiceCore::cd_track(uint8_t press_byte, const char *action)
         " release_waveform=" + waveform_name(release.waveform) +
         " cd_result=" + cd_last_result_ +
         " receiver_execution=UNVERIFIED\n";
+}
+
+// Direct CD track entry: floor(N/10) ROOT 0xDA (+10) frames, then one ROOT digit
+// frame (N % 10) << 4 | 0x08. Physically verified by the operator for tracks 10
+// (DA 08), 13 (DA 38) and 23 (DA DA 38) with 200 ms gaps. One synchronous transaction: the
+// single control loop serves no other client until it ends, so no frame can
+// interleave. The first unverified frame ends it, as does shutdown or a failed
+// wait between frames: nothing is resent and no later frame is sent. No KEY UP
+// or release obligation exists, so no CD fault is latched (as for single keys).
+std::string Xs8ServiceCore::cd_track_select(const std::string& argument)
+{
+    // Canonical decimal 1..kTrackSelectMax only: no sign, leading zero or space.
+    int track = 0;
+    const char *first = argument.data();
+    const char *last = first + argument.size();
+    const auto parsed = std::from_chars(first, last, track);
+    if (argument.empty() || argument[0] == '0' || argument[0] == '+' ||
+        argument[0] == '-' || parsed.ec != std::errc() || parsed.ptr != last ||
+        track < 1 || track > kTrackSelectMax)
+        return "ERR CD_TRACK_SELECT_INVALID\n";
+    const std::string denied = cd_preflight();
+    if (!denied.empty()) return denied;
+    if (stopping_ && stopping_()) return "ERR SHUTDOWN\n";
+    std::vector<uint8_t> frames(static_cast<size_t>(track / 10), 0xDA);
+    frames.push_back(static_cast<uint8_t>(((track % 10) << 4) | 0x08));
+    cd_lease_expired_ = false;
+    cd_active_ = true;
+    cd_action_ = "TRACK_SELECT";
+    std::string result = "TX_VERIFIED";
+    ServiceTxEvidence evidence{};
+    size_t sent = 0;
+    Time previous_end{};
+    for (const uint8_t byte : frames) {
+        if (sent > 0) {
+            bool waited = true;
+            try { wait_until_(previous_end + kTrackSelectGap); }
+            catch (...) { waited = false; }
+            if (!waited || (stopping_ && stopping_())) {
+                result = "CANCELLED";
+                break;
+            }
+        }
+        bool verified = false;
+        bool threw = false;
+        try { verified = tx_.send(byte); }
+        catch (...) { threw = true; }
+        ++sent;
+        evidence = threw ? ServiceTxEvidence{} : tx_.last_evidence();
+        previous_end = threw ? Time{} : tx_.last_tx_end_time();
+        if (!(verified && evidence.attempted && evidence.byte == byte &&
+              evidence.gpio_completed && evidence.waveform == WaveformEvidence::MATCH &&
+              previous_end != Time{})) {
+            result = "TX_UNCERTAIN";
+            break;
+        }
+    }
+    cd_active_ = false;
+    cd_last_result_ = result;
+    const std::string fields = " track=" + std::to_string(track) +
+        " frames=" + std::to_string(frames.size()) +
+        " sent=" + std::to_string(sent) +
+        " gpio_tx=" + (evidence.gpio_completed ? "TX_OK" : "TX_FAIL") +
+        " waveform=" + waveform_name(evidence.waveform) +
+        " cd_result=" + result + " receiver_execution=UNVERIFIED";
+    std::fprintf(stderr, "XS8 CD_TRACK_SELECT%s\n", fields.c_str());
+    return std::string(result == "TX_VERIFIED" ? "OK CD_TRACK_SELECT_TX"
+                                               : "ERR CD_TRACK_SELECT_UNCERTAIN") +
+        fields + "\n";
 }
 
 std::string Xs8ServiceCore::cd_transport(uint8_t byte, const char *action)
@@ -565,6 +634,8 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
     if (line == "CD_REPEAT") return cd_transport(0xCC, "REPEAT");
     if (line == "CD_DISC_SKIP") return cd_transport(0x8A, "DISC_SKIP");
     if (line == "CD_TRACK_NEXT") return cd_track(0xFC, "NEXT");
+    if (line.compare(0, 16, "CD_TRACK_SELECT ") == 0)
+        return cd_track_select(line.substr(16));
     if (line == "CD_TRACK_PREVIOUS") return cd_track(0xEC, "PREVIOUS");
     if (line.compare(0, 14, "SELECT_SOURCE ") == 0) {
         const std::string name = line.substr(14);

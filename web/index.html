@@ -91,6 +91,12 @@
                 <small>DISC SKIP</small>
               </button>
             </div>
+            <div class="track-entry">
+              <label for="cd-track-number">TRACK #</label>
+              <input id="cd-track-number" disabled type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off" placeholder="1–39" aria-describedby="cd-track-hint">
+              <button id="cd-track-go" disabled type="button" aria-label="Go to the entered track">GO</button>
+              <span id="cd-track-hint" class="track-hint">TX ONLY · CHECK CHANGER</span>
+            </div>
           </section>
         </div>
 

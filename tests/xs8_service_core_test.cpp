@@ -4,6 +4,7 @@
 #include <cassert>
 #include <deque>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
 using Clock = VolumeControl::Clock;
@@ -2116,6 +2117,151 @@ static void test_volume_key_hold()
     assert(cd_tx.sent == (Bytes{0x7A}));
 }
 
+
+static void test_cd_track_select()
+{
+    using Bytes = std::vector<uint8_t>;
+    struct Case { int track; Bytes bytes; };
+    const Case cases[] = {
+        {1, {0x18}}, {9, {0x98}}, {10, {0xDA, 0x08}}, {13, {0xDA, 0x38}},
+        {20, {0xDA, 0xDA, 0x08}}, {23, {0xDA, 0xDA, 0x38}},
+        {39, {0xDA, 0xDA, 0xDA, 0x98}}};
+    for (const auto& c : cases) {
+        FakeTx tx;
+        tx.end_time = at(100);
+        std::vector<Clock::time_point> deadlines;
+        // Each wait ends one frame later: the next frame's TX ends 50 ms after it.
+        Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); },
+            [&](Clock::time_point deadline) {
+                deadlines.push_back(deadline);
+                tx.end_time = deadline + Ms(50);
+            });
+        core.connected();
+        const std::string n = std::to_string(c.track);
+        const std::string frames = std::to_string(c.bytes.size());
+        assert(core.command("CD_TRACK_SELECT " + n, at(1), at(1)) ==
+               "OK CD_TRACK_SELECT_TX track=" + n + " frames=" + frames + " sent=" + frames +
+               " gpio_tx=TX_OK waveform=MATCH cd_result=TX_VERIFIED "
+               "receiver_execution=UNVERIFIED\n");
+        assert(tx.sent == c.bytes);
+        // 200 ms from each verified frame's TX end to the next frame's start.
+        assert(deadlines.size() == c.bytes.size() - 1);
+        for (size_t i = 0; i < deadlines.size(); ++i)
+            assert(deadlines[i] == (i == 0 ? at(100) : deadlines[i - 1] + Ms(50)) + Ms(200));
+        assert(!core.cd_fault() && !core.cd_release_owed());
+        assert(status_has(core, 2, " cd_state=IDLE "));
+        assert(status_has(core, 2, " cd_action=TRACK_SELECT "));
+        assert(status_has(core, 2, " cd_last_result=TX_VERIFIED "));
+        core.tick(at(20000));
+        assert(tx.sent == c.bytes); // Nothing more, ever.
+    }
+
+    // Only canonical decimal 1..39 (the v1 operational limit); anything else
+    // sends nothing.
+    for (const char *line : {"CD_TRACK_SELECT ", "CD_TRACK_SELECT 0", "CD_TRACK_SELECT 00",
+                             "CD_TRACK_SELECT 01", "CD_TRACK_SELECT 40", "CD_TRACK_SELECT 99",
+                             "CD_TRACK_SELECT 100", "CD_TRACK_SELECT -1",
+                             "CD_TRACK_SELECT +5", "CD_TRACK_SELECT 1.5", "CD_TRACK_SELECT  5",
+                             "CD_TRACK_SELECT 5 ", "CD_TRACK_SELECT 5 6", "CD_TRACK_SELECT x",
+                             "CD_TRACK_SELECT 0x0D", "CD_TRACK_SELECT 99999999999999999999",
+                             "CD_TRACK_SELECT 1e1"}) {
+        FakeTx tx;
+        Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+        core.connected();
+        assert(core.command(line, at(1), at(1)) == "ERR CD_TRACK_SELECT_INVALID\n");
+        assert(tx.sent.empty());
+    }
+    for (const char *line : {"CD_TRACK_SELECT", "cd_track_select 5", "CD_TRACK_SELECT5"}) {
+        FakeTx tx;
+        Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+        core.connected();
+        assert(core.command(line, at(1), at(1)) == "ERR UNKNOWN_COMMAND\n");
+        assert(tx.sent.empty());
+    }
+
+    // An unverified frame ends the sequence at once: later frames are never
+    // sent and nothing is resent. No CD fault is latched (no release owed).
+    for (int failing = 0; failing < 3; ++failing) {
+        for (int gpio = 0; gpio < 2; ++gpio) {
+            FakeTx tx;
+            int waits = 0;
+            Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); },
+                [&](Clock::time_point) {
+                    if (++waits == failing) (gpio ? tx.fail_gpio_next : tx.fail_next) = true;
+                });
+            core.connected();
+            if (failing == 0) (gpio ? tx.fail_gpio_next : tx.fail_next) = true;
+            const std::string sent = std::to_string(failing + 1);
+            assert(core.command("CD_TRACK_SELECT 23", at(1), at(1)) ==
+                   "ERR CD_TRACK_SELECT_UNCERTAIN track=23 frames=3 sent=" + sent +
+                   (gpio ? " gpio_tx=TX_FAIL" : " gpio_tx=TX_OK") +
+                   " waveform=MISSING cd_result=TX_UNCERTAIN receiver_execution=UNVERIFIED\n");
+            const Bytes all{0xDA, 0xDA, 0x38};
+            assert(tx.sent == Bytes(all.begin(), all.begin() + failing + 1));
+            assert(!core.cd_fault() && !core.cd_release_owed());
+            assert(status_has(core, 2, " cd_state=IDLE "));
+            assert(status_has(core, 2, " cd_last_result=TX_UNCERTAIN "));
+            core.tick(at(20000));
+            assert(tx.sent.size() == size_t(failing + 1));
+        }
+    }
+
+    // Shutdown between frames, or a failed wait, cancels before the next frame.
+    for (int mode = 0; mode < 2; ++mode) {
+        FakeTx tx;
+        bool signalled = false;
+        Xs8ServiceCore core(tx, Ms(2000), true, [&] { return signalled; },
+            [] { return at(0); },
+            [&](Clock::time_point) {
+                if (mode == 0) signalled = true;
+                else throw std::runtime_error("clock failed");
+            });
+        core.connected();
+        assert(core.command("CD_TRACK_SELECT 23", at(1), at(1)) ==
+               "ERR CD_TRACK_SELECT_UNCERTAIN track=23 frames=3 sent=1 gpio_tx=TX_OK "
+               "waveform=MATCH cd_result=CANCELLED receiver_execution=UNVERIFIED\n");
+        assert(tx.sent == (Bytes{0xDA}));
+        assert(!core.cd_fault() && !core.cd_release_owed());
+    }
+    {
+        FakeTx tx;
+        bool signalled = true;
+        Xs8ServiceCore core(tx, Ms(2000), true, [&] { return signalled; },
+                            [] { return at(0); });
+        core.connected();
+        assert(core.command("CD_TRACK_SELECT 5", at(1), at(1)) == "ERR SHUTDOWN\n");
+        assert(tx.sent.empty());
+    }
+
+    // Existing refusals apply and send nothing.
+    {
+        FakeTx tx;
+        Xs8ServiceCore boot(tx, Ms(2000), false, {}, [] { return at(0); });
+        boot.connected();
+        assert(boot.command("CD_TRACK_SELECT 5", at(1), at(1)) == "ERR BOOT_INHIBIT\n");
+        assert(boot.command("CD_TRACK_SELECT 5", at(1), at(1), 7) == "ERR NO_CLIENT\n");
+        assert(tx.sent.empty());
+    }
+    {
+        FakeTx tx;
+        Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+        core.connected();
+        const std::string press = core.command("CD_PRESS SEEK_FORWARD", at(1), at(1));
+        assert(press.rfind("OK CD_PRESS_TX", 0) == 0);
+        assert(core.command("CD_TRACK_SELECT 5", at(2), at(2)) == "ERR CD_TRACK_BUSY\n");
+        assert(tx.sent == (Bytes{0x7A}));
+    }
+    {
+        FakeTx tx;
+        Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+        core.connected();
+        assert(core.command("VOLUME_PRESS UP", at(1), at(1)).rfind("OK", 0) == 0);
+        const Bytes before = tx.sent;
+        assert(core.command("CD_TRACK_SELECT 5", at(2), at(2)).rfind("ERR ", 0) == 0);
+        assert(tx.sent == before);
+    }
+}
+
 int main()
 {
     test_startup_and_parsing();
@@ -2141,6 +2287,7 @@ int main()
     test_cd_hold_max_hold();
     test_volume_step();
     test_cd_transport_keys();
+    test_cd_track_select();
     test_cd_key_holds();
     test_context_key_commands();
     test_power_commands();

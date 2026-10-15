@@ -4,6 +4,7 @@ import re
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 
@@ -128,6 +129,53 @@ class ServiceSocketTest(unittest.TestCase):
         self.assertEqual(self.transmitted(), ["0x6A", "0x72", "0xFC"])
         self.assertTrue(self.request("CD_RELEASE " + fresh).startswith("OK CD_RELEASE_TX"))
         self.assertEqual(self.request("MUTE"), "OK MUTE_TX")
+
+    def test_track_select_is_one_uninterleaved_sequence(self):
+        replies = {}
+
+        def select():
+            with self.connect() as client:
+                client.settimeout(5)
+                replies["select"] = self.command(client, "CD_TRACK_SELECT 23")
+                replies["select_done"] = time.monotonic()
+
+        started = time.monotonic()
+        worker = threading.Thread(target=select)
+        worker.start()
+        time.sleep(0.05)  # MUTE arrives while the sequence is still running.
+        with self.connect() as client:
+            client.settimeout(5)
+            replies["mute"] = self.command(client, "MUTE")
+        worker.join(5)
+        self.assertEqual(replies["select"],
+                         "OK CD_TRACK_SELECT_TX track=23 frames=3 sent=3 gpio_tx=TX_OK "
+                         "waveform=MATCH cd_result=TX_VERIFIED receiver_execution=UNVERIFIED")
+        self.assertEqual(replies["mute"], "OK MUTE_TX")
+        self.assertGreaterEqual(replies["select_done"] - started, 0.39, "two 200 ms gaps")
+        # The whole entry first; MUTE's CONTEXT frames only afterwards.
+        self.assertEqual(self.transmitted(), ["0xDA", "0xDA", "0x38", "0x17", "0xD8", "0x07"])
+
+    def test_track_select_client_disconnect_completes_without_retry(self):
+        with self.connect() as client:
+            client.sendall(b"CD_TRACK_SELECT 13\n")
+        # The accepted entry finishes; the lost reply is never re-sent or retried.
+        status = self.request("STATUS")
+        self.assertIn("cd_action=TRACK_SELECT", status)
+        self.assertIn("cd_last_result=TX_VERIFIED", status)
+        self.assertIn("cd_state=IDLE", status)
+        time.sleep(0.5)
+        self.assertEqual(self.transmitted(), ["0xDA", "0x38"])
+
+    def test_track_select_shutdown_stops_before_the_next_frame(self):
+        with self.connect() as client:
+            client.sendall(b"CD_TRACK_SELECT 39\n")
+            time.sleep(0.35)
+            self.process.terminate()
+            self.assertEqual(self.process.wait(timeout=5), 0)
+        sent = self.transmitted()
+        self.assertTrue(0 < len(sent) < 4, sent)
+        self.assertEqual(sent, ["0xDA"] * len(sent), "no digit after a cancelled entry")
+        self.assertIn("cd_result=CANCELLED", self.log_path.read_text())
 
     def test_orderly_shutdown_releases_detached_hold(self):
         self.press("TRACK_PREVIOUS")
