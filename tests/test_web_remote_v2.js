@@ -259,6 +259,19 @@ async function main() {
   assert.equal(powerButton.dataset.powerState, 'ON', 'never changed by the TX reply');
   assert.equal(await powerShown({ value: 'UNKNOWN', freshness: 'UNKNOWN', evidence: 'POWER_TX' }),
     'UNKNOWN');
+  await idle();
+  // Right after OFF the state is UNKNOWN: the next click still toggles, with no
+  // expected state, and the Gateway decides from fresh observations.
+  reset();
+  plans.push({ status: 200, data: { result: 'SERVICE_TX_OK', action: 'TOGGLE', sent: 'ON',
+    decision: { state: 'OFF_INFERRED' }, power_sent: true } });
+  await powerButton.fire('click');
+  await settle();
+  assert.deepEqual(requests.map((r) => r.body), [{ action: 'TOGGLE' }]);
+  assert.equal(menu.hidden, true, 'no chooser before the Gateway has observed');
+  assert.match(availability(), /^POWER ON TX VERIFIED · RECEIVER WAS SILENT TWICE/);
+  assert.equal(powerButton.dataset.powerState, 'UNKNOWN', 'still only what was observed');
+  await idle();
 
   assert.equal(await powerShown({ value: 'OFF_INFERRED', freshness: 'FRESH' }), 'OFF_INFERRED');
   reset();
@@ -316,11 +329,30 @@ async function main() {
   assert.equal(requests.length, 1);
   await idle();
 
-  // Stale, unknown or TOGGLE unavailable: the click only opens the chooser.
-  for (const [report, toggle] of [[{ value: 'ON', freshness: 'STALE' }, true],
-    [{ value: 'UNKNOWN', freshness: 'UNKNOWN' }, true], [{ value: 'ON', freshness: 'FRESH' }, false]]) {
+  // Stale or unknown (also after a Gateway restart): TOGGLE without expected; a
+  // refusal opens the chooser, never a retry.
+  for (const report of [{ value: 'ON', freshness: 'STALE' }, { value: 'OFF_INFERRED',
+    freshness: 'STALE' }, { value: 'UNKNOWN', freshness: 'UNKNOWN', evidence: 'NONE' }]) {
     reset();
-    await powerShown(report, toggle);
+    await powerShown(report);
+    assert.equal(powerButton.dataset.powerState, 'UNKNOWN');
+    plans.push({ status: 409, data: { result: 'POWER_STATE_UNKNOWN', power_sent: false,
+      decision: { state: 'UNKNOWN' } } });
+    await powerButton.fire('click');
+    await settle();
+    assert.deepEqual(requests.map((r) => r.body), [{ action: 'TOGGLE' }]);
+    assert.equal(menu.hidden, false, 'refused: chooser offered');
+    await advance(3000);
+    assert.equal(requests.length, 1, 'never retried');
+    await powerButton.fire('click');
+    assert.equal(menu.hidden, true, 'a click on the open chooser only closes it');
+    assert.equal(requests.length, 1);
+    await idle();
+  }
+  // TOGGLE unavailable: the click only opens the chooser, as before.
+  for (const report of [{ value: 'ON', freshness: 'FRESH' }, { value: 'UNKNOWN', freshness: 'UNKNOWN' }]) {
+    reset();
+    await powerShown(report, false);
     await powerButton.fire('click');
     await settle();
     assert.equal(menu.hidden, false);

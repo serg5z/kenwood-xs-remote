@@ -2955,7 +2955,8 @@ class RemoteV2GatewayTest(CdSeekGatewayTest):
                 self.assertNotIn("mapping", payload)
                 self.assertEqual(self.power(token, cookie, action)[0], 403, "single use")
                 token = self.fresh_token(cookie)
-            for body in ('{"action":"on"}', '{"action":"TOGGLE"}', '{"action":"STANDBY"}',
+            # ({"action":"TOGGLE"} is valid: see PowerToggleGatewayTest.)
+            for body in ('{"action":"on"}', '{"action":"toggle"}', '{"action":"STANDBY"}',
                          '{"action":"0x39"}', '{}', '{"action":"ON","x":1}'):
                 self.assertEqual(self.power(token, cookie, None, body)[0], 400, body)
             # Spacing: a second POWER within 2 s is refused before dispatch.
@@ -4112,7 +4113,15 @@ class PowerToggleGatewayTest(GatewayTest):
         return code, json.loads(raw)
 
     def toggle(self, expected="ON", session=None):
-        return self.post(json.dumps({"action": "TOGGLE", "expected": expected}), session)
+        """expected=None: what the Web sends for an unknown or stale state."""
+        body = {"action": "TOGGLE"} if expected is None else {"action": "TOGGLE",
+                                                              "expected": expected}
+        return self.post(json.dumps(body), session)
+
+    def elapse_power_interval(self):
+        state = self.server.__dict__.get("power")
+        if state:
+            state["completed"] = float("-inf")
 
     def sent(self):
         return [c for c in self.fake.commands if c != b"STATUS\n"]
@@ -4159,7 +4168,7 @@ class PowerToggleGatewayTest(GatewayTest):
                   [NO_REPLY, query_error("PARTIAL")], [NO_REPLY, query_error("BUS_ACTIVE")],
                   [NO_REPLY, None]]
         for queries in cases:
-            for expected in ("ON", "OFF_INFERRED"):
+            for expected in ("ON", "OFF_INFERRED", None):
                 with self.subTest(queries=[q[:40] if q else q for q in queries],
                                   expected=expected):
                     self.service(queries)
@@ -4177,6 +4186,81 @@ class PowerToggleGatewayTest(GatewayTest):
         self.assertEqual((code, payload["result"], payload["decision"]["observations"]),
                          (409, "POWER_STATE_UNKNOWN", [{"result": "TIMEOUT"}]))
         query.assert_called_once_with(self.socket_path, settle=True)
+        self.assertEqual(self.sent(), [])
+
+    def test_unknown_right_after_power_off_toggles_on_from_fresh_silence(self):
+        # The physically reported failure: after a toggled OFF the observation is
+        # UNKNOWN (cleared by the POWER frame), and the next click must still work.
+        self.service([QUERY_REPLY])
+        code, payload = self.toggle("ON")
+        self.assertEqual((code, payload["sent"]), (200, "OFF"))
+        power = self.power_status()
+        self.assertEqual((power["value"], power["evidence"]), ("UNKNOWN", "POWER_TX"))
+        # One manual-SYNC-style silence is not enough for OFF_INFERRED either.
+        self.elapse_power_interval()
+        self.service([NO_REPLY, NO_REPLY])
+        code, payload = self.toggle(None)
+        self.assertEqual(code, 200, payload)
+        self.assertEqual((payload["sent"], payload["decision"]["state"], payload["power_sent"]),
+                         ("ON", "OFF_INFERRED", True))
+        self.assertEqual(self.sent(), [SETTLE, SETTLE, b"POWER_ON\n"])
+        self.assertEqual(self.power_status()["evidence"], "POWER_TX")
+
+    def test_unknown_after_gateway_restart_decides_from_fresh_observation(self):
+        for queries, sent, state in (([QUERY_REPLY], b"POWER_OFF\n", "ON"),
+                                     ([NO_REPLY, NO_REPLY], b"POWER_ON\n", "OFF_INFERRED")):
+            with self.subTest(state=state):
+                # A restarted Gateway knows nothing about power.
+                self.server.__dict__.pop("power_observation", None)
+                self.elapse_power_interval()
+                self.service(queries)
+                power = self.power_status()
+                self.assertEqual((power["value"], power["evidence"], power["freshness"]),
+                                 ("UNKNOWN", "NONE", "UNKNOWN"))
+                code, payload = self.toggle(None)
+                self.assertEqual((code, payload["decision"]["state"]), (200, state), payload)
+                self.assertEqual(self.sent(), [SETTLE] * len(queries) + [sent])
+
+    def test_stale_observation_neither_blocks_nor_decides(self):
+        # A stale ON in the Gateway is not used: two fresh silences still mean ON.
+        observation = self.server.__dict__.setdefault("power_observation",
+                                                      xs8_gateway.PowerObservation())
+        observation.record({"result": "OBSERVATION_RECORDED"}, True,
+                           time.monotonic_ns() - 31_000_000_000)
+        self.service([NO_REPLY, NO_REPLY])
+        power = self.power_status()
+        self.assertEqual((power["value"], power["freshness"]), ("ON", "STALE"))
+        code, payload = self.toggle(None)
+        self.assertEqual((code, payload["sent"]), (200, "ON"), payload)
+        self.assertEqual(self.sent(), [SETTLE, SETTLE, b"POWER_ON\n"])
+
+    def test_without_expected_every_refusal_still_sends_nothing(self):
+        holding = self.STATUS_AFTER.replace(b"OK state=IDLE", b"OK state=HOLDING_UP")
+        intervening = self.STATUS_AFTER.replace(b"last_byte=0x13", b"last_byte=0xD8")
+        for after, code, result in ((holding, 409, "VOLUME_BUSY"),
+                                    (intervening, 409, "INTERVENING_TX"),
+                                    (None, 503, "UNAVAILABLE")):
+            with self.subTest(result=result):
+                session = self.session()
+                self.service([NO_REPLY, NO_REPLY], statuses=[self.STATUS_BEFORE, after])
+                status, payload = self.toggle(None, session)
+                self.assertEqual((status, payload["result"], payload["power_sent"],
+                                  payload["physical_check_required"]),
+                                 (code, result, False, False))
+                self.assertEqual(self.sent(), [SETTLE, SETTLE], "no POWER frame")
+        # Busy and fault gates before any query still apply.
+        for before, result in ((receiver_status("CD", base=CD_HOLD_STATUS), "CD_BUSY"),
+                               (receiver_status("CD", base=CD_FAULT_STATUS), "CD_FAULT_LATCHED")):
+            with self.subTest(result=result):
+                session = self.session()
+                self.service([QUERY_REPLY], statuses=[before])
+                status, payload = self.toggle(None, session)
+                self.assertEqual((status, payload["result"]), (409, result))
+                self.assertEqual(self.sent(), [], "nothing at all is sent")
+        # Unavailable TOGGLE without the query gate, with or without expected.
+        self.server.RequestHandlerClass.receiver_query_enabled = False
+        self.service([QUERY_REPLY])
+        self.assertEqual(self.toggle(None)[1]["result"], "TOGGLE_UNAVAILABLE")
         self.assertEqual(self.sent(), [])
 
     def test_observation_contradicting_the_display_sends_nothing(self):
@@ -4227,7 +4311,7 @@ class PowerToggleGatewayTest(GatewayTest):
     def test_spacing_csrf_and_body_validation(self):
         self.service([QUERY_REPLY])
         session = self.session()
-        for body in ('{"action":"TOGGLE"}', '{"action":"TOGGLE","expected":"OFF"}',
+        for body in ('{"action":"TOGGLE","expected":null}', '{"action":"TOGGLE","expected":"OFF"}',
                      '{"action":"TOGGLE","expected":"UNKNOWN"}',
                      '{"action":"ON","expected":"ON"}',
                      '{"action":"TOGGLE","expected":"ON","extra":1}',

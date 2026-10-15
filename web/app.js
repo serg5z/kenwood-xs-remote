@@ -850,11 +850,12 @@ monitorButton.addEventListener('click', async () => {
     (data) => volumeFailure('MONITOR', data));
 });
 
-// POWER: with a fresh observed ON or OFF_INFERRED (and TOGGLE available), one click
-// asks the Gateway to toggle; the Gateway re-observes and decides, sending at most
-// one frame. Otherwise, or after a refused toggle, the button opens the explicit
-// ON / OFF chooser. Nothing is retried, and the shown state changes only from a
-// later observation.
+// POWER: with TOGGLE available, one click asks the Gateway to toggle. It re-observes
+// and decides, sending at most one frame; a fresh observed ON or OFF_INFERRED goes
+// along as expected (a guard only), an unknown or stale state is omitted. Without
+// TOGGLE, or after a refused toggle, the button opens the explicit ON / OFF
+// chooser. Nothing is retried, and the shown state changes only from a later
+// observation.
 function setPowerMenu(open) {
   powerMenu.hidden = !open;
   if (typeof powerTrigger.setAttribute === 'function') {
@@ -865,7 +866,8 @@ function setPowerMenu(open) {
 async function togglePower(expected) {
   setPowerMenu(false);
   let refused = false;
-  await sendControl('/api/v1/power', JSON.stringify({ action: 'TOGGLE', expected }),
+  await sendControl('/api/v1/power',
+    JSON.stringify(expected ? { action: 'TOGGLE', expected } : { action: 'TOGGLE' }),
     (data) => `POWER ${data.sent} TX VERIFIED · RECEIVER WAS ${
       data.decision && data.decision.state === 'ON' ? 'ON' : 'SILENT TWICE'
     } · RECEIVER POWER UNVERIFIED`,
@@ -881,9 +883,8 @@ async function togglePower(expected) {
 
 powerTrigger.addEventListener('click', async () => {
   if (powerTrigger.disabled || controlBusy || seek) return;
-  if (powerMenu.hidden && powerToggleReady &&
-      (powerState === 'ON' || powerState === 'OFF_INFERRED')) {
-    await togglePower(powerState);
+  if (powerMenu.hidden && powerToggleReady) {
+    await togglePower(powerState === 'ON' || powerState === 'OFF_INFERRED' ? powerState : null);
     return;
   }
   setPowerMenu(powerMenu.hidden);

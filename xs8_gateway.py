@@ -1183,7 +1183,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if state == "UNKNOWN":
             raise PowerToggleRefused("POWER_STATE_UNKNOWN",
                                      "Receiver power could not be observed reliably", refused)
-        if state != expected:
+        # Without expected (the browser showed UNKNOWN or a stale state, for
+        # example right after a POWER frame or a Gateway restart) the fresh
+        # observation alone decides.
+        if expected is not None and state != expected:
             raise PowerToggleRefused("STATE_CHANGED",
                                      f"Receiver power observed {state}, expected {expected}",
                                      refused)
@@ -1377,8 +1380,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.handle_seek(session, request, kind)
             return
         elif is_power:
-            # {"action": "ON"|"OFF"}, or {"action": "TOGGLE", "expected": "ON"|"OFF_INFERRED"}:
-            # expected is what the browser showed; it only guards, never decides.
+            # {"action": "ON"|"OFF"}, or {"action": "TOGGLE"} with an optional
+            # "expected": "ON"|"OFF_INFERRED", the fresh state the browser showed.
+            # expected only guards; the fresh observation always decides.
             try:
                 pairs = json.loads(body, object_pairs_hook=list)
                 fields = (dict(pairs) if isinstance(pairs, list) and
@@ -1389,7 +1393,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             action = fields.get("action")
             expected = fields.get("expected")
             if not isinstance(action, str) or not (
-                    (set(fields) == {"action"} and action in POWER_COMMANDS) or
+                    (set(fields) == {"action"} and
+                     (action in POWER_COMMANDS or action == "TOGGLE")) or
                     (set(fields) == {"action", "expected"} and action == "TOGGLE" and
                      expected in POWER_TOGGLE_STATES)):
                 self.send_json(400, {"error": "Expected one allowlisted power action"})
