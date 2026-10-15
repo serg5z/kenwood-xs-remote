@@ -65,23 +65,24 @@ struct MainRemoteView: View {
 struct ResultBanner: View {
     let model: RemoteModel
 
+    /// Lines reserved whatever the message: the controls below must not move
+    /// while a command goes from idle to SENDING to its result.
+    static let reservedLines = 2
+
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            if let fault = model.faultBanner {
-                Image(systemName: "exclamationmark.octagon.fill").foregroundStyle(.red)
-                Text(fault)
-            } else if let line = model.lastResult {
-                if line.tone == .progress {
-                    ProgressView().controlSize(.mini)
-                } else {
-                    Image(systemName: icon(line.tone)).foregroundStyle(color(line.tone))
+        HStack(alignment: .top, spacing: 8) {
+            symbol
+                .frame(width: 18, height: 18)
+            // The hidden full-size placeholder alone sets the height; the
+            // message (which may shrink to fit) is laid over it.
+            Text(String(repeating: "\n", count: Self.reservedLines - 1))
+                .hidden()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .overlay(alignment: .topLeading) {
+                    Text(message)
+                        .lineLimit(Self.reservedLines)
+                        .minimumScaleFactor(0.75)
                 }
-                Text(line.text)
-            } else {
-                Image(systemName: "dot.radiowaves.left.and.right").foregroundStyle(.secondary)
-                Text(model.isOnline ? "Ready · results show transmission, not receiver action"
-                                    : model.connection.title)
-            }
         }
         .font(.footnote.weight(.medium))
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -89,6 +90,27 @@ struct ResultBanner: View {
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.updatesFrequently)
+    }
+
+    private var message: String {
+        if let fault = model.faultBanner { return fault }
+        if let line = model.lastResult { return line.text }
+        return model.isOnline ? "Ready · results show transmission, not receiver action"
+                              : model.connection.title
+    }
+
+    @ViewBuilder private var symbol: some View {
+        if model.faultBanner != nil {
+            Image(systemName: "exclamationmark.octagon.fill").foregroundStyle(.red)
+        } else if let line = model.lastResult {
+            if line.tone == .progress {
+                ProgressView().controlSize(.mini)
+            } else {
+                Image(systemName: icon(line.tone)).foregroundStyle(color(line.tone))
+            }
+        } else {
+            Image(systemName: "dot.radiowaves.left.and.right").foregroundStyle(.secondary)
+        }
     }
 
     private func icon(_ tone: ResultLine.Tone) -> String {
@@ -128,8 +150,17 @@ struct HeaderView: View {
                 PowerButton(indicator: model.powerIndicator, enabled: model.isEnabled(.power)) {
                     model.tapPower()
                 }
-                Text(model.powerIndicator.shortLabel)
-                    .font(.caption2).foregroundStyle(.secondary)
+                // Fixed to one full-size line at the button's width, so POWER
+                // never moves whatever the label.
+                Text(verbatim: " ")
+                    .font(.caption2)
+                    .frame(width: 56)
+                    .overlay {
+                        Text(model.powerIndicator.shortLabel)
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.6)
+                    }
             }
         }
         .padding(.top, 8)
@@ -150,7 +181,7 @@ struct ConnectionBadge: View {
     var body: some View {
         HStack(spacing: 6) {
             Circle().fill(color).frame(width: 8, height: 8)
-            Text(state.title).font(.caption.weight(.semibold))
+            Text(state.title).font(.caption.weight(.semibold)).lineLimit(1)
         }
         .padding(.top, 4)
         .accessibilityElement(children: .combine)
@@ -226,10 +257,13 @@ struct SourceSelector: View {
                 }
             }
             HStack {
+                // One line in every state: a wrapped summary moves every key below.
                 Text(indicator.summary)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-                Spacer()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                Spacer(minLength: 8)
                 // One explicit receiver query; never automatic.
                 Button("SYNC", systemImage: "arrow.triangle.2.circlepath") { model.sync() }
                     .font(.caption.weight(.semibold))
