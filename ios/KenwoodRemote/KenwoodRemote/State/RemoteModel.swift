@@ -57,11 +57,25 @@ enum ConnectionState: Equatable, Sendable {
     }
 }
 
-/// Presentation state for the remote. It only reads: there is no control path
-/// in this build, so nothing here can transmit on the XS8 bus.
+/// The one-line result of the last control, worded like the Web Remote.
+struct ResultLine: Equatable, Sendable {
+    enum Tone: Equatable, Sendable { case progress, verified, neutral, nothingSent, uncertain, fault }
+    let text: String
+    let tone: Tone
+}
+
+/// A latched fault reported by a control; controls of that kind stay off until
+/// the next successful read shows the Gateway's own view.
+enum FaultScope: Equatable, Sendable { case cd, service }
+
+/// Presentation and interaction state. Every receiver indication comes from
+/// Gateway observations; control results only produce the result line.
 @MainActor @Observable
 final class RemoteModel {
     typealias ClientFactory = @MainActor (BasicCredentials) throws -> GatewayClient
+    /// Starts an OS background task so a RELEASE can still go out after the app
+    /// leaves the foreground; returns the function that ends it.
+    typealias BackgroundTaskStarter = @MainActor (String) -> (@MainActor () -> Void)
 
     static let pollInterval: Duration = .seconds(5)
 
@@ -71,17 +85,43 @@ final class RemoteModel {
     private(set) var savedUsername: String?
     var panel = ContextPanelState()
 
-    private let credentialStore: any CredentialStore
-    private let makeClient: ClientFactory
-    private var client: GatewayClient?
-    private var inFlight: Task<Void, Never>?
+    // Control state (written by RemoteModel+Controls)
+    /// True while a control or hold is in flight. Taps meanwhile are dropped,
+    /// never queued.
+    var busy = false
+    var lastResult: ResultLine?
+    var activeHold: ActiveHold?
+    /// A volume key is down and its tap/hold decision is pending.
+    var pendingPress: HoldKey?
+    /// The explicit ON / OFF choice (no TOGGLE, or after a refused one).
+    var showingPowerChooser = false
+    var localFault: FaultScope?
+    var sourceSince: UInt64?
+    var monitorSince: UInt64?
+
+    @ObservationIgnored let now: @MainActor () -> Date
+    @ObservationIgnored let beginBackgroundTask: BackgroundTaskStarter
+    @ObservationIgnored var spacing = ControlSpacing()
+    @ObservationIgnored var pressTimer: Task<Void, Never>?
+    @ObservationIgnored var controlTask: Task<Void, Never>?
+    @ObservationIgnored var holdTask: Task<Void, Never>?
+    @ObservationIgnored private(set) var client: GatewayClient?
+
+    @ObservationIgnored private let credentialStore: any CredentialStore
+    @ObservationIgnored private let makeClient: ClientFactory
+    @ObservationIgnored private var inFlight: Task<Void, Never>?
     /// Bumped whenever the client is replaced, so a read started with old
     /// credentials can never be applied afterwards.
-    private var generation = 0
+    @ObservationIgnored private var generation = 0
 
-    init(credentialStore: any CredentialStore, makeClient: @escaping ClientFactory) {
+    init(credentialStore: any CredentialStore,
+         now: @escaping @MainActor () -> Date = { Date() },
+         beginBackgroundTask: @escaping BackgroundTaskStarter = { _ in {} },
+         makeClient: @escaping ClientFactory) {
         self.credentialStore = credentialStore
         self.makeClient = makeClient
+        self.now = now
+        self.beginBackgroundTask = beginBackgroundTask
         connection = .needsCredentials
         do {
             if let credentials = try credentialStore.load() { install(credentials) }
@@ -94,18 +134,43 @@ final class RemoteModel {
 
     var isOnline: Bool { connection.isOnline }
     var receiver: ReceiverObservations? { snapshot?.status.receiver }
-    var sourceIndicator: SourceIndicator { SourceIndicator(receiver: receiver, connected: isOnline) }
-    var monitorIndicator: MonitorIndicator { MonitorIndicator(receiver: receiver, connected: isOnline) }
+    var sourceIndicator: SourceIndicator {
+        SourceIndicator(receiver: receiver, connected: isOnline, since: sourceSince)
+    }
+    var monitorIndicator: MonitorIndicator {
+        MonitorIndicator(receiver: receiver, connected: isOnline, since: monitorSince)
+    }
     var powerIndicator: PowerIndicator {
         PowerIndicator(power: snapshot?.status.power, connected: isOnline)
     }
     var capabilities: Capabilities? { isOnline ? snapshot?.capabilities : nil }
 
+    /// A fault the XS8 Service reports in STATUS. The Gateway refuses the
+    /// affected controls; this only explains why.
+    var faultBanner: String? {
+        guard isOnline, let status = snapshot?.status.status else { return nil }
+        if status["state"] == "FAULT_LATCHED" { return "XS8 FAULT LATCHED · CHECK RECEIVER · RESTART REQUIRED" }
+        if status["cd_state"] == "FAULT_LATCHED" ||
+            (status["cd_state"] == "IDLE" && status["cd_release_owed"] == "1") {
+            return "CD FAULT LATCHED · STOP AND INSPECT CHANGER"
+        }
+        if let monitor = status["monitor"], monitor != "HEALTHY" {
+            return "XS8 MONITOR \(monitor) · CONTROLS REFUSED"
+        }
+        return nil
+    }
+
     // MARK: Refresh
 
     /// One read at a time; a second caller (pull-to-refresh during a poll)
-    /// waits for the read already running instead of starting another.
+    /// waits for the read already running. No reads while a control runs: the
+    /// control refreshes when it finishes.
     func refresh() async {
+        guard !busy else { return }
+        await refreshNow()
+    }
+
+    func refreshNow() async {
         if let inFlight {
             await inFlight.value
             return
@@ -125,23 +190,40 @@ final class RemoteModel {
         }
     }
 
+    /// Ends a running read before a control, so the control does not wait for it.
+    func cancelRefresh() async {
+        guard let task = inFlight else { return }
+        task.cancel()
+        await task.value
+    }
+
     private func performRefresh() async {
         guard let client else { return }
         let started = generation
         let result = await client.refresh()
-        guard started == generation else { return }
+        // A cancelled read (a control started) is dropped, not shown as a failure.
+        guard started == generation, !Task.isCancelled else { return }
         switch result {
         case .success(let snapshot):
             self.snapshot = snapshot
-            lastSuccess = Date()
+            lastSuccess = now()
             connection = snapshot.status.serviceConnected
                 ? .online : .serviceUnavailable(snapshot.status.error)
+            localFault = nil
+            if !connection.isOnline { clearObservationGuards() }
             panel.observe(sourceIndicator.displayedSource)
         case .failure(let issue):
             // Keep the last snapshot for diagnostics only: every indicator
             // requires an online connection, so nothing stale is shown as current.
             connection = ConnectionState(issue)
+            // A restarted Pi restarts its monotonic clock.
+            clearObservationGuards()
         }
+    }
+
+    private func clearObservationGuards() {
+        sourceSince = nil
+        monitorSince = nil
     }
 
     // MARK: Credentials
@@ -153,6 +235,7 @@ final class RemoteModel {
 
     func forgetCredentials() throws {
         try credentialStore.delete()
+        stopInteraction(reason: "SIGNED OUT")
         generation += 1
         client = nil
         snapshot = nil
@@ -161,6 +244,7 @@ final class RemoteModel {
     }
 
     private func install(_ credentials: BasicCredentials) {
+        stopInteraction(reason: "ACCOUNT CHANGED")
         generation += 1
         snapshot = nil
         savedUsername = credentials.username
@@ -188,8 +272,10 @@ final class RemoteModel {
 }
 
 extension RemoteModel {
-    static func live(configuration: GatewayConfiguration = .woodland) -> RemoteModel {
-        RemoteModel(credentialStore: KeychainCredentialStore(server: configuration.host)) { credentials in
+    static func live(configuration: GatewayConfiguration = .woodland,
+                     beginBackgroundTask: @escaping BackgroundTaskStarter) -> RemoteModel {
+        RemoteModel(credentialStore: KeychainCredentialStore(server: configuration.host),
+                    beginBackgroundTask: beginBackgroundTask) { credentials in
             let anchor = try PinnedCertificateAuthority.load(configuration)
             let transport = URLSessionTransport(
                 trust: PinnedTrustEvaluator(host: configuration.host, anchor: anchor),

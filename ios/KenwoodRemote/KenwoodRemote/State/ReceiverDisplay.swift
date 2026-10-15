@@ -17,6 +17,9 @@ enum ObservationQuality: Equatable, Sendable {
     /// Receiver integrity is uncertain: the value is not shown as a selection.
     case uncertain
     case unknown
+    /// A source or MONITOR control was sent after this observation was made:
+    /// it cannot show that control's result, so it is not displayed.
+    case awaitingObservation
     case connectionLost
 
     var label: String {
@@ -25,6 +28,7 @@ enum ObservationQuality: Equatable, Sendable {
         case .lastKnown: "LAST KNOWN"
         case .uncertain: "UNCERTAIN"
         case .unknown: "UNKNOWN"
+        case .awaitingObservation: "AWAITING OBSERVATION"
         case .connectionLost: "CONNECTION LOST"
         }
     }
@@ -42,12 +46,17 @@ struct SourceIndicator: Equatable, Sendable {
     let quality: ObservationQuality
     let ageMs: Int?
 
-    init(receiver: ReceiverObservations?, connected: Bool) {
+    /// `since`: the Gateway's `sync.since_mono_ns` from the last source control
+    /// (the Pi's monotonic clock); older observations are not its result.
+    init(receiver: ReceiverObservations?, connected: Bool, since: UInt64? = nil) {
         guard connected else { self.init(nil, .connectionLost, nil); return }
         guard let receiver, receiver.source.value != "UNKNOWN" else {
             self.init(nil, .unknown, nil); return
         }
         let source = receiver.source
+        guard ReceiverObservation.isCurrent(source, since: since) else {
+            self.init(nil, .awaitingObservation, nil); return
+        }
         let quality: ObservationQuality =
             receiver.integrity != "HEALTHY" || source.freshness == "UNCERTAIN" ? .uncertain :
             source.freshness == "FRESH" ? .fresh :
@@ -76,6 +85,7 @@ struct SourceIndicator: Equatable, Sendable {
         switch quality {
         case .connectionLost: "Observed source unavailable · connection lost"
         case .unknown: "Observed source unknown"
+        case .awaitingObservation: "Awaiting the receiver's report"
         case .uncertain: "Observed \(observed ?? "source") · observation uncertain"
         case .fresh: "Observed \(observed ?? "") · \(ageText)"
         case .lastKnown: "Last known \(observed ?? "") · \(ageText)"
@@ -89,14 +99,25 @@ struct SourceIndicator: Equatable, Sendable {
     }
 }
 
+extension ReceiverObservation {
+    /// Observed at or after `since` (always true without a guard).
+    static func isCurrent(_ observation: ReceiverObservation, since: UInt64?) -> Bool {
+        guard let since else { return true }
+        return (observation.observedMonoNs ?? 0) >= since
+    }
+}
+
 /// TAPE2 MONITOR shows ON/OFF only for a fresh, healthy observation (as on the
 /// Web); anything else is neutral.
 enum MonitorIndicator: Equatable, Sendable {
     case on, off, unknown
 
-    init(receiver: ReceiverObservations?, connected: Bool) {
+    init(receiver: ReceiverObservations?, connected: Bool, since: UInt64? = nil) {
         guard connected, let receiver, receiver.integrity == "HEALTHY",
-              receiver.monitor.freshness == "FRESH" else { self = .unknown; return }
+              receiver.monitor.freshness == "FRESH",
+              ReceiverObservation.isCurrent(receiver.monitor, since: since) else {
+            self = .unknown; return
+        }
         switch receiver.monitor.value {
         case "ON": self = .on
         case "OFF": self = .off

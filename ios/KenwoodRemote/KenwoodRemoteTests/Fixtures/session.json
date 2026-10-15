@@ -1,5 +1,5 @@
 {
- "csrf_token": "TOKEN-NOT-USED-IN-READ-ONLY-CLIENT",
+ "csrf_token": "token-from-session-0001",
  "mute_available": true,
  "source_available": true,
  "receiver_query_available": true,

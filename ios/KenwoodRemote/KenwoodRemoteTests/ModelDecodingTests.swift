@@ -24,10 +24,10 @@ import Testing
         #expect(status.receiver == nil)
     }
 
-    @Test func decodesSessionWithoutKeepingTheToken() throws {
+    @Test func sessionAvailabilityCarriesNoToken() throws {
         let session = try JSONDecoder().decode(SessionAvailability.self, from: Fixture.data("session"))
         #expect(session.cdTrackSelect && session.power && session.volumeHold)
-        #expect(!String(describing: session).contains("TOKEN"))
+        #expect(!String(describing: session).contains("token-from-session"))
     }
 
     @Test func missingSessionFlagsAreFalse() throws {

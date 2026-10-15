@@ -1,8 +1,6 @@
 import Foundation
 
-/// The Gateway's read endpoints. This client has no write path: every request it
-/// can build is a body-less GET, which the Gateway answers without transmitting
-/// anything on the XS8 bus.
+/// The Gateway's read endpoints. GETs never transmit on the XS8 bus.
 enum ReadEndpoint: String, CaseIterable, Sendable {
     case status = "/api/v1/status"
     case session = "/api/v1/session"
@@ -34,21 +32,49 @@ struct GatewaySnapshot: Sendable, Equatable {
     let controlsConfigured: Bool
 }
 
+/// All Gateway traffic goes through one serial lane: a read and a control
+/// never interleave, so a session GET can never hand back a CSRF token that a
+/// control has already rotated, and controls run strictly one at a time.
 actor GatewayClient {
     static let readTimeout: TimeInterval = 4
 
     private let baseURL: URL
+    /// The exact Origin the Gateway requires (`--https-origin`).
+    let origin: String
     private let transport: any HTTPTransport
     /// The Gateway's `xs8_session` cookie, managed by hand: exactly one Cookie
     /// header, never persisted (sessions last 30 min and die with the Gateway).
     private(set) var sessionCookie: String?
+    /// The session's current one-use CSRF token: from `GET /session` or the
+    /// successor in a control reply. Taken (cleared) by every control request.
+    private var csrfToken: String?
+
+    private var laneBusy = false
+    private var laneWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(baseURL: URL, transport: any HTTPTransport) {
         self.baseURL = baseURL
+        origin = "\(baseURL.scheme ?? "https")://\(baseURL.host() ?? "")"
+            + (baseURL.port.map { ":\($0)" } ?? "")
         self.transport = transport
     }
 
+    // MARK: Serial lane
+
+    private func enterLane() async {
+        guard laneBusy else { laneBusy = true; return }
+        await withCheckedContinuation { laneWaiters.append($0) }
+    }
+
+    private func leaveLane() {
+        if laneWaiters.isEmpty { laneBusy = false } else { laneWaiters.removeFirst().resume() }
+    }
+
+    // MARK: Reads
+
     func refresh() async -> Result<GatewaySnapshot, GatewayIssue> {
+        await enterLane()
+        defer { leaveLane() }
         let status: StatusResponse
         do {
             status = try await fetchStatus()
@@ -83,7 +109,7 @@ actor GatewayClient {
         }
     }
 
-    func fetchStatus() async throws(GatewayIssue) -> StatusResponse {
+    private func fetchStatus() async throws(GatewayIssue) -> StatusResponse {
         let (data, response) = try await get(.status)
         // 503 is a well-formed Gateway reply: the Gateway is up, the service is not.
         guard response.statusCode == 200 || (response.statusCode == 503 && isJSON(response)) else {
@@ -92,16 +118,22 @@ actor GatewayClient {
         return try decode(StatusResponse.self, data, .status)
     }
 
-    /// nil when the Gateway has every control gate disabled (404).
-    func fetchSession() async throws(GatewayIssue) -> SessionAvailability? {
+    /// nil when the Gateway has every control gate disabled (404). Also stores
+    /// the session's current CSRF token.
+    private func fetchSession() async throws(GatewayIssue) -> SessionAvailability? {
         let (data, response) = try await get(.session)
-        if response.statusCode == 404 && isJSON(response) { return nil }
+        if response.statusCode == 404 && isJSON(response) {
+            csrfToken = nil
+            return nil
+        }
         guard response.statusCode == 200 else { throw classify(response) }
         if let cookie = Self.sessionCookie(from: response) { sessionCookie = cookie }
-        return try decode(SessionAvailability.self, data, .session)
+        let session = try decode(SessionResponse.self, data, .session)
+        csrfToken = session.csrfToken
+        return session.availability
     }
 
-    func fetchCapabilities() async throws(GatewayIssue) -> Capabilities {
+    private func fetchCapabilities() async throws(GatewayIssue) -> Capabilities {
         let (data, response) = try await get(.capabilities)
         guard response.statusCode == 200 else { throw classify(response) }
         return try decode(Capabilities.self, data, .capabilities)
@@ -126,6 +158,62 @@ actor GatewayClient {
             throw .transport(error)
         }
     }
+
+    // MARK: Controls
+
+    /// One control request, sent at most once and never retried. `sendGuard` is
+    /// checked after this request's turn in the lane and its token are ready,
+    /// immediately before transmission.
+    func send(_ command: ControlCommand, guard sendGuard: SendGuard? = nil) async -> ControlExchange {
+        await enterLane()
+        defer { leaveLane() }
+        if sendGuard?.isCancelled == true { return .notAttempted("CANCELLED BEFORE SEND") }
+        guard let body = command.body else { return .notAttempted("INVALID REQUEST") }
+        if csrfToken == nil {
+            // After a control without a successor token (or none yet): the
+            // session's current token. A read only; it never rotates the token.
+            do {
+                _ = try await fetchSession()
+            } catch {
+                return .notAttempted("NO SESSION TOKEN")
+            }
+        }
+        guard let token = csrfToken else { return .notAttempted("NO SESSION TOKEN") }
+        if sendGuard?.isCancelled == true { return .notAttempted("CANCELLED BEFORE SEND") }
+        // Single use, even before the reply: whatever happens, never reuse it.
+        csrfToken = nil
+
+        var request = URLRequest(url: URL(string: command.path, relativeTo: baseURL)!.absoluteURL,
+                                 cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
+                                 timeoutInterval: command.timeout)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(origin, forHTTPHeaderField: "Origin")
+        request.setValue(token, forHTTPHeaderField: "X-CSRF-Token")
+        if let sessionCookie {
+            request.setValue("xs8_session=\(sessionCookie)", forHTTPHeaderField: "Cookie")
+        }
+
+        let data: Data
+        let response: HTTPURLResponse
+        do {
+            (data, response) = try await transport.send(request)
+        } catch {
+            return .transportFailed(error)
+        }
+        let json = isJSON(response)
+        let reply = json ? try? JSONDecoder().decode(ControlReply.self, from: data) : nil
+        if let successor = reply?.csrfToken { csrfToken = successor }
+        if response.statusCode == 401 && json {
+            // The Gateway no longer knows this session (expired or restarted).
+            sessionCookie = nil
+        }
+        return .response(status: response.statusCode, reply: reply, gatewayJSON: json)
+    }
+
+    // MARK: Helpers
 
     private func decode<T: Decodable>(_ type: T.Type, _ data: Data,
                                       _ endpoint: ReadEndpoint) throws(GatewayIssue) -> T {

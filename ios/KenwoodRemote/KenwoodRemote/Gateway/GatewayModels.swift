@@ -79,8 +79,22 @@ struct CDChangerObservation: Decodable, Sendable, Equatable {
     }
 }
 
-/// `GET /api/v1/session`, without its CSRF token: this read-only client has no
-/// use for one, so it is never decoded, stored or logged.
+/// `GET /api/v1/session`. The token stays inside GatewayClient; only the
+/// availability flags reach the rest of the app.
+struct SessionResponse: Decodable, Sendable {
+    let csrfToken: String?
+    let availability: SessionAvailability
+
+    enum CodingKeys: String, CodingKey { case csrfToken = "csrf_token" }
+
+    init(from decoder: Decoder) throws {
+        csrfToken = try decoder.container(keyedBy: CodingKeys.self)
+            .decodeIfPresent(String.self, forKey: .csrfToken)
+        availability = try SessionAvailability(from: decoder)
+    }
+}
+
+/// The per-control `*_available` flags from `GET /api/v1/session`.
 struct SessionAvailability: Decodable, Sendable, Equatable {
     var mute = false
     var source = false

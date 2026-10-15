@@ -67,7 +67,7 @@ struct DiagnosticsView: View {
                     } header: {
                         Text("Gateway capabilities \(capabilities.apiVersion ?? "")")
                     } footer: {
-                        Text("Advertised by the Gateway for this session. This build sends no controls.")
+                        Text("Advertised by the Gateway for this session. Controls follow these flags; the Gateway re-checks every request.")
                     }
                 }
             }
