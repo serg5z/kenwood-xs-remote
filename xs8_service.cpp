@@ -1143,6 +1143,8 @@ int main(int argc, char **argv)
                     line == "TAPE2_MONITOR_TOGGLE" ||
                     line == "POWER_ON" || line == "POWER_OFF" ||
                     line == "CD_PLAY" || line == "CD_PLAY_PAUSE" || line == "CD_STOP" ||
+                    line == "CD_TIME_DISPLAY" || line == "CD_REPEAT" ||
+                    line == "CD_DISC_SKIP" ||
                     line == "VOLUME_STEP UP" || line == "VOLUME_STEP DOWN") {
                     if (stopping) {
                         if (!reply(client, "ERR SHUTDOWN\n")) failed = true;

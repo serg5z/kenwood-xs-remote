@@ -90,7 +90,8 @@
   .intro { display: none; }
   .control-layout { margin-top: 24px; }
   .transport { margin-top: 24px; }
-  .transport-grid button { min-height: 65px; }
+  /* Narrow buttons: a 2 px side padding keeps REPEAT on one line at 320–375 px. */
+  .transport-grid button { min-height: 65px; padding-inline: 2px; }
   .transport-grid small { margin-top: 6px; overflow-wrap: anywhere; }
   .availability { margin-top: 22px; line-height: 1.4; overflow-wrap: anywhere; }
   .availability-dot { flex: none; }

@@ -4,8 +4,13 @@ const vm = require('node:vm');
 
 const html = fs.readFileSync('web/index.html', 'utf8');
 for (const [id, attribute] of [['cd-rew', 'data-cd-seek="BACKWARD"'], ['cd-ff', 'data-cd-seek="FORWARD"'],
-  ['cd-play-pause', 'data-cd-playback="PLAY_PAUSE"'], ['cd-stop', 'data-cd-playback="STOP"']]) {
+  ['cd-play-pause', 'data-cd-playback="PLAY_PAUSE"'], ['cd-stop', 'data-cd-playback="STOP"'],
+  ['cd-time-display', 'data-cd-playback="TIME_DISPLAY"'], ['cd-repeat', 'data-cd-playback="REPEAT"'],
+  ['cd-disc-skip', 'data-cd-playback="DISC_SKIP"']]) {
   assert.match(html, new RegExp(`id="${id}" disabled type="button" ${attribute}`));
+}
+for (const label of ['TIME DISP.', 'REPEAT', 'DISC SKIP']) {
+  assert.ok(html.includes(`<small>${label}</small>`), label);
 }
 
 // ---- Fake clock: every app timer runs only when the test advances time. ----
@@ -42,6 +47,8 @@ const elements = new Map();
 const datasets = {
   'cd-rew': { cdSeek: 'BACKWARD' }, 'cd-ff': { cdSeek: 'FORWARD' },
   'cd-play-pause': { cdPlayback: 'PLAY_PAUSE' }, 'cd-stop': { cdPlayback: 'STOP' },
+  'cd-time-display': { cdPlayback: 'TIME_DISPLAY' }, 'cd-repeat': { cdPlayback: 'REPEAT' },
+  'cd-disc-skip': { cdPlayback: 'DISC_SKIP' },
   'cd-previous': { cdAction: 'PREVIOUS' }, 'cd-next': { cdAction: 'NEXT' },
   'volume-up': { volumeDirection: 'UP' }, 'volume-down': { volumeDirection: 'DOWN' },
 };
@@ -65,6 +72,11 @@ const ff = element('cd-ff');
 const rew = element('cd-rew');
 const playPause = element('cd-play-pause');
 const stop = element('cd-stop');
+const timeDisplay = element('cd-time-display');
+const repeat = element('cd-repeat');
+const discSkip = element('cd-disc-skip');
+const momentary = [[timeDisplay, 'TIME_DISPLAY', 'TIME DISP\\.'], [repeat, 'REPEAT', 'REPEAT'],
+  [discSkip, 'DISC_SKIP', 'DISC SKIP']];
 const next = element('cd-next');
 const volumeUp = element('volume-up');
 const windowListeners = {};
@@ -89,6 +101,8 @@ let holdCount = 0;
 let cdState = 'IDLE';
 let seekAvailable = true;
 let playbackAvailable = true;
+let playbackActions = ['PLAY_PAUSE', 'STOP', 'TIME_DISPLAY', 'REPEAT', 'DISC_SKIP'];
+const playbackPlans = [];  // per playback POST: { status, data } overrides success
 const plans = [];          // per seek POST: 'defer' | 'drop' | { status, data }
 const deferred = [];
 const requests = [];       // every seek POST that reached the network
@@ -149,7 +163,7 @@ const context = {
       return respond({ status: 200, data: { operations: {
         cd_transport: { enabled: true, available_actions: ['NEXT', 'PREVIOUS'], min_interval_ms: 250 },
         volume_step: { enabled: true, available_directions: ['UP', 'DOWN'], min_interval_ms: 250 },
-        cd_playback: { enabled: playbackAvailable, available_actions: ['PLAY_PAUSE', 'STOP'] },
+        cd_playback: { enabled: playbackAvailable, available_actions: playbackActions },
         cd_seek: { enabled: seekAvailable, available_directions: ['FORWARD', 'BACKWARD'],
           heartbeat_ms: 500, lease_ms: 2000, max_hold_ms: 10000 } } } });
     }
@@ -161,6 +175,9 @@ const context = {
         return respond({ status: 403, data: { error: 'Invalid CSRF token' } });
       }
       gatewayToken = `t${++rotations}`;
+      const plan = playbackPlans.shift();
+      if (plan) return respond({ status: plan.status, data: { ...plan.data, action: record.body.action,
+        receiver_execution: 'UNVERIFIED' } });
       return respond({ status: 200, data: { result: 'SERVICE_TX_OK', action: record.body.action,
         receiver_execution: 'UNVERIFIED' } });
     }
@@ -432,13 +449,74 @@ async function main() {
   assert.deepEqual(playbackPosts.map((p) => p.body.action), ['PLAY_PAUSE', 'STOP']);
   assert.deepEqual(forbidden, []);
 
+  // 13b. TIME DISP., REPEAT and DISC SKIP: momentary, one exact POST per click.
+  for (const [button, action, label] of momentary) {
+    await advance(1000);
+    assert.equal(button.disabled, false, `${action} enabled`);
+    const before = playbackPosts.length;
+    await button.fire('click');
+    await settle();
+    assert.deepEqual(playbackPosts.slice(before).map((p) => p.body), [{ action }]);
+    assert.match(availability(), new RegExp(`^${label} TX VERIFIED · CHANGER ACTION UNVERIFIED`));
+    // Nothing is inferred: no state attribute or pressed/active marking appears.
+    assert.equal(button.dataset.active, undefined);
+    assert.equal(button.dataset.state, undefined);
+    assert.equal(button.ariaPressed, undefined);
+    // A second click inside the shared CD spacing sends nothing.
+    await button.fire('click');
+    await settle();
+    assert.equal(playbackPosts.length, before + 1, `${action} spacing`);
+  }
+  // Two REPEAT presses are two independent requests; nothing tracks ON/OFF.
+  await advance(1000);
+  await repeat.fire('click');
+  await advance(1000);
+  await repeat.fire('click');
+  await settle();
+  assert.deepEqual(playbackPosts.slice(-2).map((p) => p.body.action), ['REPEAT', 'REPEAT']);
+  assert.match(availability(), /^REPEAT TX VERIFIED · CHANGER ACTION UNVERIFIED/);
+
+  // 13c. Failures are reported, never retried; a refusal says nothing was sent.
+  for (const [plan, pattern] of [
+    [{ status: 502, data: { result: 'SERVICE_UNCERTAIN', physical_check_required: true } },
+      /^DISC SKIP SERVICE_UNCERTAIN · CHECK CHANGER/],
+    [{ status: 409, data: { result: 'CD_BUSY' } }, /^DISC SKIP CD_BUSY · NOTHING SENT/],
+    [{ status: 409, data: { result: 'CD_FAULT_LATCHED', physical_check_required: true } },
+      /^CD FAULT LATCHED · STOP AND INSPECT CHANGER/]]) {
+    await advance(1000);
+    const before = playbackPosts.length;
+    playbackPlans.push(plan);
+    await discSkip.fire('click');
+    await settle();
+    assert.match(availability(), pattern);
+    await advance(6000);
+    assert.equal(playbackPosts.length, before + 1, 'never retried');
+  }
+  assert.deepEqual(forbidden, []);
+
+  // 13d. A key the Gateway does not list stays disabled and sends nothing.
+  playbackActions = ['PLAY_PAUSE', 'STOP'];
+  await advance(6000);
+  for (const [button] of momentary) {
+    assert.equal(button.disabled, true, `${button.id} not offered`);
+    const before = playbackPosts.length;
+    await button.fire('click');
+    await settle();
+    assert.equal(playbackPosts.length, before);
+  }
+  assert.equal(stop.disabled, false, 'listed keys remain usable');
+  playbackActions = ['PLAY_PAUSE', 'STOP', 'TIME_DISPLAY', 'REPEAT', 'DISC_SKIP'];
+  await advance(6000);
+
   // 14. Unavailable capability or a CD hold keeps the controls disabled.
   for (const change of [() => { seekAvailable = false; playbackAvailable = false; },
     () => { cdState = 'HOLDING'; }]) {
     seekAvailable = true; playbackAvailable = true; cdState = 'IDLE';
     change();
     await advance(6000);
-    for (const button of [ff, rew, playPause, stop]) assert.equal(button.disabled, true, button.id);
+    for (const button of [ff, rew, playPause, stop, timeDisplay, repeat, discSkip]) {
+      assert.equal(button.disabled, true, button.id);
+    }
     const before = requests.length + playbackPosts.length;
     await ff.fire('pointerdown');
     await playPause.fire('click');

@@ -4,7 +4,11 @@ const syncButton = document.getElementById('sync-button');
 const sourceButtons = [...document.querySelectorAll('.source-grid button[data-source]')];
 const cdButtons = [document.getElementById('cd-previous'), document.getElementById('cd-next')];
 const volumeButtons = [document.getElementById('volume-up'), document.getElementById('volume-down')];
-const playbackButtons = [document.getElementById('cd-play-pause'), document.getElementById('cd-stop')];
+const playbackButtons = ['cd-play-pause', 'cd-stop', 'cd-time-display', 'cd-repeat', 'cd-disc-skip']
+  .map((id) => document.getElementById(id));
+// Momentary single-frame keys: the Web never shows a time mode or REPEAT state.
+const PLAYBACK_LABELS = { PLAY_PAUSE: 'PLAY/PAUSE', STOP: 'STOP', TIME_DISPLAY: 'TIME DISP.',
+  REPEAT: 'REPEAT', DISC_SKIP: 'DISC SKIP' };
 const seekButtons = [document.getElementById('cd-rew'), document.getElementById('cd-ff')];
 const monitorButton = document.getElementById('monitor-button');
 const powerButtons = [document.getElementById('power-on'), document.getElementById('power-off')];
@@ -564,13 +568,14 @@ for (const button of volumeButtons) {
   });
 }
 
-// One click, one single-frame CD key. PLAY/PAUSE (0xBC) is provisionally mapped.
+// One click, one single-frame CD key, never retried. PLAY/PAUSE (0xBC) is
+// provisionally mapped; TIME DISP., REPEAT and DISC SKIP are momentary.
 for (const button of playbackButtons) {
   button.addEventListener('click', async () => {
     if (button.disabled || controlBusy || seek ||
         Date.now() - lastCdCompleted < cdIntervalMs) return;
     const action = button.dataset.cdPlayback;
-    const label = action === 'STOP' ? 'STOP' : 'PLAY/PAUSE';
+    const label = PLAYBACK_LABELS[action] || action;
     await sendControl('/api/v1/cd/playback', JSON.stringify({ action }),
       `${label} TX VERIFIED · CHANGER ACTION UNVERIFIED`,
       (data) => cdFailure(label, data));

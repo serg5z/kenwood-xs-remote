@@ -44,7 +44,7 @@ python3 -m unittest discover -s tests -p 'test_gateway.py'
 | `POST /api/v1/mute` | Returns 501 with MUTE disabled. With the production gate, a valid request checks fresh XS8 eligibility and sends one `MUTE` to the local service. |
 | `POST /api/v1/source` | Returns 501 with source disabled. With the production gate, accepts one allowlisted `{ "source": "CD" }` style JSON body, checks fresh XS8 eligibility, and dispatches at most one command, or, when leaving a freshly observed CD source, the source then `CD_STOP`; a verified selection then ends with one SYNC when the query gate is on ([CD auto-stop and final SYNC](source-selection.md)). TAPE2 returns 409 without dispatch. |
 | `POST /api/v1/cd/track` | Returns 501 with the CD gate disabled. With `--enable-cd-track`, accepts exactly `{ "action": "NEXT" }` or `{ "action": "PREVIOUS" }`, checks fresh XS8 and CD eligibility, and dispatches at most one discrete `CD_TRACK_*` pair. |
-| `POST /api/v1/cd/playback` | Returns 501 with `--enable-cd-playback` off. Otherwise accepts exactly `{ "action": "PLAY_PAUSE" }` or `{ "action": "STOP" }` and dispatches at most one single-frame key. |
+| `POST /api/v1/cd/playback` | Returns 501 with `--enable-cd-playback` off. Otherwise accepts exactly one `{ "action": … }` of `PLAY_PAUSE`, `STOP`, `TIME_DISPLAY`, `REPEAT` or `DISC_SKIP` and dispatches at most one single-frame key (`CD_PLAY_PAUSE`, `CD_STOP`, `CD_TIME_DISPLAY`, `CD_REPEAT` or `CD_DISC_SKIP`). |
 | `POST /api/v1/cd/seek` | Returns 501 with `--enable-cd-seek` off. Otherwise accepts `START` (with `direction` `FORWARD`/`BACKWARD`), `HEARTBEAT` (with `hold_id`) or `RELEASE` (optional `hold_id`) for one held seek. |
 | `POST /api/v1/volume/hold` | Returns 501 with `--enable-volume-hold` off. Otherwise `START` (with `direction` `UP`/`DOWN`), `HEARTBEAT` (with `hold_id`) or `RELEASE` for one connection-owned volume hold. |
 | `POST /api/v1/power` | Returns 501 with `--enable-power` off. Otherwise exactly `{ "action": "ON" }` or `{ "action": "OFF" }` (one ROOT frame), or `{ "action": "TOGGLE" }` with an optional `"expected": "ON" \| "OFF_INFERRED"` ([one-click POWER](#one-click-power)). |
@@ -156,16 +156,18 @@ Offline tests: `python3 -m unittest tests.test_gateway` (class `CdTrackGatewayTe
 
 Two further default-off gates complete the CD transport. Each has the same startup requirements as `--enable-cd-track`: `--systemd-socket`, a verified `--nginx-uid`, an exact `--https-origin`, the real XS8 Service socket, and never the offline MUTE mode. The startup mode prints `CD PLAYBACK` or `CD SEEK`. Capabilities gain `cd_playback` and `cd_seek` operations, and `cd_transport.blocked_actions` lists only what the configured gates do not expose. Existing fields are unchanged.
 
-### PLAY/PAUSE and STOP
+### PLAY/PAUSE, STOP, TIME DISP., REPEAT and DISC SKIP
 
 `--enable-cd-playback` enables `POST /api/v1/cd/playback`, which follows the CD track conventions exactly:
 - Origin, session and a single-use CSRF token;
 - the server-wide CD lock and the same completion-based spacing as PREV/NEXT;
 - a fresh STATUS that must show an idle CD;
-- one `CD_PLAY_PAUSE` or `CD_STOP` dispatch, never retried, with strict reply parsing;
+- one `CD_PLAY_PAUSE`, `CD_STOP`, `CD_TIME_DISPLAY`, `CD_REPEAT` or `CD_DISC_SKIP` dispatch, never retried, with strict reply parsing;
 - `physical_check_required` on anything but a clean refusal.
 
-A verified `PLAY_PAUSE` reply carries `"mapping": "PROVISIONAL"`. When this label was added, `0xBC` was a historical mapping. The operator has since reported physical testing, but no trial note is archived and the label is unchanged ([service API](cd-transport-api.md#single-frame-keys-play-playpause-and-stop)). `PLAY` (`0x41`) is not exposed.
+The action names map only to these service commands; the Gateway never accepts a byte value. `TIME_DISPLAY` (ROOT `0xEA`), `REPEAT` (`0xCC`) and `DISC_SKIP` (`0x8A`) were physically verified by the operator on 2026-10-15 ([service API](cd-transport-api.md#single-frame-keys-play-playpause-stop-time-display-repeat-and-disc-skip)). They are **momentary**: a reply reports transmission only, carries no `mapping` label and no state, and the Web shows no REPEAT indicator, time mode or disc number. The CD section has three more buttons, **TIME DISP.**, **REPEAT** and **DISC SKIP**. Like PLAY/PAUSE and STOP, each sends one request per click within the shared CD spacing, reads `<LABEL> TX VERIFIED · CHANGER ACTION UNVERIFIED` on success, and is never retried.
+
+A verified `PLAY_PAUSE` reply carries `"mapping": "PROVISIONAL"`. When this label was added, `0xBC` was a historical mapping. The operator has since reported physical testing, but no trial note is archived and the label is unchanged ([service API](cd-transport-api.md#single-frame-keys-play-playpause-stop-time-display-repeat-and-disc-skip)). `PLAY` (`0x41`) is not exposed.
 
 ### Held FF/REW
 

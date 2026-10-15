@@ -15,6 +15,9 @@
 | `CD_PLAY\n` | `0x41` | One PLAY key frame. |
 | `CD_PLAY_PAUSE\n` | `0xBC` | One PLAY/PAUSE toggle key frame. **Provisional mapping** (see below). |
 | `CD_STOP\n` | `0xA1` | One CD STOP key frame (formerly `0x9C`, see below). |
+| `CD_TIME_DISPLAY\n` | `0xEA` | One TIME DISPLAY key frame: cycles the changer's time display mode. |
+| `CD_REPEAT\n` | `0xCC` | One REPEAT key frame: toggles the changer's REPEAT setting. |
+| `CD_DISC_SKIP\n` | `0x8A` | One DISC SKIP key frame: advances to the next disc; the receiver stays on CD. |
 
 ### Connection-owned seek: KEY_DOWN / KEY_UP
 
@@ -42,7 +45,7 @@ Token holds are unchanged: `CD_PRESS` keeps its 2000 ms lease, `CD_HEARTBEAT`/`C
 
 `KEY_UP` itself is handled before the CONTEXT, fault and monitor checks, and is not subject to the shutdown or research-uncertainty gates. A fault or monitor failure has already ended any hold through `0x72`. During shutdown, the service closes every client, which releases a connection-owned hold, before its final cleanup. A non-owner's `KEY_UP` never transmits. The socket tests check both invariants.
 
-### Single-frame keys: PLAY, PLAY/PAUSE and STOP
+### Single-frame keys: PLAY, PLAY/PAUSE, STOP, TIME DISPLAY, REPEAT and DISC SKIP
 
 These send **one** ROOT frame and no KEY UP: no `0x72`, no `0x17` entry, no hold, lease or token. They use the same preflight as the other CD commands (local client, healthy monitor, receiver control `IDLE`, no volume STOP obligation, no open context, no CD hold, pair or fault, not shutting down, no uncertain research TX). A verified frame replies `OK CD_TRANSPORT_TX action=PLAY|PLAY_PAUSE|STOP gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED`. An unverified one replies `ERR CD_TRANSPORT_UNCERTAIN` with the same fields and is **never retried**. Because no release obligation exists, it does **not** latch a CD fault, like `SELECT_SOURCE`; `STATUS` shows `cd_action` and `cd_last_result=TX_VERIFIED|TX_UNCERTAIN`.
 
@@ -50,6 +53,7 @@ Evidence differs by key:
 - **`0x41` PLAY**: physically observed on 2026-10-12 (PLAY lit the changer indicator), in the reported CD-selected setup ([ROOT validation note](../research/notes/xs8-root-validation-2026-10-12.md)). The effect with another source selected is untested.
 - **`0xA1` STOP** (current): ROOT `0x21` and `0xA1` both physically stopped CD when sent through the research REPL, and `CD_STOP` with `0xA1` has since been physically verified on the KR-V6070. Its waveform `0xA1` is the same value as the receiver's VIDEO1 source broadcast (legacy `7A`, [matrix D.2](xs8-command-matrices.md#d2-bytes-that-are-both-a-tx-command-and-a-known-rx-value)); the service's own frame is excluded from receiver state by its TX window, like every local frame.
 - **`0x9C` STOP/CANCEL** (research history, no longer sent by `CD_STOP`): physically observed on 2026-10-12 (`0x41 → 0x9C` ended in STOP; `FC → 9C` cancelled a skip and stopped playback). A later report found that a VIDEO1/VIDEO2 selection after a `0x9C` STOP can provoke an unwanted changer restart, which motivated the change to `0xA1`.
+- **`0xEA` TIME DISPLAY, `0xCC` REPEAT, `0x8A` DISC SKIP**: physically verified on the KR-V6070 and its changer (operator report, 2026-10-15; no trial note, raw capture or reply log archived). `0xEA` changed the changer's time display mode. Two consecutive `0xCC` frames turned the changer's REPEAT indicator on, then off. `0x8A` advanced to the next disc with the receiver staying on CD; a passive `0xD4` frame followed about 1.15 s later. `0xD4` is recorded only as a **candidate disc-change notification**: it is not a reply the service waits for, and it is never sent. All three are **momentary**: the service, Gateway and Web never infer a time-display mode, REPEAT state or disc number from a transmission. They were first reported in the 2026-10-09 ROOT sweep (CD selected and playing); earlier partial maps recorded `0xCC` as no visible effect ([registry](../research/COMMAND_REGISTRY.md#operator-reported-physical-validations-2026-10-14-to-2026-10-15)).
 - **`0xBC` PLAY/PAUSE**: a **historical** toggle mapping only. Its pause and resume RX reports conflict with older passive labels, and it has **not** been physically verified through this service. The operator has since reported that `CD_PLAY_PAUSE` was physically tested (stated 2026-10-15). No dated trial note is archived, and the Gateway still labels it `PROVISIONAL`. Record the trial before lifting that label.
 
 The discrete commands complete both frame attempts before replying. After a verified PRESS, they request a **100 ms minimum gap from the recorded end of KEY DOWN TX to the beginning of KEY UP TX**. Waveform verification, BUSY-free checks, and scheduling can make the actual gap longer. If PRESS transmission or waveform verification is uncertain, RELEASE is attempted immediately. The explicit `CD_PRESS` commands send KEY DOWN **once** and hold while their lease is renewed. They do not use the 100 ms gap or repeat KEY DOWN. No `0x17` context entry or CD STOP is substituted.

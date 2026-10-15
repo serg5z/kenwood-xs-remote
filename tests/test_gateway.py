@@ -469,7 +469,7 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(code, 200)
         parser = DisabledControls()
         parser.feed(body.decode())
-        self.assertEqual(len(parser.buttons), 20)
+        self.assertEqual(len(parser.buttons), 23)
         self.assertTrue(all("disabled" in button for button in parser.buttons))
         for path in ("/api/v1/source", "/api/v1/mute",
                      "/api/v1/receiver/query",
@@ -2181,7 +2181,8 @@ class CdPlaybackGatewayTest(GatewayTest):
         self.assertEqual(self.request("POST", "/api/v1/cd/transport")[0], 501)
         operations = json.loads(self.request("GET", "/api/v1/capabilities")[1])["operations"]
         self.assertFalse(operations["cd_playback"]["enabled"])
-        self.assertEqual(operations["cd_playback"]["available_actions"], ["PLAY_PAUSE", "STOP"])
+        self.assertEqual(operations["cd_playback"]["available_actions"],
+                         ["PLAY_PAUSE", "STOP", "TIME_DISPLAY", "REPEAT", "DISC_SKIP"])
         self.assertEqual(operations["cd_playback"]["provisional_actions"], ["PLAY_PAUSE"])
         self.assertIn("STOP", operations["cd_transport"]["blocked_actions"])
         self.enable()
@@ -2199,7 +2200,10 @@ class CdPlaybackGatewayTest(GatewayTest):
     def test_actions_dispatch_one_exact_frame_command(self):
         self.enable()
         for action, command, provisional in (("PLAY_PAUSE", b"CD_PLAY_PAUSE\n", True),
-                                             ("STOP", b"CD_STOP\n", False)):
+                                             ("STOP", b"CD_STOP\n", False),
+                                             ("TIME_DISPLAY", b"CD_TIME_DISPLAY\n", False),
+                                             ("REPEAT", b"CD_REPEAT\n", False),
+                                             ("DISC_SKIP", b"CD_DISC_SKIP\n", False)):
             with self.subTest(action=action):
                 token, cookie = self.session()
                 self.elapse_interval()
@@ -2223,7 +2227,11 @@ class CdPlaybackGatewayTest(GatewayTest):
         fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
                                 mute_reply=CD_TRANSPORT_OK)
         for body in ('{"action":"PLAY"}', '{"action":"NEXT"}', '{"action":"stop"}',
-                     '{"action":"SEEK_FORWARD"}', '{"action":"STOP","x":1}', '{}', '[]'):
+                     '{"action":"SEEK_FORWARD"}', '{"action":"STOP","x":1}', '{}', '[]',
+                     '{"action":"repeat"}', '{"action":"TIME"}', '{"action":"NEXT_DISC"}',
+                     '{"action":"CD_DISC_SKIP"}', '{"action":"RANDOM"}', '{"action":"0x8A"}',
+                     '{"action":"DISC_SKIP","byte":"0x8A"}', '{"byte":"0xEA"}',
+                     '{"action":["REPEAT"]}'):
             with self.subTest(body=body):
                 self.assertEqual(self.playback(token, cookie, body=body)[0], 400)
         fake.close()
@@ -2309,6 +2317,65 @@ class CdPlaybackGatewayTest(GatewayTest):
         dispatch.assert_called_once()
         self.assertEqual(fake.commands, [b"CD_STOP\n"])
 
+    def test_momentary_keys_share_refusals_spacing_and_no_retry(self):
+        """TIME_DISPLAY, REPEAT and DISC_SKIP use the playback gates unchanged."""
+        self.enable()
+        uncertain = (b"ERR CD_TRANSPORT_UNCERTAIN action=%s gpio_tx=TX_OK waveform=MISSING "
+                     b"receiver_execution=UNVERIFIED\n")
+        for action in ("TIME_DISPLAY", "REPEAT", "DISC_SKIP"):
+            command = b"CD_" + action.encode() + b"\n"
+            ok = CD_TRANSPORT_OK.replace(b"STOP", action.encode())
+            with self.subTest(action=action):
+                for status, result in ((CD_HOLD_STATUS, "CD_BUSY"),
+                                       (CD_FAULT_STATUS, "CD_FAULT_LATCHED"),
+                                       (STATUS, "NOT_ELIGIBLE")):
+                    token, cookie = self.session()
+                    self.elapse_interval()
+                    fake = RecordingService(self.socket_path, status=status, mute_reply=ok)
+                    code, body, _ = self.playback(token, cookie, action)
+                    fake.close()
+                    self.assertEqual((code, json.loads(body)["result"]), (409, result))
+                    self.assertEqual(self.dispatched(fake), [])
+                for reply, code, result, check in (
+                        (uncertain % action.encode(), 502, "SERVICE_UNCERTAIN", True),
+                        (ok.replace(action.encode(), b"STOP"), 502, "INVALID_REPLY", True),
+                        (b"ERR CD_TRACK_BUSY\n", 409, "REJECTED", False)):
+                    token, cookie = self.session()
+                    self.elapse_interval()
+                    fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                            mute_reply=reply)
+                    code_, body, _ = self.playback(token, cookie, action)
+                    fake.close()
+                    payload = json.loads(body)
+                    self.assertEqual((code_, payload["result"], payload["action"]),
+                                     (code, result, action))
+                    self.assertIs(payload["physical_check_required"], check)
+                    self.assertEqual(self.dispatched(fake), [command], "sent once, never retried")
+                # A success reports transmission only: no display mode or REPEAT state.
+                token, cookie = self.session()
+                self.elapse_interval()
+                fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS, mute_reply=ok)
+                code, body, _ = self.playback(token, cookie, action)
+                fake.close()
+                payload = json.loads(body)
+                self.assertEqual(code, 200)
+                self.assertEqual(payload["receiver_execution"], "UNVERIFIED")
+                self.assertFalse({"repeat", "repeat_state", "time_mode", "disc", "mapping"} &
+                                 set(payload))
+        # They share the CD spacing with PREV/NEXT and the existing keys.
+        self.server.RequestHandlerClass.cd_track_interval_ms = 1000
+        token, cookie = self.session()
+        self.elapse_interval()
+        fake = RecordingService(self.socket_path, status=CD_IDLE_STATUS,
+                                mute_reply=CD_TRANSPORT_OK.replace(b"STOP", b"REPEAT"))
+        try:
+            self.assertEqual(self.playback(token, cookie, "REPEAT")[0], 200)
+            code, body, _ = self.playback(self.fresh_token(cookie), cookie, "DISC_SKIP")
+        finally:
+            fake.close()
+        self.assertEqual((code, json.loads(body)["result"]), (429, "TOO_FAST"))
+        self.assertEqual(self.dispatched(fake), [b"CD_REPEAT\n"])
+
     def test_cli_gates(self):
         base = ["--systemd-socket", "--nginx-uid", "33", "--https-origin",
                 "https://woodland-pi.local"]
@@ -2374,6 +2441,7 @@ class CdSeekGatewayTest(CdPlaybackGatewayTest):
     test_invalid_actions_never_dispatch = None
     test_status_gating_and_shared_cd_spacing = None
     test_uncertain_malformed_and_timeout_are_never_retried = None
+    test_momentary_keys_share_refusals_spacing_and_no_retry = None
     test_cli_gates = None
 
     def test_gate_off_and_capabilities_report_seek(self):

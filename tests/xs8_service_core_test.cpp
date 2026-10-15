@@ -1382,7 +1382,10 @@ static void test_cd_transport_keys()
     using Bytes = std::vector<uint8_t>;
     struct Key { const char *line; uint8_t byte; const char *action; };
     const Key keys[] = {{"CD_PLAY", 0x41, "PLAY"}, {"CD_PLAY_PAUSE", 0xBC, "PLAY_PAUSE"},
-                        {"CD_STOP", 0xA1, "STOP"}};
+                        {"CD_STOP", 0xA1, "STOP"},
+                        {"CD_TIME_DISPLAY", 0xEA, "TIME_DISPLAY"},
+                        {"CD_REPEAT", 0xCC, "REPEAT"},
+                        {"CD_DISC_SKIP", 0x8A, "DISC_SKIP"}};
     for (const auto& key : keys) {
         FakeTx tx;
         Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
@@ -1422,7 +1425,9 @@ static void test_cd_transport_keys()
             assert(fail_tx.sent == (Bytes{key.byte}));
         }
     }
-    for (const char *line : {"CD_PLAY ", "CD_PAUSE", "cd_stop", "CD_STOP 1", "CD_PLAYPAUSE"}) {
+    for (const char *line : {"CD_PLAY ", "CD_PAUSE", "cd_stop", "CD_STOP 1", "CD_PLAYPAUSE",
+                             "CD_TIME", "CD_TIME_DISPLAY 1", "cd_repeat", "CD_REPEAT ON",
+                             "CD_NEXT_DISC", "CD_DISC_SKIP ", "CD_DISC", "CD_RANDOM"}) {
         FakeTx tx;
         Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
         core.connected();

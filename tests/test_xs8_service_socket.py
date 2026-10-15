@@ -157,17 +157,20 @@ class ServiceSocketTest(unittest.TestCase):
         self.assertIn("XS8 STOP reason=STEP result=TX_OK", self.log_path.read_text())
 
     def test_cd_transport_keys_single_frames_and_hold_exclusion(self):
-        for line, action in (("CD_PLAY", "PLAY"), ("CD_PLAY_PAUSE", "PLAY_PAUSE"),
-                             ("CD_STOP", "STOP")):
+        keys = (("CD_PLAY", "PLAY"), ("CD_PLAY_PAUSE", "PLAY_PAUSE"), ("CD_STOP", "STOP"),
+                ("CD_TIME_DISPLAY", "TIME_DISPLAY"), ("CD_REPEAT", "REPEAT"),
+                ("CD_DISC_SKIP", "DISC_SKIP"))
+        for line, action in keys:
             self.assertEqual(self.request(line), "OK CD_TRANSPORT_TX action=" + action +
                              " gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED")
-        self.assertEqual(self.transmitted(), ["0x41", "0xBC", "0xA1"])
+        sent = ["0x41", "0xBC", "0xA1", "0xEA", "0xCC", "0x8A"]
+        self.assertEqual(self.transmitted(), sent)
         token = self.press("SEEK_BACKWARD")
-        for line in ("CD_PLAY", "CD_PLAY_PAUSE", "CD_STOP"):
+        for line, _ in keys:
             self.assertEqual(self.request(line), "ERR CD_TRACK_BUSY")
         self.assertTrue(self.request("CD_RELEASE " + token).startswith("OK CD_RELEASE_TX"))
         self.assertEqual(self.request("CD_STOP").split()[:2], ["OK", "CD_TRANSPORT_TX"])
-        self.assertEqual(self.transmitted(), ["0x41", "0xBC", "0xA1", "0x6A", "0x72", "0xA1"])
+        self.assertEqual(self.transmitted(), sent + ["0x6A", "0x72", "0xA1"])
         status = self.request("STATUS")
         for field in ("cd_state=IDLE", "cd_action=STOP", "cd_last_result=TX_VERIFIED"):
             self.assertIn(field, status)
@@ -839,6 +842,26 @@ class QueryStatusSocketTest(ScriptedRxSocketTest):
                           status["receiver_monitor_evidence"]), ("UNKNOWN", "0", "NONE"))
         self.assertEqual(status["receiver_source"], "TUNER")
         self.assertIn("XS8 RECEIVER monitor cleared after local TX", self.log_path.read_text())
+
+    def test_momentary_cd_keys_keep_the_receiver_observation(self):
+        """TIME DISPLAY, REPEAT and DISC SKIP are not source or MONITOR commands."""
+        self.rx(QUERY_CD_ON)
+        self.assertTrue(self.request("QUERY_STATUS").startswith("OK QUERY_STATUS"))
+        before = self.status()
+        # DISC SKIP was followed by a passive 0xD4 about 1.15 s later on the
+        # hardware: an unknown report, which must not change receiver state.
+        self.rx("0xEA echo", "0xCC echo", "0x8A echo +1150000:0xD4")
+        for line in ("CD_TIME_DISPLAY", "CD_REPEAT", "CD_DISC_SKIP"):
+            self.assertTrue(self.request(line).startswith("OK CD_TRANSPORT_TX"), line)
+        time.sleep(1.4)
+        status = self.status()
+        for field in ("receiver_source", "receiver_source_ns", "receiver_source_evidence",
+                      "receiver_monitor", "receiver_monitor_ns", "receiver_integrity"):
+            self.assertEqual(status[field], before[field], field)
+        self.assertEqual(status["receiver_source"], "CD")
+        self.assertEqual(status["cd_action"], "DISC_SKIP")
+        self.assertEqual(self.transmitted(), ["0x13", "0xEA", "0xCC", "0x8A"])
+        self.assertNotIn("cleared after local TX", self.log_path.read_text())
 
 
 class CdProbeSocketTest(ScriptedRxSocketTest):

@@ -39,7 +39,7 @@ Panasonic TV / Apple TV remote            iPhone Safari
 
 | Status | Capabilities |
 |---|---|
-| **Implemented and physically validated** | CEC volume UP/DOWN and MUTE • Web Remote over HTTPS with authentication • POWER ON (`0x52`) / OFF (`0x62`) and the one-click POWER toggle (both directions) • source selection CD, TUNER, PHONO, TAPE1, VIDEO1, VIDEO2 with automatic `QUERY_STATUS SETTLE` readback • TAPE2 MONITOR toggle (`0x17 → 0x48 → 0x07`; readback `0xD7` ON, `0xE7` OFF) • read-only `QUERY_STATUS` (`0x13`) and source/MONITOR observation • CD NEXT/PREVIOUS, held SEEK, STOP, PLAY/PAUSE |
+| **Implemented and physically validated** | CEC volume UP/DOWN and MUTE • Web Remote over HTTPS with authentication • POWER ON (`0x52`) / OFF (`0x62`) and the one-click POWER toggle (both directions) • source selection CD, TUNER, PHONO, TAPE1, VIDEO1, VIDEO2 with automatic `QUERY_STATUS SETTLE` readback • TAPE2 MONITOR toggle (`0x17 → 0x48 → 0x07`; readback `0xD7` ON, `0xE7` OFF) • read-only `QUERY_STATUS` (`0x13`) and source/MONITOR observation • CD NEXT/PREVIOUS, held SEEK, STOP, PLAY/PAUSE, TIME DISP., REPEAT, DISC SKIP (the last three implemented, not yet deployed) |
 | **Implemented, Web-path validation not recorded** | Web volume step and hold, and Web MUTE. They use the same service transactions as the validated CEC path. |
 | **Experimental / disabled by default** | Every Gateway control gate (off in the checked-in unit) • CD changer presence probe • research TX, chain and CONTEXT REPL • zero CD track spacing • provisional SETTLE timing |
 | **Planned / future** | Exclusive bus lease or service-side atomic POWER • archived trial notes for the latest validations • volume-step calibration • presence in the Web UI • native iOS client |

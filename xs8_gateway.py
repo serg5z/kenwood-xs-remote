@@ -58,8 +58,12 @@ CD_TRACK_INTERVAL_RANGE_MS = (200, 1000)
 CD_TRACK_INTERVAL_OFF = 0
 # Single ROOT key frames, mapped to bytes only by the service. STOP (ROOT 0xA1,
 # formerly 0x9C) is physically observed; 0xBC PLAY/PAUSE is a
-# historical mapping that is not yet physically verified.
-CD_PLAYBACK_COMMANDS = {"PLAY_PAUSE": "CD_PLAY_PAUSE", "STOP": "CD_STOP"}
+# historical mapping that is not yet physically verified. TIME_DISPLAY (0xEA),
+# REPEAT (0xCC) and DISC_SKIP (0x8A) were physically verified by the operator on
+# 2026-10-15. All are momentary: no display mode or REPEAT state is inferred.
+CD_PLAYBACK_COMMANDS = {"PLAY_PAUSE": "CD_PLAY_PAUSE", "STOP": "CD_STOP",
+                        "TIME_DISPLAY": "CD_TIME_DISPLAY", "REPEAT": "CD_REPEAT",
+                        "DISC_SKIP": "CD_DISC_SKIP"}
 CD_PLAYBACK_ACTIONS = tuple(CD_PLAYBACK_COMMANDS)
 CD_PROVISIONAL_ACTIONS = ("PLAY_PAUSE",)
 # Held FF/REW through the service's CD hold API. The service lease (2 s) and
@@ -754,7 +758,7 @@ def capabilities(mute_available=False, source_available=False, query_available=F
                 "available_actions": list(CD_PLAYBACK_ACTIONS),
                 "provisional_actions": list(CD_PROVISIONAL_ACTIONS),
                 "min_interval_ms": cd_track_interval_ms,
-                "reason": "STOP 0xA1 is physically observed; PLAY/PAUSE 0xBC is a historical mapping not yet physically verified",
+                "reason": "STOP 0xA1, TIME_DISPLAY 0xEA, REPEAT 0xCC and DISC_SKIP 0x8A are physically observed; PLAY/PAUSE 0xBC is a historical mapping not yet physically verified; TX and waveform do not confirm a changer action",
             },
             "volume_hold": {
                 "classification": "unverified", "enabled": volume_hold_available,

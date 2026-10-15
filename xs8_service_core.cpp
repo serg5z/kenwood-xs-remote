@@ -557,6 +557,13 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
     if (line == "CD_PLAY") return cd_transport(0x41, "PLAY");
     if (line == "CD_PLAY_PAUSE") return cd_transport(0xBC, "PLAY_PAUSE");
     if (line == "CD_STOP") return cd_transport(0xA1, "STOP");
+    // Single ROOT frames physically verified on the KR-V6070 (operator report,
+    // 2026-10-15): 0xEA cycles the changer's time display, 0xCC toggles REPEAT
+    // and 0x8A skips to the next disc with the receiver staying on CD. They are
+    // momentary keys; nothing infers a display mode or REPEAT state from them.
+    if (line == "CD_TIME_DISPLAY") return cd_transport(0xEA, "TIME_DISPLAY");
+    if (line == "CD_REPEAT") return cd_transport(0xCC, "REPEAT");
+    if (line == "CD_DISC_SKIP") return cd_transport(0x8A, "DISC_SKIP");
     if (line == "CD_TRACK_NEXT") return cd_track(0xFC, "NEXT");
     if (line == "CD_TRACK_PREVIOUS") return cd_track(0xEC, "PREVIOUS");
     if (line.compare(0, 14, "SELECT_SOURCE ") == 0) {

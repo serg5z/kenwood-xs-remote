@@ -6,7 +6,7 @@ This is a consolidated **logical TX** evidence map for the KR-V6070, not a list 
 
 Each row/column is logical TX `0xHL` (high nibble row, low nibble column). Legacy TX is another label for the **same waveform**, converted by `logical = reverse8(~legacy)`: `B5 → 52`, `7D → 41`, `C6 → 9C`, `C0/C8/A9/A1/B1 → FC/EC/6A/7A/72`, `57 → 15`, `1F → 07`, `60/68 → F9/E9`. Never apply that conversion to RX. Later-decoder legacy RX labels such as `D6`, `1D`, and `18` remain as printed; early passive RX labels require their own convention ([registry encoding history](COMMAND_REGISTRY.md#byte-encoding-and-decoder-history), [original TX routine](sketches/xs-tx-test1.ino#L180-L235), [later RX routine](sketches/xs-tx-test2.ino#L349-L355)). The retained [partial scan](captures/kenwood-xs-scan.txt#L29-L56) uses legacy **TX** labels and ends at candidate legacy `17`, so its candidate labels must be converted before matrix placement.
 
-- `V` — operator-reported **physical verification** in a controlled state. It is not independently replayable without raw trial records. ROOT `13` has the [October 11 readback report](notes/xs8-readback-2026-10-11.md); `41/52/9C` have the [October 12 report](notes/xs8-root-validation-2026-10-12.md); `82–85` were physically reported in the [earlier four-input validation](notes/xs8-root-validation-2026-10-12.md), but its per-trial log is not in this archive. ROOT `62` and `A1` and the entered-context `48/78/88` are described in [section 4](#4-physical-validations-reported-2026-10-12-to-2026-10-15). `V` for `62`, `A1` and `48` rests on operator statements alone, with no dated trial note. `V` does not mean universal safety or receiver acknowledgment.
+- `V` — operator-reported **physical verification** in a controlled state. It is not independently replayable without raw trial records. ROOT `13` has the [October 11 readback report](notes/xs8-readback-2026-10-11.md); `41/52/9C` have the [October 12 report](notes/xs8-root-validation-2026-10-12.md); `82–85` were physically reported in the [earlier four-input validation](notes/xs8-root-validation-2026-10-12.md), but its per-trial log is not in this archive. ROOT `62`, `8A`, `A1`, `CC` and `EA` and the entered-context `48/78/88` are described in [section 4](#4-physical-validations-reported-2026-10-12-to-2026-10-15). `V` for `62`, `8A`, `A1`, `CC`, `EA` and `48` rests on operator statements alone, with no dated trial note. `V` does not mean universal safety or receiver acknowledgment.
 - `R` — behavior or RX **reported in historical notes**, without a retained per-byte raw log. The presence of RX can be the only observed result; semantics may remain unknown.
 - `K` — **known protocol/control byte** in the tested context: ROOT `15` releases a control lock and ROOT `17` enters an alternative interpretation; after `17`, `07` exits and `09` stops an active volume hold. These are observed control effects, not claims of a universal release opcode.
 - `T` — **tested with no visible effect recorded** in the specified state. It does not mean NOP or no RX unless a separate no-RX test says so.
@@ -17,7 +17,7 @@ Each row/column is logical TX `0xHL` (high nibble row, low nibble column). Legac
 
 ## 1. ROOT matrix
 
-Baseline is ROOT + CD selected + CD playing, with source and lock state restored between trials. `V` for `41`, `52`, `62`, `72` and `A1` overlays newer physical tests in different initial states; their earlier no-visible-effect observations remain recorded below. `A` preserves historical NORMAL attributions and the `F1` STOP discrepancy rather than selecting a global meaning.
+Baseline is ROOT + CD selected + CD playing, with source and lock state restored between trials. `V` for `41`, `52`, `62`, `72`, `8A`, `A1`, `CC` and `EA` overlays newer physical tests in different initial states; their earlier no-visible-effect observations remain recorded below. `A` preserves historical NORMAL attributions and the `F1` STOP discrepancy rather than selecting a global meaning.
 
 | hi\lo | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | A | B | C | D | E | F |
 |:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
@@ -29,13 +29,13 @@ Baseline is ROOT + CD selected + CD playing, with source and lock state restored
 | **5** | T | R | V | T | T | R! | R! | T | R | T | T | T | T | T | T | T |
 | **6** | T | R | V! | T | T | R! | R! | R! | R | A | R! | T | T | T | T | T |
 | **7** | T | R | V | T | A | R! | R! | R! | A | T | R! | T | T | T | T | T |
-| **8** | T | R | V | V | V | V | R | T | A | T | R | T | T | T | T | T |
+| **8** | T | R | V | V | V | V | R | T | A | T | V | T | T | T | T | T |
 | **9** | T | T | T | T | T | T | T | T | R | T | T | T | V | T | T | T |
 | **A** | T | V | T | T | T | R! | R! | T | T | T | T | T | T | T | T | T |
 | **B** | T | T | T | T | T | T | R | T | T | T | T | T | R | T | T | T |
-| **C** | T | T | T | R | T | T | T | T | A | T | T | T | R | T | T | T |
+| **C** | T | T | T | R | T | T | T | T | A | T | T | T | V | T | T | T |
 | **D** | T | T | T | R | T | R! | R! | T | T | T | R | T | T | T | T | T |
-| **E** | T | T | T | R | T | R | R | T | T | T | R | T | R! | T | T | T |
+| **E** | T | T | T | R | T | R | R | T | T | T | V | T | R! | T | T | T |
 | **F** | T | A | T | T | A | T | T | T | T | T | T | T | R! | T | T | T |
 
 **ROOT evidence.** `13` produced two source/MONITOR-associated RX frames; the six sources and both MONITOR states were later physically compared ([query A/B](notes/kenwood-xs-reverse-engineering-reviewed.md#L113-L175), [physical readback](notes/xs8-readback-2026-10-11.md)). `14` produced the same `1D,18` pair in ROOT+CD but is not proven equivalent elsewhere. `15` released the persistent observed lock; `17` changed interpretation ([lock and context tests](notes/kenwood-xs-reverse-engineering-reviewed.md#L177-L206), [context A/B](notes/kenwood-xs-reverse-engineering-reviewed.md#L410-L428)).
@@ -134,6 +134,9 @@ No row rests on `TX_OK`/`MATCH` alone: every one is a physical observation of th
 | `84 82 83 85` (ROOT) and `17 → 78/88 → 07` (CONTEXT), each followed by a SETTLE `13` | Web source selection with automatic readback | The selected input showed on the receiver, and the readback reported it | VIDEO1/VIDEO2 sequences: dated note, [2026-10-12](notes/xs8-context-video-mute-2026-10-12.md). The end-to-end Web selection with SETTLE readback: operator statement only, 2026-10-15 |
 | `17 → 48 → 07` | CONTEXT; `TAPE2_MONITOR_TOGGLE` | Toggled TAPE2 MONITOR. The readback showed `D7` (ON) and `E7` (OFF) in waveform terms, legacy RX `14`/`18` | Operator statement only, 2026-10-15 |
 | `A1` | ROOT; CD playing; `CD_STOP` | CD stopped; ROOT `21` also stopped CD via the REPL | Operator statement only, recorded in commit `2793883` (2026-10-14). It replaced `9C`, after a VIDEO1/VIDEO2 selection following a `9C` STOP provoked an unwanted changer restart |
+| `EA` | ROOT, CD selected; now `CD_TIME_DISPLAY` | The changer's time display mode changed | Operator statement only, 2026-10-15 |
+| `CC` ×2 | ROOT, CD selected; now `CD_REPEAT` | REPEAT indicator on, then off | Operator statement only, 2026-10-15. Earlier partial maps (copies 2–7) recorded `CC` as no visible effect |
+| `8A` | ROOT, CD selected, changer connected; now `CD_DISC_SKIP` | Next disc; receiver stayed on CD; a passive `D4` about 1.15 s later | Operator statement only, 2026-10-15. `D4` is a candidate disc-change notification, not a confirmed command |
 
 The entered-context `48` result supersedes, **for CONTEXT only**, the open question of the historical NORMAL label `ED` (logical `48`) "MONITOR toggle". In ROOT, `48` remains CD track 4 in the controlled sweep.
 
