@@ -672,6 +672,18 @@ std::string Xs8ServiceCore::volume_step(VolumeControl::Direction direction,
 
 std::string Xs8ServiceCore::begin_query_status(Time now)
 {
+    return begin_root_observation(0x13, "QUERY_STATUS", now);
+}
+
+std::string Xs8ServiceCore::begin_cd_probe(Time now)
+{
+    return begin_root_observation(0xC3, "CD_PROBE", now);
+}
+
+// One verified ROOT frame that opens an RX observation window: IDLE, no hold,
+// no outstanding STOP, release or CD fault, closed context, healthy monitor.
+std::string Xs8ServiceCore::begin_root_observation(uint8_t byte, const char *name, Time now)
+{
     if (cd_active_) return "ERR CD_TRACK_BUSY\n";
     if (cd_fault_ || cd_release_owed_) return "ERR CD_FAULT_LATCHED\n";
     const VolumeControl::State received_state = volume_.state();
@@ -683,14 +695,14 @@ std::string Xs8ServiceCore::begin_query_status(Time now)
     if (received_state != VolumeControl::State::IDLE)
         return std::string("ERR ") + state_name(received_state) + "\n";
     if (received_unresolved)
-        return "ERR QUERY_STATUS reason=UNRESOLVED_STATE\n";
+        return std::string("ERR ") + name + " reason=UNRESOLVED_STATE\n";
     if (volume_.state() != VolumeControl::State::IDLE ||
         volume_.stop_owed() || volume_.context_may_be_open())
-        return "ERR QUERY_STATUS reason=UNRESOLVED_STATE\n";
-    const bool verified = tx_.send(0x13);
+        return std::string("ERR ") + name + " reason=UNRESOLVED_STATE\n";
+    const bool verified = tx_.send(byte);
     const ServiceTxEvidence evidence = tx_.last_evidence();
     if (!verified)
-        return std::string("ERR QUERY_STATUS reason=TX_UNCERTAIN gpio_tx=") +
+        return std::string("ERR ") + name + " reason=TX_UNCERTAIN gpio_tx=" +
             (evidence.gpio_completed ? "TX_OK" : "TX_FAIL") +
             " waveform=" + waveform_name(evidence.waveform) +
             " receiver_execution=UNVERIFIED\n";

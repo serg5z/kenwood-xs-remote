@@ -322,6 +322,63 @@ static void test_query_status_gates_and_single_tx()
     assert(root_tx.sent.back() == 0x07);
 }
 
+// The experimental CD presence probe reuses the query gates: one ROOT 0xC3,
+// refused (nothing sent) while inhibited, unhealthy, holding or uncertain.
+static void test_cd_probe_gates_and_single_tx()
+{
+    using Bytes = std::vector<uint8_t>;
+    FakeTx inhibited_tx;
+    Xs8ServiceCore inhibited(inhibited_tx, Ms(2000), false);
+    inhibited.connected();
+    assert(inhibited.begin_cd_probe(at(1)) == "ERR BOOT_INHIBIT\n");
+    assert(inhibited_tx.sent.empty());
+
+    FakeTx tx;
+    Xs8ServiceCore core(tx, Ms(2000), true, {}, [] { return at(0); });
+    assert(core.begin_cd_probe(at(1)) == "ERR NO_CLIENT\n");
+    core.connected(1);
+    core.connected(2);
+    assert(core.begin_cd_probe(at(2)).empty());
+    assert(tx.sent == (Bytes{0xC3}));
+    tx.healthy = false;
+    assert(core.begin_cd_probe(at(3)) == "ERR MONITOR_FAILED\n");
+    tx.healthy = true;
+    assert(tx.sent == (Bytes{0xC3}));
+
+    // Volume hold, CD hold, open context or STOP obligation: nothing sent.
+    core.command("VOLUME_PRESS UP", at(10), at(10), 2);
+    assert(core.begin_cd_probe(at(11)) == "ERR HOLDING_UP\n");
+    core.command("VOLUME_RELEASE UP", at(12), at(12), 2);
+    core.command("KEY_DOWN SEEK_FORWARD", at(20), at(20), 2);
+    assert(core.begin_cd_probe(at(21)) == "ERR CD_TRACK_BUSY\n");
+    core.command("KEY_UP SEEK_FORWARD", at(22), at(22), 2);
+    assert(tx.sent == (Bytes{0xC3, 0x17, 0xF9, 0x09, 0x07, 0x7A, 0x72}));
+    assert(core.begin_cd_probe(at(30)).empty());
+    assert(tx.sent.back() == 0xC3);
+
+    // An uncertain frame is reported once, never retried.
+    FakeTx uncertain_tx;
+    uncertain_tx.fail_next = true;
+    uncertain_tx.fail_waveform = WaveformEvidence::MISSING;
+    Xs8ServiceCore uncertain(uncertain_tx, Ms(2000), true);
+    uncertain.connected();
+    assert(uncertain.begin_cd_probe(at(1)) ==
+        "ERR CD_PROBE reason=TX_UNCERTAIN gpio_tx=TX_OK "
+        "waveform=MISSING receiver_execution=UNVERIFIED\n");
+    assert(uncertain_tx.sent == (Bytes{0xC3}));
+
+    // A latched CD fault or owed release refuses it too.
+    FakeTx fault_tx;
+    fault_tx.fail_release = true;
+    Xs8ServiceCore fault(fault_tx, Ms(2000), true, {}, [] { return at(0); });
+    fault.connected();
+    fault.command("CD_TRACK_NEXT", at(1), at(1));
+    assert(fault.cd_fault() || fault.cd_release_owed());
+    const size_t sent = fault_tx.sent.size();
+    assert(fault.begin_cd_probe(at(2)) == "ERR CD_FAULT_LATCHED\n");
+    assert(fault_tx.sent.size() == sent);
+}
+
 static void test_research_tx_interlocks()
 {
     FakeTx inhibited_tx;
@@ -2064,6 +2121,7 @@ int main()
     test_release_and_watchdog();
     test_failed_stop_verification_and_monitor();
     test_query_status_gates_and_single_tx();
+    test_cd_probe_gates_and_single_tx();
     test_research_tx_interlocks();
     test_cd_track_success_timing_and_serialization();
     test_cd_track_uncertain_press_still_releases();

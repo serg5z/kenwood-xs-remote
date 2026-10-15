@@ -1,6 +1,7 @@
 import http.client
 import contextlib
 import io
+import itertools
 import json
 import os
 import re
@@ -37,6 +38,10 @@ CD_IDLE_STATUS = STATUS.replace(b"\n", (
 CD_FAULT_STATUS = STATUS.replace(b"state=IDLE", b"state=FAULT_LATCHED").replace(
     b"\n", (b" cd_state=FAULT_LATCHED cd_action=NEXT cd_release_owed=1"
             b" cd_lease_expired=0 cd_last_result=RELEASE_UNCERTAIN\n"))
+RECEIVER_CD_STATUS = RECEIVER_STATUS.rstrip(b"\n") + CD_IDLE_STATUS[len(STATUS) - 1:]
+PRESENCE_STATUS = RECEIVER_CD_STATUS.replace(b"\n", (
+    b" cd_changer=NOT_DETECTED cd_changer_ns=2000000000"
+    b" cd_changer_last_probe=NO_RESPONSE\n"))
 CD_OK = (b"OK CD_TRACK_TX action=NEXT press_gpio_tx=TX_OK press_waveform=MATCH "
          b"release_gpio_tx=TX_OK release_waveform=MATCH cd_result=TX_VERIFIED "
          b"receiver_execution=UNVERIFIED\n")
@@ -880,6 +885,166 @@ class ReceiverQueryGatewayTest(GatewayTest):
             with contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     xs8_gateway.parse_args(list(args))
+
+
+class CdPresenceStatusTest(GatewayTest):
+    """Optional diagnostic presence fields from --enable-cd-presence-probe."""
+
+    enable_source = SourceGatewayTest.enable_source
+
+    def read(self, line):
+        fake = FakeService(self.socket_path, line)
+        try:
+            return xs8_gateway.read_status(self.socket_path)
+        finally:
+            fake.close()
+
+    def presence(self, value, ns, last, base=RECEIVER_STATUS):
+        return base.rstrip(b"\n") + (f" cd_changer={value} cd_changer_ns={ns}"
+                                      f" cd_changer_last_probe={last}\n").encode()
+
+    def assert_rejected(self, line):
+        with self.assertRaises(xs8_gateway.ServiceError) as raised:
+            self.read(line)
+        self.assertEqual(str(raised.exception), "Invalid XS8 service STATUS reply")
+
+    def test_old_status_without_presence_is_accepted(self):
+        for line in (STATUS, RECEIVER_STATUS, CD_IDLE_STATUS, RECEIVER_CD_STATUS):
+            with self.subTest(line=line):
+                self.assertFalse(set(self.read(line)) & xs8_gateway.CD_PRESENCE_FIELDS)
+        fake = FakeService(self.socket_path, RECEIVER_STATUS)
+        code, body, _ = self.request_full("GET", "/api/v1/status")
+        fake.close()
+        self.assertEqual(code, 200)
+        parsed = json.loads(body)
+        self.assertIsNone(parsed["cd_changer"])
+        self.assertNotIn("cd_changer", parsed["status"])
+
+    def test_every_consistent_presence_combination_is_accepted(self):
+        valid = [("UNKNOWN", "0", last) for last in ("NONE", "AMBIGUOUS", "FAILED")]
+        valid += [("PRESENT", "90", last) for last in ("RESPONSE", "AMBIGUOUS", "FAILED")]
+        valid += [("NOT_DETECTED", "300", last)
+                  for last in ("NO_RESPONSE", "AMBIGUOUS", "FAILED")]
+        valid.append(("PRESENT", str((1 << 64) - 1), "RESPONSE"))
+        for value, ns, last in valid:
+            for base in (STATUS, RECEIVER_STATUS, RECEIVER_CD_STATUS):
+                with self.subTest(value=value, ns=ns, last=last, base=base):
+                    fields = self.read(self.presence(value, ns, last, base))
+                    self.assertEqual((fields["cd_changer"], fields["cd_changer_ns"],
+                                      fields["cd_changer_last_probe"]), (value, ns, last))
+
+    def test_status_endpoint_exposes_presence_as_diagnostic_only(self):
+        fake = FakeService(self.socket_path, PRESENCE_STATUS)
+        code, body, _ = self.request_full("GET", "/api/v1/status")
+        fake.close()
+        self.assertEqual(code, 200)
+        self.assertEqual(fake.commands, [b"STATUS\n"])
+        parsed = json.loads(body)
+        self.assertEqual(parsed["cd_changer"]["value"], "NOT_DETECTED")
+        self.assertEqual(parsed["cd_changer"]["observed_mono_ns"], 2000000000)
+        self.assertEqual(parsed["cd_changer"]["last_probe"], "NO_RESPONSE")
+        self.assertTrue(parsed["cd_changer"]["diagnostic"])
+        self.assertEqual(parsed["cd_changer"]["receiver_execution"], "UNVERIFIED")
+        # NOT_DETECTED never changes the receiver's reported source.
+        self.assertEqual(parsed["receiver"]["source"]["value"], "CD")
+        self.assertEqual(parsed["receiver"]["source"]["evidence"], "PASSIVE")
+        unknown = self.presence("UNKNOWN", "0", "NONE")
+        fake = FakeService(self.socket_path, unknown)
+        parsed = json.loads(self.request_full("GET", "/api/v1/status")[1])
+        fake.close()
+        self.assertIsNone(parsed["cd_changer"]["age_ms"])
+
+    def test_incomplete_presence_groups_are_rejected(self):
+        names = sorted(xs8_gateway.CD_PRESENCE_FIELDS)
+        values = {"cd_changer": "PRESENT", "cd_changer_ns": "90",
+                  "cd_changer_last_probe": "RESPONSE"}
+        for size in (1, 2):
+            for subset in itertools.combinations(names, size):
+                with self.subTest(subset=subset):
+                    extra = "".join(f" {name}={values[name]}" for name in subset)
+                    self.assert_rejected(RECEIVER_STATUS.rstrip(b"\n") + extra.encode() + b"\n")
+
+    def test_malformed_presence_values_are_rejected(self):
+        for value, ns, last in (
+                ("ABSENT", "300", "NO_RESPONSE"), ("OFF", "300", "NO_RESPONSE"),
+                ("present", "90", "RESPONSE"), ("PRESENT", "90", "OK"),
+                ("PRESENT", "90", "response"), ("PRESENT", "-90", "RESPONSE"),
+                ("PRESENT", "+90", "RESPONSE"), ("PRESENT", "090", "RESPONSE"),
+                ("PRESENT", "00", "RESPONSE"), ("PRESENT", "9.0", "RESPONSE"),
+                ("PRESENT", "0x5A", "RESPONSE"), ("PRESENT", "1e3", "RESPONSE"),
+                ("PRESENT", str(1 << 64), "RESPONSE")):
+            with self.subTest(value=value, ns=ns, last=last):
+                self.assert_rejected(self.presence(value, ns, last))
+        for line in (self.presence("PRESENT", "", "RESPONSE"),
+                     self.presence("PRESENT", "90", "RESPONSE").replace(
+                         b"cd_changer=PRESENT", b"cd_changer=PRESENT cd_changer=PRESENT"),
+                     self.presence("PRESENT", "90", "RESPONSE").replace(
+                         b"cd_changer_ns=90", b"cd_changer_ns"),
+                     "OK cd_changer=PRESENT cd_changer_ns=90 cd_changer_last_probe=RESPONSE\n"
+                     .encode()):
+            with self.subTest(line=line):
+                self.assert_rejected(line)
+
+    def test_inconsistent_presence_is_rejected(self):
+        for value, ns, last in (
+                ("UNKNOWN", "5", "FAILED"), ("PRESENT", "0", "RESPONSE"),
+                ("NOT_DETECTED", "0", "NO_RESPONSE"), ("PRESENT", "90", "NONE"),
+                ("NOT_DETECTED", "300", "NONE"), ("PRESENT", "90", "NO_RESPONSE"),
+                ("NOT_DETECTED", "300", "RESPONSE"), ("UNKNOWN", "0", "RESPONSE"),
+                ("UNKNOWN", "0", "NO_RESPONSE")):
+            with self.subTest(value=value, ns=ns, last=last):
+                self.assert_rejected(self.presence(value, ns, last))
+
+    def test_unrelated_unknown_fields_are_still_rejected(self):
+        for extra in (b" cd_changer_age=1", b" cd_probe=RESPONSE", b" cd_presence=PRESENT",
+                      b" receiver_cd_changer=PRESENT", b" future_field=1"):
+            with self.subTest(extra=extra):
+                self.assert_rejected(PRESENCE_STATUS.rstrip(b"\n") + extra + b"\n")
+        # Existing strict checks still apply alongside a valid presence group.
+        self.assert_rejected(PRESENCE_STATUS.replace(b" receiver_integrity=HEALTHY", b""))
+        self.assert_rejected(PRESENCE_STATUS.replace(b" cd_last_result=NONE", b""))
+        self.assert_rejected(PRESENCE_STATUS.replace(b"receiver_source_ns=1000000000",
+                                                     b"receiver_source_ns=0"))
+        self.assert_rejected(PRESENCE_STATUS.replace(b" last_byte=0x09", b""))
+        self.assert_rejected(PRESENCE_STATUS.replace(b"OK ", b"ERR "))
+
+    def test_presence_never_changes_availability_or_source_selection(self):
+        self.enable_source()
+        handler = self.server.RequestHandlerClass
+        handler.receiver_query_enabled = True
+        handler.cd_track_enabled = True
+        base = RECEIVER_CD_STATUS
+        expected = None
+        for line in (base, self.presence("UNKNOWN", "0", "NONE", base),
+                     self.presence("PRESENT", "90", "RESPONSE", base), PRESENCE_STATUS,
+                     self.presence("NOT_DETECTED", "300", "FAILED", base)):
+            with self.subTest(line=line):
+                fields = self.read(line)
+                self.assertTrue(handler.status_allows_cd_track(fields))
+                fake = RecordingService(self.socket_path, status=line)
+                token, cookie = self.session()
+                headers = {"X-Kenwood-Authenticated-User": "remote", "Cookie": cookie}
+                code, body, _ = self.request_full("GET", "/api/v1/capabilities",
+                                                  headers=headers)
+                fake.close()
+                self.assertEqual(code, 200)
+                operations = json.loads(body)["operations"]
+                if expected is None:
+                    expected = operations
+                self.assertEqual(operations, expected)
+                self.assertTrue(operations["source"]["enabled"])
+                self.assertTrue(operations["cd_transport"]["enabled"])
+                self.assertTrue(operations["receiver_query"]["enabled"])
+                self.assertNotIn(b"PROBE_CD_CHANGER\n", fake.commands)
+        # With NOT_DETECTED reported, selecting CD still dispatches exactly once.
+        fake = RecordingService(self.socket_path, status=PRESENCE_STATUS, mute_reply=(
+            b"OK SOURCE_TX gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED\n"))
+        token, cookie = self.session()
+        code, body, _ = self.source(token, cookie, "TUNER")
+        fake.close()
+        self.assertEqual(code, 200)
+        self.assertEqual(fake.commands.count(b"SELECT_SOURCE TUNER\n"), 1)
+        self.assertNotIn(b"PROBE_CD_CHANGER\n", fake.commands)
 
 
 class CdTrackGatewayTest(GatewayTest):

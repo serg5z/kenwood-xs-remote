@@ -38,7 +38,7 @@ python3 -m unittest discover -s tests -p 'test_gateway.py'
 
 | Endpoint | Result |
 | --- | --- |
-| `GET /api/v1/status` | JSON with `gateway`, `xs8_service`, and parsed service `status`. Returns HTTP 503 when the service is unavailable or its reply is invalid. |
+| `GET /api/v1/status` | JSON with `gateway`, `xs8_service`, parsed service `status`, `receiver` and `cd_changer` (diagnostic CD changer presence, or `null` from a service without it; see [CD changer presence](cd-changer-presence.md)). Returns HTTP 503 when the service is unavailable or its reply is invalid. |
 | `GET /api/v1/capabilities` | JSON classifications and enabled flags. MUTE and evidenced sources require their own gates, a session, and XS8 eligibility. |
 | `GET /api/v1/session` | Returns 404 when every control gate is disabled; otherwise issues a secure session cookie and one-use CSRF token, plus per-control `*_available` flags including `cd_track_available` `volume_step_available`, `cd_playback_available` and `cd_seek_available`. |
 | `POST /api/v1/mute` | Returns 501 with MUTE disabled. With the production gate, a valid request checks fresh XS8 eligibility and sends one `MUTE` to the local service. |

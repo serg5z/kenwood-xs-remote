@@ -1,3 +1,4 @@
+import os
 import pathlib
 import re
 import socket
@@ -8,6 +9,11 @@ import unittest
 
 
 class ServiceSocketTest(unittest.TestCase):
+    extra_args = ()
+
+    def environment(self):
+        return None
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="xs8-socket-", dir="/tmp")
         self.path = str(pathlib.Path(self.temp.name) / "service.sock")
@@ -19,8 +25,8 @@ class ServiceSocketTest(unittest.TestCase):
             str(pathlib.Path(".build/xs8_service_socket_test").resolve()),
             "--socket", self.path, "--allow-unrecovered-start",
             "--enable-research-tx", "--enable-research-chain",
-            "--enable-research-context",
-        ], stdout=subprocess.DEVNULL, stderr=self.log)
+            "--enable-research-context", *self.extra_args,
+        ], stdout=subprocess.DEVNULL, stderr=self.log, env=self.environment())
         deadline = time.monotonic() + 3
         while not pathlib.Path(self.path).exists():
             if self.process.poll() is not None or time.monotonic() >= deadline:
@@ -599,6 +605,172 @@ class ServiceSocketTest(unittest.TestCase):
                          "ERR CONTEXT_SESSION reason=DISABLED")
         self.assertIn("research_context=DISABLED", self.log_path.read_text())
         self.assertEqual(self.transmitted(), [])
+
+    def test_cd_probe_is_disabled_by_default(self):
+        self.assertEqual(self.request("PROBE_CD_CHANGER"), "ERR CD_PROBE reason=DISABLED")
+        self.assertEqual(self.transmitted(), [])
+        # STATUS is unchanged without the flag, so current STATUS parsers keep working.
+        self.assertNotIn("cd_changer", self.request("STATUS"))
+        self.assertIn("cd_presence_probe=DISABLED", self.log_path.read_text())
+
+
+class ScriptedRxSocketTest(ServiceSocketTest):
+    """Simulated RX timed from each fake TX (XS8_FAKE_RX_SCRIPT)."""
+
+    for _name in [n for n in dir(ServiceSocketTest) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name
+
+    def environment(self):
+        self.script = pathlib.Path(tempfile.mkdtemp(prefix="xs8-rx-", dir="/tmp")) / "rx"
+        self.script.write_text("")
+        self.addCleanup(lambda: self.script.unlink(missing_ok=True))
+        return dict(os.environ, XS8_FAKE_RX_SCRIPT=str(self.script))
+
+    def rx(self, *lines):
+        self.script.write_text("\n".join(lines) + "\n")
+
+    def status(self):
+        return dict(part.split("=", 1) for part in self.request("STATUS").split()[1:])
+
+
+class CdProbeSocketTest(ScriptedRxSocketTest):
+    """Experimental PROBE_CD_CHANGER with simulated RX timed from the fake TX."""
+
+    extra_args = ("--enable-cd-presence-probe",)
+
+    def probe(self, rx):
+        time.sleep(1.05)  # The service's 1 s guard after any local TX.
+        self.rx(rx)
+        return self.request("PROBE_CD_CHANGER")
+
+    def test_response_about_three_ms_after_tx(self):
+        self.assertIn("cd_presence_probe=EXPERIMENTAL", self.log_path.read_text())
+        before = self.status()
+        self.assertEqual((before["cd_changer"], before["cd_changer_ns"],
+                          before["cd_changer_last_probe"]), ("UNKNOWN", "0", "NONE"))
+        self.rx("0xC3 echo +3000:0x94")
+        reply = self.request("PROBE_CD_CHANGER")
+        self.assertRegex(reply, r"^OK CD_PROBE result=RESPONSE latency=\d+us frames=1 "
+                                r"rx=0x94@\+\d+us gpio_tx=TX_OK waveform=MATCH "
+                                r"receiver_execution=UNVERIFIED$")
+        latency = int(re.search(r"latency=(\d+)us", reply).group(1))
+        self.assertTrue(1000 <= latency <= 3000, latency)
+        self.assertEqual(self.transmitted(), ["0xC3"], "exactly one frame, no retry")
+        after = self.status()
+        self.assertEqual((after["cd_changer"], after["cd_changer_last_probe"]),
+                         ("PRESENT", "RESPONSE"))
+        self.assertNotEqual(after["cd_changer_ns"], "0")
+        # Presence never touches the receiver source observation.
+        self.assertEqual((after["receiver_source"], after["receiver_source_evidence"]),
+                         ("UNKNOWN", "NONE"))
+
+    def test_silence_is_no_response_not_off(self):
+        self.rx("0xC3 echo")
+        self.assertEqual(self.request("PROBE_CD_CHANGER"),
+                         "OK CD_PROBE result=NO_RESPONSE latency=NONE frames=0 rx=NONE "
+                         "gpio_tx=TX_OK waveform=MATCH receiver_execution=UNVERIFIED")
+        status = self.status()
+        self.assertEqual((status["cd_changer"], status["cd_changer_last_probe"]),
+                         ("NOT_DETECTED", "NO_RESPONSE"))
+        self.assertNotIn("ABSENT", self.request("STATUS"))
+
+    def test_multiple_and_late_frames_are_ambiguous_and_change_nothing(self):
+        self.rx("0xC3 echo +3000:0x94")
+        self.assertIn("result=RESPONSE", self.request("PROBE_CD_CHANGER"))
+        for rx, frames in (("0xC3 echo +3000:0x94 +30000:0x94", "frames=2"),
+                           ("0xC3 echo +35000:0x94", "frames=1"),
+                           ("0xC3 echo +3000:0xE4", "frames=1")):
+            with self.subTest(rx=rx):
+                reply = self.probe(rx)
+                self.assertTrue(reply.startswith("OK CD_PROBE result=AMBIGUOUS"), reply)
+                self.assertIn(frames, reply)
+                status = self.status()
+                # The earlier RESPONSE stays the observation; nothing is inferred.
+                self.assertEqual((status["cd_changer"], status["cd_changer_last_probe"]),
+                                 ("PRESENT", "AMBIGUOUS"))
+        self.assertEqual(self.transmitted(), ["0xC3"] * 4)
+
+    def test_faults_fail_without_establishing_presence(self):
+        for rx, reason in (("0xC3 echo +3000:INVALID", "INVALID_FRAME"),
+                           ("0xC3 echo +3000:0x94 +4000:GAP", "EVENT_GAP"),
+                           ("0xC3 +0:0x94", "TX_MISMATCH"),
+                           ("0xC3", "TX_MISSING"),
+                           ("0xC3 echo +0:0x94", "OVERLAP")):
+            with self.subTest(reason=reason):
+                reply = self.probe(rx)
+                self.assertTrue(reply.startswith("ERR CD_PROBE reason=" + reason), reply)
+                self.assertTrue(reply.endswith("receiver_execution=UNVERIFIED"), reply)
+                status = self.status()
+                self.assertEqual((status["cd_changer"], status["cd_changer_last_probe"]),
+                                 ("UNKNOWN", "FAILED"))
+        self.assertEqual(self.transmitted(), ["0xC3"] * 5, "never retried")
+
+    def test_recent_tx_and_bus_activity_guards(self):
+        self.rx("0xC3 echo")
+        self.assertIn("NO_RESPONSE", self.request("PROBE_CD_CHANGER"))
+        self.assertEqual(self.request("PROBE_CD_CHANGER"), "ERR CD_PROBE reason=RECENT_TX")
+        # A delayed report from an earlier CD operation: refused until the bus
+        # has been quiet, so it can never land in a probe window.
+        time.sleep(1.05)
+        self.rx("0xA1 +1100000:0x94")
+        self.assertTrue(self.request("CD_STOP").startswith("OK CD_TRANSPORT_TX"))
+        self.assertEqual(self.request("PROBE_CD_CHANGER"), "ERR CD_PROBE reason=RECENT_TX")
+        time.sleep(1.25)  # The delayed 0x94 has now arrived.
+        self.assertEqual(self.request("PROBE_CD_CHANGER"), "ERR CD_PROBE reason=BUS_ACTIVE")
+        self.assertEqual(self.transmitted(), ["0xC3", "0xA1"])
+        time.sleep(0.55)
+        self.rx("0xC3 echo")
+        self.assertIn("NO_RESPONSE", self.request("PROBE_CD_CHANGER"))
+        self.assertEqual(self.transmitted(), ["0xC3", "0xA1", "0xC3"])
+
+    def test_busy_states_are_mutually_exclusive(self):
+        # A pending probe refuses every other operation; STATUS stays available.
+        self.rx("0xC3 echo +3000:0x94")
+        with self.connect() as owner, self.connect() as other:
+            owner.sendall(b"PROBE_CD_CHANGER\n")
+            time.sleep(0.01)
+            for line in ("QUERY_STATUS", "CD_STOP", "PROBE_CD_CHANGER", "SELECT_SOURCE CD",
+                         "VOLUME_STEP UP", "RESEARCH_SEND 0x9C 100"):
+                self.assertEqual(self.command(other, line), "ERR CD_PROBE reason=SESSION_BUSY")
+            self.assertTrue(self.command(other, "STATUS").startswith("OK state=IDLE"))
+            # Reading only: any input from the owner would cancel its probe.
+            owner.settimeout(2)
+            reply = bytearray()
+            while not reply.endswith(b"\n"):
+                chunk = owner.recv(1024)
+                self.assertTrue(chunk, "service closed before its reply")
+                reply.extend(chunk)
+            self.assertIn("result=RESPONSE", reply.decode("ascii"))
+        self.assertEqual(self.transmitted(), ["0xC3"])
+        # A research capture or a CD hold refuses the probe; nothing is sent.
+        time.sleep(1.05)
+        self.assertTrue(self.request("RESEARCH_SEND 0x9C 3000").startswith("OK RESEARCH"))
+        time.sleep(1.05)
+        self.assertEqual(self.request("PROBE_CD_CHANGER"), "ERR CD_PROBE reason=SESSION_BUSY")
+        time.sleep(2.0)
+        token = self.press("SEEK_FORWARD")
+        time.sleep(0.6)
+        self.assertTrue(self.request("CD_HEARTBEAT " + token).startswith("OK"))
+        time.sleep(0.5)
+        self.assertEqual(self.request("PROBE_CD_CHANGER"), "ERR CD_TRACK_BUSY")
+        self.assertTrue(self.request("CD_RELEASE " + token).startswith("OK CD_RELEASE_TX"))
+        self.assertEqual(self.transmitted(), ["0xC3", "0x9C", "0x7A", "0x72"])
+
+    def test_disconnect_cancels_without_changing_presence(self):
+        self.rx("0xC3 echo +3000:0x94")
+        with self.connect() as client:
+            client.sendall(b"PROBE_CD_CHANGER\n")
+            time.sleep(0.01)
+        time.sleep(0.2)
+        status = self.status()
+        self.assertEqual((status["cd_changer"], status["cd_changer_last_probe"]),
+                         ("UNKNOWN", "NONE"))
+        self.assertEqual(self.transmitted(), ["0xC3"])
+        # The service stays usable; the next probe is a new, explicit request.
+        self.assertIn("result=RESPONSE", self.probe("0xC3 echo +3000:0x94"))
+        self.assertEqual(self.transmitted(), ["0xC3", "0xC3"])
+
 
 if __name__ == "__main__":
     unittest.main()

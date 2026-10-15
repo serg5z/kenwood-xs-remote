@@ -1,4 +1,5 @@
 #include "xs8_service_core.h"
+#include "xs8_cd_probe.h"
 #include "xs8_gpio.h"
 #include "xs8_monitor.h"
 #include "xs8_query_status.h"
@@ -242,6 +243,8 @@ int main(int argc, char **argv)
     bool research_tx_enabled = false;
     bool research_chain_enabled = false;
     bool research_context_enabled = false;
+    // Experimental ROOT 0xC3 CD changer presence probe; default off.
+    bool cd_probe_enabled = false;
     // One absolute volume MAX_HOLD for CEC and Web holds alike.
     long hold_ms = 20000;
     for (int i = 1; i < argc; ++i) {
@@ -253,6 +256,8 @@ int main(int argc, char **argv)
             research_chain_enabled = true;
         else if (std::strcmp(argv[i], "--enable-research-context") == 0)
             research_context_enabled = true;
+        else if (std::strcmp(argv[i], "--enable-cd-presence-probe") == 0)
+            cd_probe_enabled = true;
         else if (std::strcmp(argv[i], "--socket") == 0 && i + 1 < argc)
             socket_path = argv[++i];
         else if (std::strcmp(argv[i], "--max-hold-ms") == 0 && i + 1 < argc) {
@@ -265,7 +270,7 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "Usage: %s [--socket PATH] "
                 "[--allow-unrecovered-start] [--enable-research-tx] "
                 "[--enable-research-chain] [--enable-research-context] "
-                "[--max-hold-ms 100..20000]\n",
+                "[--enable-cd-presence-probe] [--max-hold-ms 100..20000]\n",
                 argv[0]);
             return 2;
         }
@@ -300,17 +305,22 @@ int main(int argc, char **argv)
     const bool context_research = research_tx_enabled && research_context_enabled;
     core.set_research_context_enabled(context_research);
     std::fprintf(stderr, "XS8 service listening on %s; state=%s "
-                         "research_tx=%s research_chain=%s research_context=%s\n",
+                         "research_tx=%s research_chain=%s research_context=%s "
+                         "cd_presence_probe=%s\n",
         socket_path, authorized ? "IDLE (operator authorized)" : "BOOT_INHIBIT",
         research_tx_enabled ? "ENABLED" : "DISABLED",
         research_chain_enabled ? "ENABLED" : "DISABLED",
-        context_research ? "ENABLED" : "DISABLED");
+        context_research ? "ENABLED" : "DISABLED",
+        cd_probe_enabled ? "EXPERIMENTAL" : "DISABLED");
     struct Client { int fd; uint64_t id; std::string input; };
     std::vector<Client> clients;
     uint64_t next_client_id = 1;
     size_t next_poll_client = 0;
+    // One RX transaction at a time: a QUERY_STATUS or a CD presence probe.
     int query_client = -1;
     std::optional<Xs8QueryStatus> query;
+    std::optional<Xs8CdProbe> probe;
+    Xs8CdPresence presence;
     auto close_client = [&](size_t index) {
         if (index >= clients.size()) return;
         const int fd = clients[index].fd;
@@ -318,6 +328,8 @@ int main(int argc, char **argv)
         if (query_client == fd) {
             if (query) query->cancel();
             query.reset();
+            // A cancelled probe changes no presence observation.
+            probe.reset();
             query_client = -1;
         }
         core.disconnected(VolumeControl::Clock::now(), id);
@@ -331,6 +343,9 @@ int main(int argc, char **argv)
     uint64_t next_research_id = 1;
     bool research_tx_uncertain = false;
     uint64_t query_cursor = 0;
+    uint64_t probe_cursor = 0;
+    // End of the latest bus frame seen, for the probe's quiet-bus guard.
+    uint64_t last_rx_end_ns = 0;
     uint64_t state_cursor = xs8_monitor_checkpoint(monitor);
     while (!stopping) {
         xs8_monitor_poll(monitor, 0);
@@ -427,8 +442,11 @@ int main(int argc, char **argv)
                 state_cursor = xs8_monitor_checkpoint(monitor);
                 break;
             }
-            for (size_t i = 0; i < state_count; ++i)
-                receiver.observe(state_records[i], query.has_value());
+            for (size_t i = 0; i < state_count; ++i) {
+                if (state_records[i].decoded.kind == XS8_FRAME)
+                    last_rx_end_ns = std::max(last_rx_end_ns, state_records[i].end_ns);
+                receiver.observe(state_records[i], query.has_value() || probe.has_value());
+            }
         } while (state_count == 16);
         if (!xs8_monitor_healthy(monitor)) receiver.monitor_failed();
         if (context_preparation.active() &&
@@ -463,6 +481,44 @@ int main(int argc, char **argv)
                 const bool sent = reply(query_client, query->response(
                     now_ns > 0 ? (uint64_t)now_ns : 0));
                 query.reset();
+                const int completed_client = query_client;
+                query_client = -1;
+                if (!sent) {
+                    for (size_t i = 0; i < clients.size(); ++i)
+                        if (clients[i].fd == completed_client) {
+                            close_client(i);
+                            break;
+                        }
+                }
+            }
+        }
+        if (probe) {
+            xs8_monitor_record records[8];
+            size_t copied = 0;
+            do {
+                if (xs8_monitor_snapshot(monitor, &probe_cursor, records, 8,
+                                         &copied) < 0) {
+                    probe->overflow();
+                    break;
+                }
+                probe->observe(records, copied);
+            } while (copied == 8 && !probe->done(0));
+            if (!xs8_monitor_healthy(monitor)) probe->monitor_failed();
+            int64_t now_ns = xs8_gpio_now_ns();
+            if (now_ns < 0) probe->monitor_failed();
+            if (now_ns > 0 && (uint64_t)now_ns >= probe->deadline_ns()) {
+                // A frame still arriving at the deadline is incomplete: FAILED.
+                xs8_monitor_record partial{};
+                if (xs8_monitor_partial(monitor, (uint64_t)now_ns, &partial))
+                    probe->observe(&partial, 1);
+            }
+            const uint64_t now = now_ns > 0 ? (uint64_t)now_ns : 0;
+            if (probe->done(now)) {
+                presence.apply(probe->result(now), now, probe->response_ns());
+                const std::string outcome = probe->response(now);
+                std::fprintf(stderr, "XS8 %s", outcome.c_str());
+                const bool sent = reply(query_client, outcome);
+                probe.reset();
                 const int completed_client = query_client;
                 query_client = -1;
                 if (!sent) {
@@ -522,7 +578,7 @@ int main(int argc, char **argv)
         std::string& input = clients[selected].input;
         char buffer[256];
         ssize_t size = read(client, buffer, sizeof(buffer));
-        if (query && query_client == client) {
+        if ((query || probe) && query_client == client) {
             if (size < 0 && (errno == EAGAIN || errno == EINTR)) continue;
             close_client(selected);
             continue;
@@ -537,9 +593,11 @@ int main(int argc, char **argv)
                 input.erase(0, newline + 1);
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 auto received = VolumeControl::Clock::now();
-                if (query && line != "STATUS" && line != "RESEARCH_CONTEXT_STATUS" &&
+                if ((query || probe) && line != "STATUS" &&
+                    line != "RESEARCH_CONTEXT_STATUS" &&
                     line.compare(0, 15, "VOLUME_RELEASE ") != 0) {
-                    if (!reply(client, "ERR QUERY_STATUS reason=SESSION_BUSY\n"))
+                    if (!reply(client, probe ? "ERR CD_PROBE reason=SESSION_BUSY\n"
+                                             : "ERR QUERY_STATUS reason=SESSION_BUSY\n"))
                         failed = true;
                     continue;
                 }
@@ -561,7 +619,7 @@ int main(int argc, char **argv)
                                  receiver.status_fields().find(" receiver_integrity=HEALTHY") ==
                                      std::string::npos)
                             result = "ERR RESEARCH_CONTEXT reason=MONITOR_OR_RECEIVER_INTEGRITY\n";
-                        else if (query || (research && research->active()) ||
+                        else if (query || probe || (research && research->active()) ||
                                  (chain && chain->active()) || research_tx_uncertain || stopping)
                             result = "ERR RESEARCH_CONTEXT reason=SESSION_BUSY\n";
                         else result = context_preparation.prepare(
@@ -833,7 +891,7 @@ int main(int argc, char **argv)
                         if (stopping) denied = "ERR CONTEXT_SESSION reason=SHUTDOWN\n";
                         else if (research_tx_uncertain)
                             denied = "ERR CONTEXT_SESSION reason=TX_UNCERTAIN_LATCHED\n";
-                        else if (query || (research && research->active()) ||
+                        else if (query || probe || (research && research->active()) ||
                                  (chain && chain->active()) || context_preparation.active())
                             denied = "ERR CONTEXT_SESSION reason=SESSION_BUSY\n";
                         else if (receiver.status_fields().find(" receiver_integrity=HEALTHY") ==
@@ -888,6 +946,62 @@ int main(int argc, char **argv)
                     if (!reply(client, result)) failed = true;
                     continue;
                 }
+                if (line == "PROBE_CD_CHANGER") {
+                    // Experimental: one ROOT 0xC3, never retried. Silence is
+                    // NO_RESPONSE, never a confirmed OFF.
+                    std::string denied;
+                    const int64_t probe_now = xs8_gpio_now_ns();
+                    if (!cd_probe_enabled)
+                        denied = "ERR CD_PROBE reason=DISABLED\n";
+                    else if (stopping)
+                        denied = "ERR CD_PROBE reason=SHUTDOWN\n";
+                    else if (research_tx_uncertain)
+                        denied = "ERR CD_PROBE reason=TX_UNCERTAIN_LATCHED\n";
+                    else if ((research && research->active()) ||
+                             (chain && chain->active()))
+                        denied = "ERR CD_PROBE reason=SESSION_BUSY\n";
+                    else if (!input.empty())
+                        denied = "ERR CD_PROBE reason=PIPELINED\n";
+                    else if (probe_now <= 0)
+                        denied = "ERR CD_PROBE reason=CLOCK_FAILED\n";
+                    else if (transmitter.last_end_ns() &&
+                             (uint64_t)probe_now < transmitter.last_end_ns() +
+                                 Xs8CdProbe::kTxGuardNs)
+                        denied = "ERR CD_PROBE reason=RECENT_TX\n";
+                    else if (last_rx_end_ns &&
+                             (uint64_t)probe_now < last_rx_end_ns + Xs8CdProbe::kBusQuietNs)
+                        denied = "ERR CD_PROBE reason=BUS_ACTIVE\n";
+                    if (!denied.empty()) {
+                        if (!reply(client, denied)) failed = true;
+                        continue;
+                    }
+                    probe_cursor = xs8_monitor_checkpoint(monitor);
+                    std::string result = core.begin_cd_probe(received);
+                    const bool uncertain =
+                        result.find("reason=TX_UNCERTAIN") != std::string::npos;
+                    if ((result.empty() || uncertain) && transmitter.last_end_ns())
+                        receiver.suppress_until(transmitter.last_end_ns() +
+                            Xs8CdProbe::kResponseMaxNs + Xs8CdProbe::kQuietNs);
+                    if (uncertain)
+                        presence.apply(Xs8CdProbe::Result::FAILED, 0, 0);
+                    if (result.empty()) {
+                        if (!transmitter.last_start_ns() ||
+                            transmitter.last_end_ns() <
+                                transmitter.last_start_ns()) {
+                            presence.apply(Xs8CdProbe::Result::FAILED, 0, 0);
+                            if (!reply(client,
+                                "ERR CD_PROBE reason=TX_TIME_UNAVAILABLE\n"))
+                                failed = true;
+                            continue;
+                        }
+                        probe.emplace(transmitter.last_start_ns(),
+                                      transmitter.last_end_ns());
+                        query_client = client;
+                        break;
+                    }
+                    if (!reply(client, result)) failed = true;
+                    continue;
+                }
                 if (line == "QUERY_STATUS") {
                     if (query) {
                         if (!reply(client,
@@ -929,7 +1043,8 @@ int main(int argc, char **argv)
                     continue;
                 }
                 if (line == "STATUS")
-                    core.set_receiver_status(receiver.status_fields());
+                    core.set_receiver_status(receiver.status_fields() +
+                        (cd_probe_enabled ? presence.status_fields() : std::string()));
                 else if (chain && chain->active() &&
                          line.compare(0, 15, "VOLUME_RELEASE ") != 0) {
                     if (!reply(client, "ERR RESEARCH reason=SESSION_BUSY\n"))

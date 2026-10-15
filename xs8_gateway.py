@@ -32,6 +32,13 @@ RECEIVER_FIELDS = {
 }
 CD_FIELDS = {"cd_state", "cd_action", "cd_release_owed",
              "cd_lease_expired", "cd_last_result"}
+# Optional, from a service run with the experimental --enable-cd-presence-probe.
+# Diagnostic only: never used for receiver_source, source selection or control
+# eligibility. NOT_DETECTED is not OFF.
+CD_PRESENCE_FIELDS = {"cd_changer", "cd_changer_ns", "cd_changer_last_probe"}
+CD_PRESENCE_VALUES = ("PRESENT", "NOT_DETECTED", "UNKNOWN")
+CD_PROBE_RESULTS = ("NONE", "RESPONSE", "NO_RESPONSE", "AMBIGUOUS", "FAILED")
+OPTIONAL_STATUS_GROUPS = (RECEIVER_FIELDS, CD_FIELDS, CD_PRESENCE_FIELDS)
 SOURCES = ("CD", "TUNER", "PHONO", "VIDEO1", "VIDEO2", "TAPE1", "TAPE2")
 # VIDEO1/VIDEO2 are atomic service CONTEXT sequences (0x17 -> 0x78/0x88 -> 0x07),
 # physically validated 2026-10-12. TAPE2 (MONITOR) is not a source selection.
@@ -522,13 +529,14 @@ def read_status(socket_path, timeout=1.0):
         fields = {}
         for part in parts[1:]:
             key, value = part.split("=", 1)
-            if key not in STATUS_FIELDS | RECEIVER_FIELDS | CD_FIELDS or not value or key in fields:
+            if (key not in STATUS_FIELDS.union(*OPTIONAL_STATUS_GROUPS) or
+                    not value or key in fields):
                 raise ValueError("invalid STATUS field")
             fields[key] = value
-        extras = set(fields) - STATUS_FIELDS
+        # Each optional group is reported whole or not at all.
         if (not STATUS_FIELDS <= set(fields) or
-                extras not in (set(), RECEIVER_FIELDS, CD_FIELDS,
-                               RECEIVER_FIELDS | CD_FIELDS)):
+                any(group & set(fields) not in (set(), group)
+                    for group in OPTIONAL_STATUS_GROUPS)):
             raise ValueError("incomplete STATUS reply")
         if CD_FIELDS <= set(fields) and (
                 fields["cd_state"] not in ("IDLE", "ACTIVE", "HOLDING", "FAULT_LATCHED") or
@@ -554,7 +562,22 @@ def read_status(socket_path, timeout=1.0):
                         (fields[f"receiver_{name}_ns"] == "0" or
                          fields[f"receiver_{name}_evidence"] == "NONE")):
                     raise ValueError("inconsistent receiver observation")
-        else:
+        if CD_PRESENCE_FIELDS <= set(fields):
+            presence, last = fields["cd_changer"], fields["cd_changer_last_probe"]
+            observed_ns = fields["cd_changer_ns"]
+            # Canonical unsigned 64-bit decimal: no sign, padding or leading zeros.
+            if (presence not in CD_PRESENCE_VALUES or last not in CD_PROBE_RESULTS or
+                    not observed_ns.isdecimal() or
+                    observed_ns != str(int(observed_ns)) or int(observed_ns) >= 1 << 64):
+                raise ValueError("invalid CD presence")
+            # UNKNOWN exactly when nothing was observed; a RESPONSE or NO_RESPONSE
+            # always sets the value it implies, and no probe means no observation.
+            if ((presence == "UNKNOWN") != (observed_ns == "0") or
+                    (last == "NONE" and presence != "UNKNOWN") or
+                    (last == "RESPONSE" and presence != "PRESENT") or
+                    (last == "NO_RESPONSE" and presence != "NOT_DETECTED")):
+                raise ValueError("inconsistent CD presence")
+        if not RECEIVER_FIELDS <= set(fields):
             fields.update({"receiver_source": "UNKNOWN", "receiver_source_ns": "0",
                            "receiver_source_evidence": "NONE",
                            "receiver_monitor": "UNKNOWN", "receiver_monitor_ns": "0",
@@ -577,6 +600,17 @@ def receiver_state(status):
     return {"source": field("source"), "monitor": field("monitor"),
             "integrity": status["receiver_integrity"],
             "receiver_execution": "UNVERIFIED"}
+
+
+def cd_changer_state(status):
+    """Diagnostic CD changer presence from STATUS; None from a service without it."""
+    if "cd_changer" not in status:
+        return None
+    observed_ns = int(status["cd_changer_ns"])
+    age_ms = max(0, (time.monotonic_ns() - observed_ns) // 1_000_000) if observed_ns else None
+    return {"value": status["cd_changer"], "observed_mono_ns": observed_ns,
+            "age_ms": age_ms, "last_probe": status["cd_changer_last_probe"],
+            "diagnostic": True, "receiver_execution": "UNVERIFIED"}
 
 
 def capabilities(mute_available=False, source_available=False, query_available=False,
@@ -852,7 +886,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                      "error": str(exc)})
                 return
             self.send_json(200, {"gateway": "online", "xs8_service": "connected",
-                                 "status": status, "receiver": receiver_state(status)})
+                                 "status": status, "receiver": receiver_state(status),
+                                 "cd_changer": cd_changer_state(status)})
             return
         if path == "/api/v1/capabilities":
             status = self.service_status() if self.current_session() is not None else None

@@ -41,6 +41,9 @@ public:
                         uint64_t client_id = 0);
     // Empty result means one query frame was verified and RX collection may begin.
     std::string begin_query_status(Time now);
+    // The same gates and one verified ROOT 0xC3 for the experimental CD changer
+    // presence probe. The caller enforces its default-off flag and quiet guards.
+    std::string begin_cd_probe(Time now);
     // Empty when a single ROOT research TX may be attempted. Caller also
     // enforces the separate default-off research authorization flag.
     std::string research_ready(Time now, bool accepted_session = false);
@@ -68,6 +71,7 @@ public:
     // from the owner renews it. Token holds keep the cd_lease argument.
     static constexpr VolumeControl::Ms kCdKeyInactivity{1200};
 private:
+    std::string begin_root_observation(uint8_t byte, const char *name, Time now);
     std::string context_command(const std::string& line, Time now,
                                 uint64_t client_id);
     std::string context_close(Time now, const char *reason, bool fault_after);
