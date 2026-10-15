@@ -1,15 +1,15 @@
 # Kenwood XS Remote hardware
 
-This document describes two **experimentally validated hardware interfaces** for the Kenwood KR-V6070: the original Arduino Micro bridge and a Raspberry Pi B+ GPIO transmitter. Neither implementation is a certified interface for other Kenwood SYSTEM CONTROL devices. The [XS8 protocol reference](xs8-protocol.md) covers frame encoding and commands; the [architecture](architecture.md) describes the existing CEC-to-serial software path.
+This document describes two **experimentally validated hardware interfaces** for the Kenwood KR-V6070: the original Arduino Micro bridge and the Raspberry Pi B+ GPIO interface. Neither is a certified interface for other Kenwood SYSTEM CONTROL devices. The [XS8 protocol reference](xs8-protocol.md) covers frame encoding and commands, and the [architecture](architecture.md) covers the software path.
 
-**Integration status:** The original Raspberry Pi → USB → Arduino Micro → XS8 path is the established CEC-controlled system. The direct Raspberry Pi GPIO transmitter has successfully controlled receiver input selection, but it has **not yet replaced the Arduino in the CEC application path**.
+**Integration status:** The **Raspberry Pi GPIO interface is the production path.** `xs8-service` owns GPIO4/22 (TX) and GPIO27/23 (RX sense) and serves both the CEC client and the Web Remote ([project status](project-status.md)). The Raspberry Pi → USB → Arduino Micro bridge was the original CEC path. It is now legacy and kept for reference only.
 
 ## Components and connections
 
 | Component | Role in this project |
 |---|---|
-| Raspberry Pi B+ | Runs the existing `libCEC` host program, which sends one-character commands to an Arduino over `/dev/ttyACM0`. Separately, the Pi has been validated as a direct XS8 transmitter using GPIO and `libgpiod`. [Host code](../main.cpp), [Pi transmitter](../xs8_send.c) |
-| Arduino Micro, 5 V setup | Converts USB serial commands into timed XS8 frames in the established CEC bridge. [Working firmware](../xs8-bridge/xs8-bridge.ino), [bench summary](../research/notes/kenwood-xs-reverse-engineering-reviewed.md) |
+| Raspberry Pi B+ | Drives XS8 directly through GPIO and `libgpiod` in [`xs8-service`](../xs8_service.cpp). Also runs the CEC client and Web Gateway. Originally it ran a `libCEC` host that sent one-character commands to the Arduino over `/dev/ttyACM0`. [Pi transmitter](../xs8_send.c) |
+| Arduino Micro, 5 V setup (legacy) | Converted USB serial commands into timed XS8 frames in the original CEC bridge. [Working firmware](../xs8-bridge/xs8-bridge.ino), [bench summary](../research/notes/kenwood-xs-reverse-engineering-reviewed.md) |
 | Kenwood KR-V6070 | Receiver whose SYSTEM CONTROL/XS connector and responses were investigated. Some research tests also used a connected Kenwood CD player/changer. [Passive observations](../research/notes/kenwood-xs8-sniffing-notes.md) |
 
 The tested XS8 connector uses a **TRS** plug:
@@ -20,7 +20,7 @@ The tested XS8 connector uses a **TRS** plug:
 | Tip | `S.BUSY` / BUSY |
 | Ring | `S.DATA` / DATA |
 
-## Arduino Micro XS8 interface (original, validated)
+## Arduino Micro XS8 interface (original, validated, now legacy)
 
 | Plug contact | XS signal | Arduino-side connection |
 |---|---|---|
@@ -40,9 +40,9 @@ Raspberry Pi B+ ── USB ── Arduino Micro
 
 The 2.2 kΩ resistors are **in the TX paths**. A0 and A5 sense the XS-side nodes; they do not replace the series resistors. This Arduino configuration does **not** use Pi GPIO-to-XS wiring. The separate Pi GPIO interface is described below. [Arduino pin declarations](../xs8-bridge/xs8-bridge.ino), [physical mapping](../research/notes/kenwood-xs-reverse-engineering-reviewed.md)
 
-## Raspberry Pi B+ GPIO XS8 interface (transmitter validated)
+## Raspberry Pi B+ GPIO XS8 interface (production)
 
-A second implementation was tested on the **Kenwood KR-V6070** using a **Raspberry Pi Model B+ Rev 1.2** and external transistor-based 5 V TX stages. The program [`xs8_send.c`](../xs8_send.c) uses `libgpiod` to generate XS8 timing directly on the Pi. This is a standalone command-line transmitter, **not yet the CEC application's active output path**.
+A second implementation was tested on the **Kenwood KR-V6070** using a **Raspberry Pi Model B+ Rev 1.2** and external transistor-based 5 V TX stages. The program [`xs8_send.c`](../xs8_send.c) uses `libgpiod` to generate XS8 timing directly on the Pi. The same GPIO interface is now driven by `xs8-service`, the production path for the CEC client and the Web Remote. `xs8_send` remains a standalone command-line transmitter.
 
 | Pi BCM GPIO | Direction / function | Electrical connection |
 |---|---|---|
@@ -121,6 +121,6 @@ The Pi procedure documents the **validated wiring arrangement**; it is not a sub
 
 - The Arduino and Raspberry Pi interfaces were experimentally validated on the recorded **KR-V6070** setup. Neither provides an electrical specification proving compatibility with other Kenwood receivers, accessories, supply voltages, or cable arrangements.
 - TX must start released and must not force LOW against another bus participant. BUSY checking reduces the risk of starting while the observed bus is occupied, but is not a hardware interlock and cannot eliminate every collision or wiring fault. [Arduino transmitter](../xs8-bridge/xs8-bridge.ino), [Pi transmitter](../xs8_send.c)
-- Continuous volume commands can keep changing volume after a single frame. The Arduino bridge must send XS8 **volume STOP `0x09` before context exit `0x07`**. If BUSY stays occupied, its watchdog cannot guarantee STOP delivery. **Volume/mute operation has not yet been validated on the Pi-only path.** Verify at a controlled level before routine use. [Control sequences](xs8-protocol.md), [watchdog limitation](../xs8-bridge/xs8-bridge.ino)
+- Continuous volume commands can keep changing volume after a single frame. Any transmitter must send XS8 **volume STOP `0x09` before context exit `0x07`**; `xs8-service` and the Arduino bridge both do. If BUSY stays occupied, no watchdog can guarantee STOP delivery. CEC volume and MUTE have since been validated on the Pi GPIO path through `xs8-service` ([project status](project-status.md)). Still verify at a controlled level after any wiring change. [Control sequences](xs8-protocol.md), [watchdog limitation](../xs8-bridge/xs8-bridge.ino)
 - Avoid exploratory bytes during hardware bring-up. Research found a command family that persistently locks front-panel controls; absence of an RX frame does not establish a harmless NOP. Use documented commands with known context and state. [Command registry](../research/COMMAND_REGISTRY.md)
 - The published dimensions, voltages, and timing are **observations or software settings**, not component ratings or a completed signal-integrity analysis. Raw captures establish transitions and approximate intervals, while many receiver effects survive only as written bench notes. [Research history](../research/RESEARCH_HISTORY.md)

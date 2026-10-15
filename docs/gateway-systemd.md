@@ -1,6 +1,8 @@
-# Read-only Gateway socket activation
+# Gateway socket activation (read-only template)
 
 The authenticated nginx route uses a systemd-owned Unix socket at `/run/kenwood-gateway.sock`. nginx still provides HTTPS and Basic Auth. The Gateway accepts HTTP only from the verified nginx worker UID and sends only `STATUS` to the local XS8 Service. Every POST remains HTTP 501. The XS8 Service is neither started nor required by these units, and remains the sole GPIO owner.
+
+**Status (2026-10-15):** the units and nginx site are installed on the Pi. The checked-in templates are still read-only, but the live Gateway adds every `--enable-*` control gate through a systemd drop-in, so its POST endpoints are active. Opt-in controls are documented in the [Web API](web-api.md); the live configuration is recorded in [project status](project-status.md#live-deployment-on-the-pi-read-only-inspection-2026-10-15). The read-only statements below describe the template.
 
 Templates: [socket unit](../deploy/systemd/kenwood-xs-gateway.socket.example) and [service unit](../deploy/systemd/kenwood-xs-gateway.service.example). These are deployment instructions; neither unit has been installed by this repository.
 

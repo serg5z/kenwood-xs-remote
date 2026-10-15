@@ -6,7 +6,7 @@ This is a consolidated **logical TX** evidence map for the KR-V6070, not a list 
 
 Each row/column is logical TX `0xHL` (high nibble row, low nibble column). Legacy TX is another label for the **same waveform**, converted by `logical = reverse8(~legacy)`: `B5 → 52`, `7D → 41`, `C6 → 9C`, `C0/C8/A9/A1/B1 → FC/EC/6A/7A/72`, `57 → 15`, `1F → 07`, `60/68 → F9/E9`. Never apply that conversion to RX. Later-decoder legacy RX labels such as `D6`, `1D`, and `18` remain as printed; early passive RX labels require their own convention ([registry encoding history](COMMAND_REGISTRY.md#byte-encoding-and-decoder-history), [original TX routine](sketches/xs-tx-test1.ino#L180-L235), [later RX routine](sketches/xs-tx-test2.ino#L349-L355)). The retained [partial scan](captures/kenwood-xs-scan.txt#L29-L56) uses legacy **TX** labels and ends at candidate legacy `17`, so its candidate labels must be converted before matrix placement.
 
-- `V` — operator-reported **physical verification** in a controlled state. It is not independently replayable without raw trial records. ROOT `13` has the [October 11 readback report](notes/xs8-readback-2026-10-11.md); `41/52/9C` have the [October 12 report](notes/xs8-root-validation-2026-10-12.md); `82–85` were physically reported in the [earlier four-input validation](notes/xs8-root-validation-2026-10-12.md), but its per-trial log is not in this archive. `V` does not mean universal safety or receiver acknowledgment.
+- `V` — operator-reported **physical verification** in a controlled state. It is not independently replayable without raw trial records. ROOT `13` has the [October 11 readback report](notes/xs8-readback-2026-10-11.md); `41/52/9C` have the [October 12 report](notes/xs8-root-validation-2026-10-12.md); `82–85` were physically reported in the [earlier four-input validation](notes/xs8-root-validation-2026-10-12.md), but its per-trial log is not in this archive. ROOT `62` and `A1` and the entered-context `48/78/88` are described in [section 4](#4-physical-validations-reported-2026-10-12-to-2026-10-15). `V` for `62`, `A1` and `48` rests on operator statements alone, with no dated trial note. `V` does not mean universal safety or receiver acknowledgment.
 - `R` — behavior or RX **reported in historical notes**, without a retained per-byte raw log. The presence of RX can be the only observed result; semantics may remain unknown.
 - `K` — **known protocol/control byte** in the tested context: ROOT `15` releases a control lock and ROOT `17` enters an alternative interpretation; after `17`, `07` exits and `09` stops an active volume hold. These are observed control effects, not claims of a universal release opcode.
 - `T` — **tested with no visible effect recorded** in the specified state. It does not mean NOP or no RX unless a separate no-RX test says so.
@@ -17,7 +17,7 @@ Each row/column is logical TX `0xHL` (high nibble row, low nibble column). Legac
 
 ## 1. ROOT matrix
 
-Baseline is ROOT + CD selected + CD playing, with source and lock state restored between trials. `V` for `41`, `52`, and `72` overlays newer physical tests in different initial states; their earlier no-visible-effect observations remain recorded below. `A` preserves historical NORMAL attributions and the `F1` STOP discrepancy rather than selecting a global meaning.
+Baseline is ROOT + CD selected + CD playing, with source and lock state restored between trials. `V` for `41`, `52`, `62`, `72` and `A1` overlays newer physical tests in different initial states; their earlier no-visible-effect observations remain recorded below. `A` preserves historical NORMAL attributions and the `F1` STOP discrepancy rather than selecting a global meaning.
 
 | hi\lo | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | A | B | C | D | E | F |
 |:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
@@ -27,11 +27,11 @@ Baseline is ROOT + CD selected + CD playing, with source and lock state restored
 | **3** | T | R | T | T | T | R! | R! | T | A | T | T | T | T | T | T | T |
 | **4** | T | V | R | T | T | R! | R! | T | A | A | T | T | T | T | T | T |
 | **5** | T | R | V | T | T | R! | R! | T | R | T | T | T | T | T | T | T |
-| **6** | T | R | R! | T | T | R! | R! | R! | R | A | R! | T | T | T | T | T |
+| **6** | T | R | V! | T | T | R! | R! | R! | R | A | R! | T | T | T | T | T |
 | **7** | T | R | V | T | A | R! | R! | R! | A | T | R! | T | T | T | T | T |
 | **8** | T | R | V | V | V | V | R | T | A | T | R | T | T | T | T | T |
 | **9** | T | T | T | T | T | T | T | T | R | T | T | T | V | T | T | T |
-| **A** | T | R | T | T | T | R! | R! | T | T | T | T | T | T | T | T | T |
+| **A** | T | V | T | T | T | R! | R! | T | T | T | T | T | T | T | T | T |
 | **B** | T | T | T | T | T | T | R | T | T | T | T | T | R | T | T | T |
 | **C** | T | T | T | R | T | T | T | T | A | T | T | T | R | T | T | T |
 | **D** | T | T | T | R | T | R! | R! | T | T | T | R | T | T | T | T | T |
@@ -46,7 +46,7 @@ ROOT `A` cells `08/18/38/48/49/69/74/78/88/C8/F4` preserve older NORMAL labels t
 
 ## 2. After logical TX `0x17` matrix
 
-This is a **selective** entered-context map. `S` means tested no RX, even when no physical action was noticed; `U` means the available record does not establish an individual test. `07` is ROOT exit and `09` is volume STOP only in the tested conditions. The `17` cell itself remains `U`: repeated `17` after entry was not separately demonstrated.
+This is a **selective** entered-context map. `S` means tested no RX, even when no physical action was noticed; `U` means the available record does not establish an individual test. `07` is ROOT exit and `09` is volume STOP only in the tested conditions. `V` at `48`, `78` and `88` marks the physically observed CONTEXT keys TAPE2 MONITOR, VIDEO1 and VIDEO2, each sent as `17 → key → 07` ([section 4](#4-physical-validations-reported-2026-10-12-to-2026-10-15)). The `17` cell itself remains `U`: repeated `17` after entry was not separately demonstrated.
 
 | hi\lo | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | A | B | C | D | E | F |
 |:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
@@ -54,11 +54,11 @@ This is a **selective** entered-context map. `S` means tested no RX, even when n
 | **1** | S | U | U | S | R | R! | U | U | R | U | U | S | U | S | S | S |
 | **2** | S | U | U | U | R | R! | U | U | U | U | U | S | U | S | S | S |
 | **3** | S | U | U | U | R | S | S | U | U | R! | U | S | U | S | S | S |
-| **4** | S | U | R | U | R | S | S | U | U | R | U | S | U | S | S | S |
+| **4** | S | U | R | U | R | S | S | U | V | R | U | S | U | S | S | S |
 | **5** | S | U | U | U | R | S | S | U | U | U | U | S | U | S | S | S |
 | **6** | S | U | U | U | R | S | S | S | U | R | U | S | U | S | S | S |
-| **7** | S | U | U | U | R | R! | S | S | U | U | U | S | U | S | S | S |
-| **8** | S | U | U | U | R | U | U | U | U | U | R | S | U | S | S | S |
+| **7** | S | U | U | U | R | R! | S | S | V | U | U | S | U | S | S | S |
+| **8** | S | U | U | U | R | U | U | U | V | U | R | S | U | S | S | S |
 | **9** | S | U | U | U | R | U | U | U | U | U | U | S | U | S | S | S |
 | **A** | S | U | U | U | T | S | S | U | U | R | S | S | U | S | S | S |
 | **B** | S | U | U | U | R | U | R | U | U | U | U | S | R | S | S | S |
@@ -115,6 +115,27 @@ The union has **83 `E`, 4 `A`, 169 `T`, 0 `U`**. These are documentation counts,
 | `E5/E6` | Current disc restart | Restart plus reported TUNER side effect | [context follow-up](notes/kenwood-xs-reverse-engineering-v18.md#L486-L498) |
 | `07` | No visible effect in CD-playing sweep; did not release ROOT lock | Restored ROOT interpretation | [lock negative](notes/kenwood-xs-reverse-engineering-v18.md#L194-L205), [exit test](notes/kenwood-xs-reverse-engineering-v18.md#L558-L562) |
 | `09` | No visible effect in CD-playing sweep | STOP after active volume; no RX when isolated without active hold | [targeted controls](notes/kenwood-xs-reverse-engineering-v18.md#L553-L562); later isolated no-RX report has no raw trace |
+
+## 4. Physical validations reported 2026-10-12 to 2026-10-15
+
+These rows record **operator-reported physical observations** made through the production XS8 Service, the Web Gateway or the attended research session. Two evidence levels are distinguished:
+
+- **Dated note:** a trial record is archived in `research/notes/`. It is still operator-written; raw edges and complete service replies were not deposited.
+- **Operator statement only:** the operator stated the result while the work was in progress. No trial note, raw capture or complete reply log is archived.
+
+No row rests on `TX_OK`/`MATCH` alone: every one is a physical observation of the receiver or changer. `TX_OK`/`MATCH` never establishes receiver execution. The historical sweep results for the same bytes remain valid for their own states.
+
+| Logical TX | Context / path | Physical observation | Evidence level |
+|---|---|---|---|
+| `52` | ROOT; receiver in standby; `POWER_ON` | Receiver powered on; the changer powered through the switched outlet | Dated note: [2026-10-12](notes/xs8-root-validation-2026-10-12.md) |
+| `62` | ROOT; receiver on; `POWER_OFF` | Receiver powered off | Operator statement only, 2026-10-14 |
+| `62` / `52` via the Gateway's one-click toggle | ROOT `13` SETTLE decides: a reply sends `62`; two clean silences ≥ 1 s apart send `52` | Toggled the receiver off and on, both directions | Operator statement only, 2026-10-15 |
+| `13` | ROOT; plain and SETTLE query | Two replies: first RX `11/13/19/1A/1B/1D` gives the source, second RX `18`/`14` gives MONITOR OFF/ON (waveform `E7`/`D7`). Silence in standby | Dated note for all six sources and both MONITOR states: [2026-10-11](notes/xs8-readback-2026-10-11.md). The silence-in-standby observation is an operator statement only (2026-10-14) |
+| `84 82 83 85` (ROOT) and `17 → 78/88 → 07` (CONTEXT), each followed by a SETTLE `13` | Web source selection with automatic readback | The selected input showed on the receiver, and the readback reported it | VIDEO1/VIDEO2 sequences: dated note, [2026-10-12](notes/xs8-context-video-mute-2026-10-12.md). The end-to-end Web selection with SETTLE readback: operator statement only, 2026-10-15 |
+| `17 → 48 → 07` | CONTEXT; `TAPE2_MONITOR_TOGGLE` | Toggled TAPE2 MONITOR. The readback showed `D7` (ON) and `E7` (OFF) in waveform terms, legacy RX `14`/`18` | Operator statement only, 2026-10-15 |
+| `A1` | ROOT; CD playing; `CD_STOP` | CD stopped; ROOT `21` also stopped CD via the REPL | Operator statement only, recorded in commit `2793883` (2026-10-14). It replaced `9C`, after a VIDEO1/VIDEO2 selection following a `9C` STOP provoked an unwanted changer restart |
+
+The entered-context `48` result supersedes, **for CONTEXT only**, the open question of the historical NORMAL label `ED` (logical `48`) "MONITOR toggle". In ROOT, `48` remains CD track 4 in the controlled sweep.
 
 ## Absolute-volume-query findings retained from the earlier coverage review
 

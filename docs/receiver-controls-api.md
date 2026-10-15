@@ -10,7 +10,7 @@ One atomic CONTEXT transaction each, through VolumeControl's `context_key()`, th
 |---|---|---|
 | `SELECT_SOURCE VIDEO1` | `0x17 → 0x78 → 0x07` | Physically validated 2026-10-12 (human-paced) |
 | `SELECT_SOURCE VIDEO2` | `0x17 → 0x88 → 0x07` | Physically validated 2026-10-12 (human-paced) |
-| `TAPE2_MONITOR_TOGGLE` | `0x17 → 0x48 → 0x07` | **Historical only**; not physically validated |
+| `TAPE2_MONITOR_TOGGLE` | `0x17 → 0x48 → 0x07` | Physically verified (operator report, 2026-10-15): toggles TAPE2 MONITOR. The readback shows waveform `0xD7` for ON and `0xE7` for OFF. No trial note is archived yet, and the Gateway still labels replies `PROVISIONAL` |
 
 - Allowed only from volume IDLE with no STOP or CONTEXT obligation. Any volume hold answers `ERR VOLUME_BUSY`, any CD hold or pair `ERR CD_TRACK_BUSY`, an open research CONTEXT `ERR RESEARCH_CONTEXT_ACTIVE`, a CD fault `ERR CD_FAULT_LATCHED`; no frame is sent and no hold is cancelled.
 - `context_may_be_open` is set before `0x17`. An unverified entry, key or exit frame latches `FAULT_LATCHED` after the `0x07` exit is attempted (three attempts); the key byte is never resent.

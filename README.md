@@ -1,64 +1,76 @@
 # Kenwood XS Remote
 
-Kenwood XS Remote lets HDMI-CEC volume controls operate a **Kenwood KR-V6070** receiver through its proprietary **SYSTEM CONTROL (XS8)** interface. A Raspberry Pi runs a `libCEC` host process, and an Arduino Micro converts simple USB serial commands into XS8 bus frames.
+Kenwood XS Remote controls a **Kenwood KR-V6070** receiver and its connected CD changer through the receiver's proprietary **SYSTEM CONTROL (XS8)** bus. A Raspberry Pi B+ drives the bus directly through GPIO. It serves two front ends:
 
-The current implementation handles **volume up, volume down, and mute**. The reported working setup uses Panasonic TV and Apple TV remotes through HDMI-CEC. The host code responds to CEC volume and mute key events; it does not identify remote brands or implement input selection or CD transport through CEC.
+- **HDMI-CEC:** volume and MUTE from the Panasonic TV and Apple TV remotes;
+- **Web Remote:** an iPhone-friendly page over authenticated HTTPS, for power, input selection, TAPE2 MONITOR, volume, MUTE, CD transport and live receiver readback.
+
+**Current status, validation levels and the live Pi configuration:** see [docs/project-status.md](docs/project-status.md). It is the canonical status and handoff document.
+
+## Architecture
 
 ```text
-Panasonic TV / Apple TV remote
-             ↓ HDMI-CEC
-TV / HDMI-CEC → Raspberry Pi (`libCEC`, main.cpp)
-             → USB Serial → Arduino Micro (xs8-bridge.ino)
-             → XS8 SYSTEM CONTROL → Kenwood KR-V6070
+Panasonic TV / Apple TV remote            iPhone Safari
+        │ HDMI-CEC                              │ HTTPS + Basic Auth
+        ▼                                       ▼
+  cec-xs-client (libCEC)                nginx (LAN only, TLS)
+        │                                       │ /run/kenwood-gateway.sock
+        │                                       ▼
+        │                          xs8_gateway.py (Gateway + web/ UI)
+        │                                       │
+        └───────────► /tmp/kenwood-xs8.sock ◄───┘
+                               │
+                       xs8-service (sole GPIO owner)
+                               │ GPIO4/22 TX, GPIO27/23 RX sense
+                               ▼
+                 XS8 SYSTEM CONTROL → KR-V6070 ↔ CD changer
 ```
 
-## What is implemented
+- **XS8 Service** (`xs8_service.cpp` and related files): the only process that touches GPIO. It sends each frame after a BUSY-free check and checks its waveform with a bus monitor. It also:
+  - owns the volume, MUTE, CONTEXT, CD hold and POWER transactions;
+  - latches faults instead of retrying;
+  - decodes receiver broadcasts and `QUERY_STATUS` replies into source and MONITOR observations.
+- **CEC client** (`cec_xs_client.cpp`): turns CEC volume and MUTE keys into service requests. It opens no GPIO.
+- **Gateway** (`xs8_gateway.py`): an HTTP API on a systemd-activated Unix socket behind nginx. Every control has a default-off `--enable-*` gate, and each request needs a session, CSRF token, exact Origin and a fresh eligible STATUS. Requests are serialized by locks and spacing. The Gateway also runs the post-command SYNC readback and the one-click POWER decision.
+- **Web Remote** (`web/`): the browser UI served by the Gateway.
+- **Legacy:** `main.cpp` (`cec-xs-bridge`, its own GPIO owner) and the Arduino Micro bridge (`xs8-bridge/`) were the original path. They are kept as fallbacks only and must never run alongside the service.
 
-- The Pi receives CEC volume and mute events and sends one-character commands to the Arduino over `/dev/ttyACM0`.
-- The Arduino sends XS8 volume and mute sequences. Volume is continuous until a separate STOP frame; the firmware and host both have 1,200 ms watchdogs to request that stop.
-- On volume release, the order is **XS8 volume STOP `x09` followed by context exit `x07`**. Mute uses `x17 → xD8 → x07`. These are current logical TX bytes, not USB serial characters. See the [architecture](docs/architecture.md) and [protocol notes](docs/xs8-protocol.md).
+## Capabilities at a glance
 
-## Requirements
+| Status | Capabilities |
+|---|---|
+| **Implemented and physically validated** | CEC volume UP/DOWN and MUTE • Web Remote over HTTPS with authentication • POWER ON (`0x52`) / OFF (`0x62`) and the one-click POWER toggle (both directions) • source selection CD, TUNER, PHONO, TAPE1, VIDEO1, VIDEO2 with automatic `QUERY_STATUS SETTLE` readback • TAPE2 MONITOR toggle (`0x17 → 0x48 → 0x07`; readback `0xD7` ON, `0xE7` OFF) • read-only `QUERY_STATUS` (`0x13`) and source/MONITOR observation • CD NEXT/PREVIOUS, held SEEK, STOP, PLAY/PAUSE |
+| **Implemented, Web-path validation not recorded** | Web volume step and hold, and Web MUTE. They use the same service transactions as the validated CEC path. |
+| **Experimental / disabled by default** | Every Gateway control gate (off in the checked-in unit) • CD changer presence probe • research TX, chain and CONTEXT REPL • zero CD track spacing • provisional SETTLE timing |
+| **Planned / future** | Exclusive bus lease or service-side atomic POWER • archived trial notes for the latest validations • volume-step calibration • presence in the Web UI • native iOS client |
 
-**Hardware:** Raspberry Pi B+, Arduino Micro, Kenwood KR-V6070, a USB connection between Pi and Arduino, an HDMI-CEC path visible to `libCEC`, and a TRS connection to the receiver's SYSTEM CONTROL port. The tested XS8 wiring uses two 2.2 kΩ series resistors: Arduino D2 → DATA (ring), D3 → BUSY (tip), A0 sensing DATA, A5 sensing BUSY, and common ground (sleeve). Check the full [wiring and verification guide](docs/hardware.md) before connecting or transmitting.
+Some of these validations are operator reports without an archived trial note; [project status](docs/project-status.md) says which. A `TX_OK` / `MATCH` reply means only that a frame was transmitted and matched on the bus. It never proves the receiver executed it, and every service reply says `receiver_execution=UNVERIFIED`.
 
-**Software:** a C++17 compiler, `libCEC` headers and library for the Pi host, and the Arduino IDE (or another tool capable of uploading the `.ino` sketch to an Arduino Micro). The repository contains no installer, service unit, or build script.
+## Build and test
 
-## Build and run manually
+Offline (no GPIO, no receiver):
 
-1. Wire and verify the XS8 connection using [docs/hardware.md](docs/hardware.md). Keep the Arduino TX pins released while checking the connector and passive bus behavior.
-2. In the Arduino IDE, open [xs8-bridge/xs8-bridge.ino](xs8-bridge/xs8-bridge.ino), select **Arduino Micro** and the connected port, then upload the sketch. Connect the Arduino to the Pi by USB. The sketch prints `XS8 BRIDGE 1.0 READY` on its serial port at startup.
-3. On the Pi, provide a C++17 compiler and the `libCEC` development headers/library, then compile the host from the repository root:
+```sh
+make test                                   # C++ units, service socket and REPL tests (fake GPIO backend)
+python3 -m unittest tests.test_gateway      # Gateway
+for t in tests/test_web_*.js; do node "$t"; done   # Web UI
+```
 
-   ```sh
-   g++ -std=c++17 -O2 main.cpp -o cec-xs-bridge -lcec -ldl -pthread
-   ```
+Pi binaries are cross-built for ARMv6 with Docker ([pi-build](docs/pi-build.md)), or built natively with `make`. Deployment uses the templates in `deploy/` (systemd units and the nginx site), described in [cec-client-systemd](docs/cec-client-systemd.md), [gateway-systemd](docs/gateway-systemd.md) and [https-lan](docs/https-lan.md). The templates enable **no** control. Each Web control must be opted into on the Pi with its gate ([Web API](docs/web-api.md)).
 
-   This is a manual compiler invocation derived from [main.cpp](main.cpp), not a repository build script or a locally verified package-install command. Library paths and link flags may need to match the Pi's installed `libCEC` build.
-4. Confirm that the Arduino is available as **`/dev/ttyACM0`** and that the user can open it. The path is currently fixed in `main.cpp`; this README does not assume another port works without changing the code. Make the CEC adapter available to `libCEC`, then run:
+## Precautions
 
-   ```sh
-   ./cec-xs-bridge
-   ```
+This is an experimental interface for one documented KR-V6070 setup, not a general Kenwood compatibility claim.
 
-   The host sends a serial `S` before opening the CEC adapter. After a fresh Arduino startup, that `S` may produce no XS8 frame because the firmware has no active volume/context state to clear. Press the remote's volume or mute controls to exercise the implemented path; stop the foreground process with Ctrl-C.
-
-The Pi writes commands but does **not** read the Arduino's `OK`/`ERR` text. A successful serial write does not confirm that an XS8 frame reached the receiver. [Architecture details](docs/architecture.md)
-
-## Status and precautions
-
-This is an **experimental hardware interface tested on the documented KR-V6070 setup**, not a general compatibility claim for other Kenwood models. The working transmitter drives HIGH and releases the line for LOW; it must not be replaced with an assumed electrical driver without measuring the target bus. Verify sleeve/tip/ring, resistors, shared ground, idle levels, and the BUSY/DATA mapping before transmitting. [Hardware guide](docs/hardware.md)
-
-A lost volume STOP can leave the receiver changing volume. The watchdogs cannot guarantee delivery while BUSY remains occupied. Other researched XS8 bytes can lock the front panel or change meaning with context, so the production path intentionally exposes only the implemented volume and mute controls. The research archive records observations and unresolved decoder, context, and response questions; it does not contain a complete end-to-end CEC trace. [Protocol limitations](docs/xs8-protocol.md), [research history](research/RESEARCH_HISTORY.md)
-
-## Future direction
-
-A complementary **Web Remote** for receiver input selection and CD transport is planned. It is **not implemented** in the current host or Arduino firmware. Candidate commands and their state-dependent evidence are documented in the [command registry](research/COMMAND_REGISTRY.md).
+- Verify the wiring, the 5 V TX stages and the RX dividers before transmitting ([hardware](docs/hardware.md)).
+- A lost volume STOP or CD RELEASE can leave the receiver or changer running. Software cannot guarantee delivery on a blocked bus.
+- Many researched bytes lock the front panel or change meaning with context. Only commands with validated mappings are exposed.
+- The one-click POWER toggle is serialized only within the Gateway. Direct service clients and the receiver's own controls can still race it.
 
 ## Documentation
 
-- [ARMv6 Docker build from Apple Silicon](docs/pi-build.md)
-- [Architecture and serial command flow](docs/architecture.md)
-- [Hardware wiring and checks](docs/hardware.md)
-- [XS8 engineering specification](docs/xs8-protocol.md)
-- [Research archive](research/) — [history](research/RESEARCH_HISTORY.md), [command registry](research/COMMAND_REGISTRY.md), original notes, sketches, and captures
+- [Project status and handoff](docs/project-status.md): capability status, evidence and live configuration
+- [Architecture](docs/architecture.md) · [Hardware](docs/hardware.md) · [XS8 protocol](docs/xs8-protocol.md)
+- Web and API: [Web API](docs/web-api.md), [receiver controls (VIDEO, MONITOR, POWER)](docs/receiver-controls-api.md), [source selection](docs/source-selection.md), [receiver status and QUERY_STATUS](docs/receiver-status.md), [MUTE](docs/mute-control.md), [volume step](docs/volume-step-api.md), [CD transport](docs/cd-transport-api.md), [CD changer presence](docs/cd-changer-presence.md)
+- Deployment: [HTTPS on the LAN](docs/https-lan.md), [Gateway units](docs/gateway-systemd.md), [CEC client](docs/cec-client.md), [CEC client unit](docs/cec-client-systemd.md), [Pi build](docs/pi-build.md)
+- Research: [research REPL](docs/xs8-research-repl.md), [command matrices (historical)](docs/xs8-command-matrices.md), [research archive](research/) ([history](research/RESEARCH_HISTORY.md), [command registry](research/COMMAND_REGISTRY.md), [coverage](research/XS8_COMMAND_COVERAGE.md))

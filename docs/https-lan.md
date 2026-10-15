@@ -2,6 +2,8 @@
 
 This is a **configuration template**, not an installed service. The intended route is iPhone Safari → nginx HTTPS and Basic Auth → `/run/kenwood-gateway.sock` → Python Gateway → local XS8 Service socket. The socket-activated Gateway remains read-only; every POST returns HTTP 501. Do not expose this site to the public internet or configure router port forwarding.
 
+**Status (2026-10-15):** the Gateway units and this nginx site (with `proxy_read_timeout 14s`) are installed on the Pi. The checked-in templates are still read-only, but the live Gateway adds every `--enable-*` control gate through a systemd drop-in, so its POST endpoints are active. Opt-in controls are documented in the [Web API](web-api.md); the live configuration is recorded in [project status](project-status.md#live-deployment-on-the-pi-read-only-inspection-2026-10-15). The read-only statements below describe the template.
+
 ## 1. Choose the LAN name and address
 
 Use a stable Pi LAN IPv4 address (such as a DHCP reservation) and a name that the iPhone resolves on home Wi-Fi. `woodland-pi.local` is an example **only if it resolves on the iPhone**; a router-provided local DNS name is also suitable. The name typed in Safari must exactly match the certificate's DNS Subject Alternative Name (SAN). Use `https://NAME/`, not a bare IP URL, unless a separate IP SAN is issued. Check name resolution before making a certificate.
