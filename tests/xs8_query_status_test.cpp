@@ -90,12 +90,50 @@ static void test_failures_and_unknown()
     assert_contains(unknown.response(deadline), "source_inferred=UNKNOWN");
     assert_contains(unknown.response(deadline), "monitor_inferred=OFF");
 
+    // One frame after the echo is PARTIAL, not silence.
     Xs8QueryStatus missing = query();
     const xs8_monitor_record partial[] = {tx, source};
     missing.observe(partial, 2);
-    assert_contains(missing.response(deadline), "reason=MISSING");
+    assert(missing.done(deadline) && !missing.successful(deadline));
+    assert_contains(missing.response(deadline), "ERR QUERY_STATUS reason=PARTIAL ");
     assert_contains(missing.response(deadline), "rx1=0x47/0x1D");
+    assert(missing.response(deadline).find(" rx2=") == std::string::npos);
+    assert_contains(missing.response(deadline), "source_inferred=UNKNOWN");
     assert_contains(missing.response(deadline), "monitor_inferred=UNKNOWN");
+
+    // A verified echo and a silent window: NO_REPLY, distinct from every fault.
+    Xs8QueryStatus silent = query();
+    silent.observe(&tx, 1);
+    assert(!silent.done(silent.deadline_ns() - 1));
+    assert(silent.done(silent.deadline_ns()) && !silent.successful(silent.deadline_ns()));
+    assert_contains(silent.response(deadline), "ERR QUERY_STATUS reason=NO_REPLY ");
+    assert_contains(silent.response(deadline), " tx=0x13/");
+    assert(silent.response(deadline).find(" rx1=") == std::string::npos);
+    assert_contains(silent.response(deadline), "gap_events=0 ");
+    // A frame after the deadline does not turn silence into PARTIAL.
+    Xs8QueryStatus late = query();
+    const uint64_t window_end = late.deadline_ns();
+    const xs8_monitor_record after[] = {tx, frame(2, window_end + 1, window_end + 100, 0x47, 0x1D)};
+    late.observe(after, 2);
+    assert_contains(late.response(window_end + 200), "reason=NO_REPLY ");
+    // Silence plus lost events is EVENT_GAP, never NO_REPLY.
+    Xs8QueryStatus silent_gap = query();
+    xs8_monitor_record lost{};
+    lost.decoded.kind = XS8_EVENT_GAP;
+    lost.decoded.lost_events = 1;
+    lost.decoded.reason = "EVENT_GAP";
+    const xs8_monitor_record with_gap[] = {tx, lost};
+    silent_gap.observe(with_gap, 2);
+    assert_contains(silent_gap.response(deadline), "reason=EVENT_GAP ");
+    // Overflow and monitor failure are faults, never silence.
+    Xs8QueryStatus overflowed = query();
+    overflowed.observe(&tx, 1);
+    overflowed.overflow();
+    assert_contains(overflowed.response(deadline), "reason=OVERFLOW ");
+    Xs8QueryStatus failed = query();
+    failed.observe(&tx, 1);
+    failed.monitor_failed();
+    assert_contains(failed.response(deadline), "reason=MONITOR_FAILED ");
 
     Xs8QueryStatus no_tx = query();
     assert_contains(no_tx.response(deadline), "reason=TX_MISSING");

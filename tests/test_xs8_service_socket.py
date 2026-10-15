@@ -633,6 +633,213 @@ class ScriptedRxSocketTest(ServiceSocketTest):
     def status(self):
         return dict(part.split("=", 1) for part in self.request("STATUS").split()[1:])
 
+    def settle(self):
+        """QUERY_STATUS SETTLE may wait up to 1.5 s before its 0.5 s window."""
+        with self.connect() as client:
+            client.sendall(b"QUERY_STATUS SETTLE\n")
+            return self.read_reply(client)
+
+    @staticmethod
+    def read_reply(client, timeout=3):
+        client.settimeout(timeout)
+        reply = bytearray()
+        while not reply.endswith(b"\n"):
+            chunk = client.recv(1024)
+            if not chunk:
+                raise AssertionError("service closed before its reply")
+            reply.extend(chunk)
+        return reply.decode("ascii").strip()
+
+
+# A recognised ROOT 0x13 reply: CD (legacy 0x1D), then MONITOR ON (legacy 0x14).
+QUERY_CD_ON = "0x13 echo +3000:0x47/0x1D +6000:0xD7/0x14"
+QUERY_TUNER_ON = "0x13 echo +3000:0x27/0x1B +6000:0xD7/0x14"
+
+
+class QueryStatusSocketTest(ScriptedRxSocketTest):
+    """QUERY_STATUS outcomes, QUERY_STATUS SETTLE and cache clearing after local TX."""
+
+    def test_no_reply_is_distinct_from_partial_and_faults(self):
+        for rx, reason in (("0x13 echo", "NO_REPLY"),
+                           ("0x13 echo +3000:0x47/0x1D", "PARTIAL"),
+                           ("0x13 echo +3000:INVALID", "INCOMPLETE"),
+                           ("0x13 echo +3000:0x47/0x1D +4000:GAP", "EVENT_GAP"),
+                           ("0x13", "TX_MISSING")):
+            with self.subTest(reason=reason):
+                self.rx(rx)
+                reply = self.request("QUERY_STATUS")
+                self.assertTrue(reply.startswith(f"ERR QUERY_STATUS reason={reason} "), reply)
+                self.assertTrue(reply.endswith("receiver_execution=UNVERIFIED"), reply)
+                self.assertIn("source_inferred=UNKNOWN", reply)
+        self.assertEqual(self.status()["receiver_source"], "UNKNOWN")
+        self.rx(QUERY_CD_ON)
+        reply = self.request("QUERY_STATUS")
+        self.assertTrue(reply.startswith("OK QUERY_STATUS reason=NONE "), reply)
+        self.assertIn("source_inferred=CD monitor_inferred=ON", reply)
+        status = self.status()
+        self.assertEqual((status["receiver_source"], status["receiver_source_evidence"],
+                          status["receiver_monitor"]), ("CD", "QUERY", "ON"))
+        self.assertEqual(self.transmitted(), ["0x13"] * 6, "one frame each, never retried")
+
+    def test_settle_on_a_quiet_bus_transmits_promptly(self):
+        self.rx(QUERY_CD_ON)
+        started = time.monotonic()
+        reply = self.settle()
+        self.assertTrue(reply.startswith("OK QUERY_STATUS reason=NONE "), reply)
+        self.assertLess(time.monotonic() - started, 0.9)
+        self.assertEqual(self.transmitted(), ["0x13"])
+        self.assertRegex(self.log_path.read_text(), r"XS8 QUERY_STATUS settle waited_ms=\d+\n")
+
+    def test_delayed_cd_stop_report_collides_without_settle(self):
+        # The changer's 0x94 ~320 ms after STOP lands inside a 500 ms query window.
+        self.rx("0xA1 echo +320000:0x94", QUERY_CD_ON)
+        self.assertTrue(self.request("CD_STOP").startswith("OK CD_TRANSPORT_TX"))
+        reply = self.request("QUERY_STATUS")
+        self.assertTrue(reply.startswith("ERR QUERY_STATUS reason=EXTRA "), reply)
+        self.assertRegex(reply, r" rx3=0x94/")
+        self.assertEqual(self.status()["receiver_source"], "UNKNOWN")
+        # With SETTLE the one query frame waits until the report has passed.
+        time.sleep(1.05)
+        self.assertTrue(self.request("CD_STOP").startswith("OK CD_TRANSPORT_TX"))
+        stopped = time.monotonic()
+        reply = self.settle()
+        self.assertTrue(reply.startswith("OK QUERY_STATUS reason=NONE "), reply)
+        self.assertNotIn("0x94", reply)
+        self.assertGreaterEqual(time.monotonic() - stopped, 0.6 + 0.5)
+        waited = [int(ms) for ms in re.findall(r"settle waited_ms=(\d+)",
+                                               self.log_path.read_text())]
+        self.assertEqual(len(waited), 1)
+        self.assertGreaterEqual(waited[0], 550)
+        self.assertEqual(self.status()["receiver_source"], "CD")
+        self.assertEqual(self.transmitted(), ["0xA1", "0x13", "0xA1", "0x13"])
+
+    def test_settle_times_out_under_continuous_traffic_without_tx(self):
+        traffic = " ".join(f"+{150000 * i}:0x94" for i in range(1, 17))
+        self.rx("0xA1 echo " + traffic, QUERY_CD_ON)
+        self.assertTrue(self.request("CD_STOP").startswith("OK CD_TRANSPORT_TX"))
+        started = time.monotonic()
+        with self.connect() as owner:
+            owner.sendall(b"QUERY_STATUS SETTLE\n")
+            self.assertEqual(self.read_reply(owner), "ERR QUERY_STATUS reason=BUS_ACTIVE")
+        elapsed = time.monotonic() - started
+        self.assertTrue(1.4 <= elapsed < 2.2, elapsed)
+        self.assertEqual(self.transmitted(), ["0xA1"], "nothing sent on a busy bus")
+        self.assertIn("XS8 QUERY_STATUS settle ERR QUERY_STATUS reason=BUS_ACTIVE",
+                      self.log_path.read_text())
+        # Once the traffic has ended, a new request (never an automatic retry) works.
+        time.sleep(1.2)
+        self.assertTrue(self.settle().startswith("OK QUERY_STATUS"))
+        self.assertEqual(self.transmitted(), ["0xA1", "0x13"])
+
+    def test_volume_press_preempts_a_pending_settle(self):
+        self.rx("0xA1 echo", QUERY_CD_ON)
+        self.assertTrue(self.request("CD_STOP").startswith("OK CD_TRANSPORT_TX"))
+        with self.connect() as owner, self.connect() as cec:
+            owner.sendall(b"QUERY_STATUS SETTLE\n")
+            time.sleep(0.05)
+            # Still settling: other controls are refused, STATUS and RELEASE are not.
+            for line in ("QUERY_STATUS", "QUERY_STATUS SETTLE", "CD_STOP",
+                         "SELECT_SOURCE CD", "VOLUME_STEP UP", "RESEARCH_SEND 0x9C 100"):
+                self.assertEqual(self.command(cec, line),
+                                 "ERR QUERY_STATUS reason=SESSION_BUSY", line)
+            self.assertTrue(self.command(cec, "STATUS").startswith("OK state=IDLE"))
+            # A CEC volume press is not refused: the settle ends with nothing sent.
+            self.assertEqual(self.command(cec, "VOLUME_PRESS UP"), "OK VOLUME_PRESS_TX")
+            self.assertEqual(self.read_reply(owner), "ERR QUERY_STATUS reason=PREEMPTED")
+            self.assertEqual(self.command(cec, "VOLUME_RELEASE UP"), "OK VOLUME_RELEASE_TX")
+        self.assertNotIn("0x13", self.transmitted())
+        self.assertIn("settle preempted by VOLUME_PRESS; nothing sent",
+                      self.log_path.read_text())
+
+    def test_mute_preempts_a_pending_settle(self):
+        self.rx("0xA1 echo", QUERY_CD_ON)
+        self.assertTrue(self.request("CD_STOP").startswith("OK CD_TRANSPORT_TX"))
+        with self.connect() as owner, self.connect() as cec:
+            owner.sendall(b"QUERY_STATUS SETTLE\n")
+            time.sleep(0.05)
+            # Only an exact MUTE preempts; anything else is still refused.
+            self.assertEqual(self.command(cec, "MUTE NOW"),
+                             "ERR QUERY_STATUS reason=SESSION_BUSY")
+            reply = self.command(cec, "MUTE")
+            self.assertTrue(reply.startswith("OK MUTE_TX"), reply)
+            self.assertEqual(self.read_reply(owner), "ERR QUERY_STATUS reason=PREEMPTED")
+        sent = self.transmitted()
+        self.assertNotIn("0x13", sent)
+        self.assertEqual(sent[0], "0xA1")
+        self.assertGreater(len(sent), 1, "MUTE followed its own control path")
+        self.assertIn("settle preempted by MUTE; nothing sent", self.log_path.read_text())
+        self.assertTrue(self.request("STATUS").startswith("OK state=IDLE"))
+
+    def test_mute_preemption_keeps_mute_gates(self):
+        # A preempting MUTE is still refused by its own gates (here a CD hold):
+        # the settle ends, MUTE sends nothing and nothing is retried.
+        self.rx(QUERY_CD_ON)
+        token = self.press("SEEK_FORWARD")
+        before = self.transmitted()
+        with self.connect() as owner, self.connect() as cec:
+            owner.sendall(b"QUERY_STATUS SETTLE\n")
+            time.sleep(0.05)
+            self.assertEqual(self.command(cec, "MUTE"), "ERR CD_TRACK_BUSY")
+            self.assertEqual(self.read_reply(owner), "ERR QUERY_STATUS reason=PREEMPTED")
+        self.assertEqual(self.transmitted(), before)
+        self.assertTrue(self.request("CD_RELEASE " + token).startswith("OK CD_RELEASE_TX"))
+
+    def test_once_transmitted_the_query_stays_exclusive(self):
+        self.rx(QUERY_CD_ON)
+        with self.connect() as owner, self.connect() as cec:
+            owner.sendall(b"QUERY_STATUS SETTLE\n")
+            deadline = time.monotonic() + 1
+            while "0x13" not in self.transmitted():
+                self.assertLess(time.monotonic(), deadline, "query never transmitted")
+                time.sleep(0.01)
+            for line in ("VOLUME_PRESS UP", "MUTE"):
+                self.assertEqual(self.command(cec, line),
+                                 "ERR QUERY_STATUS reason=SESSION_BUSY", line)
+            self.assertTrue(self.read_reply(owner).startswith("OK QUERY_STATUS reason=NONE"))
+        self.assertEqual(self.transmitted(), ["0x13"])
+        self.assertNotIn("preempted", self.log_path.read_text())
+
+    def test_settle_owner_disconnect_or_input_sends_nothing(self):
+        self.rx("0xA1 echo", QUERY_CD_ON)
+        self.assertTrue(self.request("CD_STOP").startswith("OK CD_TRANSPORT_TX"))
+        with self.connect() as owner:
+            owner.sendall(b"QUERY_STATUS SETTLE\n")
+            time.sleep(0.05)
+        with self.connect() as owner:
+            owner.sendall(b"QUERY_STATUS SETTLE\n")
+            time.sleep(0.05)
+            owner.sendall(b"STATUS\n")  # Any owner input ends its pending request.
+            owner.settimeout(1)
+            self.assertEqual(owner.recv(1024), b"")
+        time.sleep(0.9)
+        self.assertEqual(self.transmitted(), ["0xA1"])
+        self.assertTrue(self.request("STATUS").startswith("OK state=IDLE"))
+
+    def test_local_source_and_monitor_tx_clear_the_current_observation(self):
+        self.rx(QUERY_CD_ON)
+        self.assertTrue(self.request("QUERY_STATUS").startswith("OK QUERY_STATUS"))
+        # Refused before any TX: nothing is cleared.
+        self.assertFalse(self.request("SELECT_SOURCE BOGUS").startswith("OK"))
+        self.assertEqual(self.status()["receiver_source"], "CD")
+        self.assertEqual(self.request("SELECT_SOURCE TUNER").split()[0], "OK")
+        status = self.status()
+        self.assertEqual((status["receiver_source"], status["receiver_source_ns"],
+                          status["receiver_source_evidence"]), ("UNKNOWN", "0", "NONE"))
+        self.assertEqual(status["receiver_monitor"], "ON")
+        self.assertEqual(status["receiver_integrity"], "HEALTHY")
+        self.assertRegex(self.log_path.read_text(),
+                         r"XS8 RECEIVER source cleared after local TX floor_ns=\d+ "
+                         r"last_source=CD last_source_ns=[1-9]\d* last_source_evidence=QUERY")
+        self.rx(QUERY_TUNER_ON)
+        self.assertIn("source_inferred=TUNER", self.settle())
+        self.assertEqual(self.status()["receiver_source"], "TUNER")
+        self.assertTrue(self.request("TAPE2_MONITOR_TOGGLE").startswith("OK TAPE2_MONITOR_TX"))
+        status = self.status()
+        self.assertEqual((status["receiver_monitor"], status["receiver_monitor_ns"],
+                          status["receiver_monitor_evidence"]), ("UNKNOWN", "0", "NONE"))
+        self.assertEqual(status["receiver_source"], "TUNER")
+        self.assertIn("XS8 RECEIVER monitor cleared after local TX", self.log_path.read_text())
+
 
 class CdProbeSocketTest(ScriptedRxSocketTest):
     """Experimental PROBE_CD_CHANGER with simulated RX timed from the fake TX."""

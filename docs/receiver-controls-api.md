@@ -21,8 +21,8 @@ One atomic CONTEXT transaction each, through VolumeControl's `context_key()`, th
 
 | Command | Frame | Evidence |
 |---|---|---|
-| `POWER_ON` | ROOT `0x52` | Physically observed from standby (2026-10-12); no effect when already on |
-| `POWER_OFF` | ROOT `0x62` | Historical; not recently validated |
+| `POWER_ON` | ROOT `0x52` | Physically verified: powers the receiver on from standby (2026-10-12). Idempotence is not assumed |
+| `POWER_OFF` | ROOT `0x62` | Physically verified: powers the receiver off (reported 2026-10-14). Idempotence is not assumed |
 
 CONTEXT `0x39` (also historically a power-off) is never used. Both commands use the CD preflight, so they are refused during any volume or CD hold, any STOP, CONTEXT or CD release obligation, any fault, BOOT_INHIBIT and shutdown; an open research CONTEXT and an unhealthy monitor are refused too. Replies: `OK POWER_TX action=ON|OFF gpio_tx=… waveform=… receiver_execution=UNVERIFIED` or `ERR POWER_UNCERTAIN …`. An uncertain frame latches no fault (it leaves no release obligation). The service does not read back power state; the standby LED and switched outlets are not indicators.
 

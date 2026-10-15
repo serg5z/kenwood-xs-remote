@@ -2943,7 +2943,7 @@ class RemoteV2GatewayTest(CdSeekGatewayTest):
             self.assertTrue(self.session_flags(cookie)["power_available"])
             power = self.operations(cookie)["power"]
             self.assertEqual((power["enabled"], power["available_actions"],
-                              power["provisional_actions"]), (True, ["ON", "OFF"], ["OFF"]))
+                              power["provisional_actions"]), (True, ["ON", "OFF"], []))
             for action in ("ON", "OFF"):
                 fake.mute_reply = POWER_OK.replace(b"action=ON", f"action={action}".encode())
                 self.spaced("power")
@@ -2952,7 +2952,7 @@ class RemoteV2GatewayTest(CdSeekGatewayTest):
                 self.assertEqual((code, payload["result"], payload["action"],
                                   payload["receiver_execution"]),
                                  (200, "SERVICE_TX_OK", action, "UNVERIFIED"))
-                self.assertIs(payload.get("mapping") == "PROVISIONAL", action == "OFF")
+                self.assertNotIn("mapping", payload)
                 self.assertEqual(self.power(token, cookie, action)[0], 403, "single use")
                 token = self.fresh_token(cookie)
             for body in ('{"action":"on"}', '{"action":"TOGGLE"}', '{"action":"STANDBY"}',

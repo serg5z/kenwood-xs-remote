@@ -8,6 +8,22 @@ The service accepts only complete, valid known bytes. Frames belonging to a pend
 
 `STATUS` retains its existing fields and adds `receiver_source`, `receiver_source_ns`, `receiver_source_evidence`, `receiver_monitor`, `receiver_monitor_ns`, `receiver_monitor_evidence`, and `receiver_integrity`. Timestamps are kernel monotonic nanoseconds. Evidence is `NONE`, `PASSIVE`, `AFTER_LOCAL_TX`, or `QUERY`; integrity is `HEALTHY` or `UNCERTAIN`. The Gateway presents the fields under `receiver` in `GET /api/v1/status`, with age and `FRESH` (30 seconds or less), `LAST_KNOWN`, `UNKNOWN`, or `UNCERTAIN` labels. Time alone never erases an observation. A service restart does erase its cache. No GET endpoint sends `QUERY_STATUS` or another XS8 frame.
 
+**Local commands clear the affected field.** Once any frame of a local `SELECT_SOURCE` (including the VIDEO1/VIDEO2 CONTEXT sequences) or `TAPE2_MONITOR_TOGGLE` has been attempted, verified or uncertain, the service sets that field to `UNKNOWN`, `_ns=0`, evidence `NONE`, because what the receiver reports may have changed. Frames that began before that command's first TX frame can no longer set it; a broadcast during the command, a later passive report or a query can. A command refused before any TX clears nothing. The cleared value is kept as last-known for diagnostics only: the journal line `XS8 RECEIVER source|monitor cleared after local TX floor_ns=… last_source=… last_monitor=…` records it, and STATUS does not report it.
+
+**Query outcomes.** A successful `QUERY_STATUS` replies `OK QUERY_STATUS reason=NONE`. Every other outcome is `ERR QUERY_STATUS reason=…` and records nothing:
+
+| Reason | Meaning |
+|---|---|
+| `NO_REPLY` | Own `0x13` echo verified, then no frame at all in the 500 ms window (no gap, overflow or monitor fault) |
+| `PARTIAL` | Echo, then exactly one frame |
+| `TX_UNCERTAIN`, `TX_MISSING`, `TX_INVALID`, `TX_MISMATCH` | The query frame itself is unverified, unseen, invalid or a different byte |
+| `OVERLAP`, `INCOMPLETE`, `EXTRA`, `OUT_OF_ORDER` | Colliding, invalid or partially received frames, more than two frames, or swapped fields |
+| `EVENT_GAP`, `OVERFLOW`, `MONITOR_FAILED` | Lost edges, monitor history overflow or monitor failure |
+
+`NO_REPLY` is evidence of silence only; it never by itself means the receiver is off.
+
+**`QUERY_STATUS SETTLE`** is the same single query, sent only once the bus is quiet: no local TX for 600 ms and no bus frame for 200 ms, waiting at most 1.5 s (provisional values). 600 ms clears the changer's `0x94` report about 320 ms after a CD STOP, which otherwise lands in the query window and fails it as `EXTRA`. If the bus never goes quiet, the reply is `ERR QUERY_STATUS reason=BUS_ACTIVE` and nothing is sent. While it waits, it holds the same RX slot as a query (other controls get `ERR QUERY_STATUS reason=SESSION_BUSY`; `STATUS`, `RESEARCH_CONTEXT_STATUS` and `VOLUME_RELEASE` still answer), except that a `VOLUME_PRESS` or an exact `MUTE` (the CEC controls) preempts it: the waiting request gets `ERR QUERY_STATUS reason=PREEMPTED` with nothing sent and no automatic retry, and the press or MUTE then follows its normal path and safety gates (it may still be refused by them). Once `0x13` has been sent, both get `SESSION_BUSY` as before. Disconnecting, or sending anything else on the requesting connection, ends it without TX. Once the query frame is sent, the transaction is exclusive exactly like `QUERY_STATUS`. Plain `QUERY_STATUS` is unchanged.
+
 `POST /api/v1/receiver/query` requires the independent, default-off Gateway `--enable-receiver-query` option. It accepts exactly `{}` with `application/json` after the same verified nginx peer UID, Basic Auth identity, exact HTTPS Origin, session cookie, and one-use CSRF checks as MUTE and SOURCE. It requires eligible IDLE/healthy service status, dispatches exactly one local `QUERY_STATUS`, never retries an uncertain outcome, and rate-limits repeat requests. The service remains the final safety gate. The Web SYNC button is disabled when authorization or service readiness is unconfirmed; page load and periodic polling never invoke it. VIDEO1, VIDEO2, and TAPE2 remain disabled as TX controls even when their observed state is displayed.
 
 ## Raspberry Pi rollout and rollback (manual; not performed here)

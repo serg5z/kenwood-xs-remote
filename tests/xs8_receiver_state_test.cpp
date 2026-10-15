@@ -150,6 +150,44 @@ int main()
     overflowed.apply_query(query, query.deadline_ns());
     has(overflowed.status_fields(), "receiver_integrity=HEALTHY");
     has(overflowed.status_fields(), "receiver_source=VIDEO2");
+    // A local source command clears only the current source; the last-known
+    // value is kept for diagnostics and earlier frames processed late are ignored.
+    Xs8ReceiverState selected;
+    selected.observe(frame(1000, 0x7D), false);
+    selected.observe(frame(2000, 0x14), false);
+    selected.forget_source(5000);
+    has(selected.status_fields(), "receiver_source=UNKNOWN receiver_source_ns=0 "
+                                  "receiver_source_evidence=NONE");
+    has(selected.status_fields(), "receiver_monitor=ON");
+    has(selected.status_fields(), "receiver_integrity=HEALTHY");
+    has(selected.last_known_fields(), "last_source=CD last_source_ns=1000 "
+                                      "last_source_evidence=PASSIVE");
+    selected.observe(frame(4999, 0x7B), false);
+    has(selected.status_fields(), "receiver_source=UNKNOWN");
+    // A second clear before any new observation keeps the earlier last-known value.
+    selected.forget_source(5000);
+    has(selected.last_known_fields(), "last_source=CD ");
+    selected.observe(frame(5000, 0x7B), false);
+    has(selected.status_fields(), "receiver_source=TUNER receiver_source_ns=5000");
+    Xs8QueryStatus after(6000, 6500);
+    const xs8_monitor_record after_frames[] = {
+        frame(6000, 0x37), frame(6600, 0x1D), frame(6800, 0x18)
+    };
+    after.observe(after_frames, 3);
+    selected.apply_query(after, after.deadline_ns());
+    has(selected.status_fields(), "receiver_source=CD receiver_source_ns=6600 "
+                                  "receiver_source_evidence=QUERY");
+    // MONITOR is cleared independently of the source.
+    selected.forget_monitor(7000);
+    has(selected.status_fields(), "receiver_monitor=UNKNOWN receiver_monitor_ns=0 "
+                                  "receiver_monitor_evidence=NONE");
+    has(selected.status_fields(), "receiver_source=CD");
+    has(selected.last_known_fields(), "last_monitor=OFF last_monitor_ns=6800 "
+                                      "last_monitor_evidence=QUERY");
+    selected.observe(frame(6900, 0x14), false);
+    has(selected.status_fields(), "receiver_monitor=UNKNOWN");
+    selected.observe(frame(7100, 0x14), false);
+    has(selected.status_fields(), "receiver_monitor=ON");
     Xs8ReceiverState restarted;
     has(restarted.status_fields(), "receiver_source=UNKNOWN");
     has(restarted.status_fields(), "receiver_monitor=UNKNOWN");

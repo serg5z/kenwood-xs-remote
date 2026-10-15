@@ -87,9 +87,10 @@ KEY_HOLDS = {
     "volume": {"directions": VOLUME_HOLD_DIRECTIONS, "max_ms": VOLUME_HOLD_MAX_MS,
                "label": "VOLUME_HOLD"},
 }
-# ROOT 0x52 POWER ON is physically observed; ROOT 0x62 POWER OFF is historical.
+# ROOT 0x52 POWER ON and ROOT 0x62 POWER OFF are both physically verified.
+# Neither is assumed idempotent, and no power state is read back.
 POWER_COMMANDS = {"ON": "POWER_ON", "OFF": "POWER_OFF"}
-POWER_PROVISIONAL_ACTIONS = ("OFF",)
+POWER_PROVISIONAL_ACTIONS = ()
 POWER_INTERVAL_MS = 2000
 # CONTEXT 0x48: historical TAPE2 MONITOR toggle, not yet physically validated.
 TAPE2_MONITOR_INTERVAL_MS = 1000
@@ -666,7 +667,7 @@ def capabilities(mute_available=False, source_available=False, query_available=F
                 "classification": "unverified", "enabled": power_available,
                 "available_actions": list(POWER_COMMANDS),
                 "provisional_actions": list(POWER_PROVISIONAL_ACTIONS),
-                "reason": "ROOT 0x52 ON is physically observed; ROOT 0x62 OFF is historical; no power state is read back",
+                "reason": "ROOT 0x52 ON and ROOT 0x62 OFF are physically verified; TX does not confirm execution and no power state is read back",
             },
             "tape2_monitor": {
                 "classification": "unverified", "enabled": tape2_monitor_available,
@@ -1651,7 +1652,7 @@ def parse_args(argv=None):
     parser.add_argument("--enable-volume-hold", action="store_true",
                         help="enable held VOL+/VOL- on a connection-owned service hold")
     parser.add_argument("--enable-power", action="store_true",
-                        help="enable POWER ON (ROOT 0x52) and provisional POWER OFF (ROOT 0x62)")
+                        help="enable POWER ON (ROOT 0x52) and POWER OFF (ROOT 0x62)")
     parser.add_argument("--enable-tape2-monitor", action="store_true",
                         help="enable the unvalidated TAPE2 MONITOR toggle (CONTEXT 0x48)")
     parser.add_argument("--cd-track-interval-ms", type=int,

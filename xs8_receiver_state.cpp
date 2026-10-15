@@ -56,7 +56,7 @@ void Xs8ReceiverState::update_source(uint8_t legacy, uint64_t time_ns,
                                      const char *evidence, bool queried)
 {
     const char *name = source_name(legacy, queried);
-    if (name && time_ns >= source_.time_ns)
+    if (name && time_ns >= source_.time_ns && time_ns >= source_floor_ns_)
         source_ = {name, time_ns, evidence};
 }
 
@@ -64,7 +64,7 @@ void Xs8ReceiverState::update_monitor(uint8_t legacy, uint64_t time_ns,
                                       const char *evidence)
 {
     const char *name = monitor_name(legacy);
-    if (name && time_ns >= monitor_.time_ns)
+    if (name && time_ns >= monitor_.time_ns && time_ns >= monitor_floor_ns_)
         monitor_ = {name, time_ns, evidence};
 }
 
@@ -111,6 +111,20 @@ void Xs8ReceiverState::apply_query(const Xs8QueryStatus& query, uint64_t now_ns)
         integrity_ = true;
 }
 
+void Xs8ReceiverState::forget_source(uint64_t floor_ns)
+{
+    if (source_.time_ns) last_source_ = source_;
+    source_ = {};
+    if (floor_ns > source_floor_ns_) source_floor_ns_ = floor_ns;
+}
+
+void Xs8ReceiverState::forget_monitor(uint64_t floor_ns)
+{
+    if (monitor_.time_ns) last_monitor_ = monitor_;
+    monitor_ = {};
+    if (floor_ns > monitor_floor_ns_) monitor_floor_ns_ = floor_ns;
+}
+
 void Xs8ReceiverState::history_overflow() { integrity_ = false; }
 void Xs8ReceiverState::monitor_failed()
 {
@@ -128,5 +142,17 @@ std::string Xs8ReceiverState::status_fields() const
         source_.value, (unsigned long long)source_.time_ns, source_.evidence,
         monitor_.value, (unsigned long long)monitor_.time_ns, monitor_.evidence,
         integrity_ ? "HEALTHY" : "UNCERTAIN");
+    return result;
+}
+
+std::string Xs8ReceiverState::last_known_fields() const
+{
+    char result[200];
+    std::snprintf(result, sizeof(result),
+        "last_source=%s last_source_ns=%llu last_source_evidence=%s "
+        "last_monitor=%s last_monitor_ns=%llu last_monitor_evidence=%s",
+        last_source_.value, (unsigned long long)last_source_.time_ns,
+        last_source_.evidence, last_monitor_.value,
+        (unsigned long long)last_monitor_.time_ns, last_monitor_.evidence);
     return result;
 }

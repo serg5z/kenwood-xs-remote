@@ -58,6 +58,10 @@ public:
     }
     uint64_t last_start_ns() const { return last_start_ns_; }
     uint64_t last_end_ns() const { return last_end_ns_; }
+    // Frames attempted since mark(), and the start of the first of them.
+    void mark() { marked_frames_ = 0; marked_start_ns_ = 0; }
+    unsigned marked_frames() const { return marked_frames_; }
+    uint64_t marked_start_ns() const { return marked_start_ns_; }
     struct Frame { ServiceTxEvidence evidence; uint64_t start_ns, end_ns; };
     // Records every frame of one research CONTEXT command, including each 0x07
     // cleanup attempt, so captures label all local TX windows.
@@ -81,6 +85,7 @@ private:
         int64_t end = xs8_gpio_now_ns();
         last_start_ns_ = start > 0 ? (uint64_t)start : 0;
         last_end_ns_ = end > 0 ? (uint64_t)end : 0;
+        if (!marked_frames_++) marked_start_ns_ = last_start_ns_;
         receiver_.note_tx(last_start_ns_, last_end_ns_);
         if (last_.gpio_completed && start > 0 && end >= start) {
             enum xs8_observation observed = xs8_monitor_verify_tx(
@@ -119,6 +124,8 @@ private:
     ServiceTxEvidence last_stop_{};
     uint64_t last_start_ns_ = 0;
     uint64_t last_end_ns_ = 0;
+    unsigned marked_frames_ = 0;
+    uint64_t marked_start_ns_ = 0;
     VolumeControl::Time last_end_time_{};
 };
 
@@ -316,10 +323,13 @@ int main(int argc, char **argv)
     std::vector<Client> clients;
     uint64_t next_client_id = 1;
     size_t next_poll_client = 0;
-    // One RX transaction at a time: a QUERY_STATUS or a CD presence probe.
+    // One RX transaction at a time: a QUERY_STATUS (optionally after a settle
+    // phase that has not transmitted yet) or a CD presence probe.
     int query_client = -1;
     std::optional<Xs8QueryStatus> query;
     std::optional<Xs8CdProbe> probe;
+    struct Settle { uint64_t started_ns, deadline_ns; };
+    std::optional<Settle> settle;
     Xs8CdPresence presence;
     auto close_client = [&](size_t index) {
         if (index >= clients.size()) return;
@@ -330,6 +340,8 @@ int main(int argc, char **argv)
             query.reset();
             // A cancelled probe changes no presence observation.
             probe.reset();
+            // A settle has sent nothing; it simply ends.
+            settle.reset();
             query_client = -1;
         }
         core.disconnected(VolumeControl::Clock::now(), id);
@@ -347,6 +359,32 @@ int main(int argc, char **argv)
     // End of the latest bus frame seen, for the probe's quiet-bus guard.
     uint64_t last_rx_end_ns = 0;
     uint64_t state_cursor = xs8_monitor_checkpoint(monitor);
+    // The single QUERY_STATUS transmission, now or at the end of a settle. Empty
+    // when the query is pending; otherwise the refusal or TX-uncertain reply.
+    auto start_query = [&](int client) -> std::string {
+        query_cursor = xs8_monitor_checkpoint(monitor);
+        std::string result = core.begin_query_status(VolumeControl::Clock::now());
+        if ((result.empty() || result.find("reason=TX_UNCERTAIN") !=
+               std::string::npos) && transmitter.last_end_ns())
+            receiver.suppress_until(transmitter.last_end_ns() +
+                                    Xs8QueryStatus::kWindowNs);
+        if (!result.empty()) return result;
+        if (!transmitter.last_start_ns() ||
+            transmitter.last_end_ns() < transmitter.last_start_ns())
+            return "ERR QUERY_STATUS reason=TX_TIME_UNAVAILABLE\n";
+        query.emplace(transmitter.last_start_ns(), transmitter.last_end_ns());
+        query_client = client;
+        return {};
+    };
+    // Replies to the owner of a finished RX transaction; closes it on failure.
+    auto finish_owner = [&](int fd, const std::string& text) {
+        if (reply(fd, text)) return;
+        for (size_t i = 0; i < clients.size(); ++i)
+            if (clients[i].fd == fd) {
+                close_client(i);
+                break;
+            }
+    };
     while (!stopping) {
         xs8_monitor_poll(monitor, 0);
         const int64_t preparation_now = xs8_gpio_now_ns();
@@ -456,6 +494,37 @@ int main(int argc, char **argv)
         if (!context_preparation.active() && research &&
             research->id() == context_capture_id && research->active())
             research->cancel();
+        if (settle) {
+            // Nothing has been sent yet. Transmit once the bus is quiet, so a
+            // delayed report (0x94 ~320 ms after CD STOP) or a broadcast after a
+            // source change cannot land in the query window.
+            const int64_t settle_now = xs8_gpio_now_ns();
+            const uint64_t now = settle_now > 0 ? (uint64_t)settle_now : 0;
+            const uint64_t tx_end = transmitter.last_end_ns();
+            const bool quiet = now &&
+                (!tx_end || now >= tx_end + Xs8QueryStatus::kSettleTxNs) &&
+                (!last_rx_end_ns || now >= last_rx_end_ns + Xs8QueryStatus::kSettleBusNs);
+            std::string outcome;
+            if (!now) outcome = "ERR QUERY_STATUS reason=CLOCK_FAILED\n";
+            else if (quiet) {
+                const int owner = query_client;
+                std::fprintf(stderr, "XS8 QUERY_STATUS settle waited_ms=%llu\n",
+                             (unsigned long long)((now - settle->started_ns) / 1000000));
+                settle.reset();
+                query_client = -1;
+                outcome = start_query(owner);
+                if (!outcome.empty()) finish_owner(owner, outcome);
+                outcome.clear();
+            } else if (now >= settle->deadline_ns)
+                outcome = "ERR QUERY_STATUS reason=BUS_ACTIVE\n";
+            if (!outcome.empty()) {
+                std::fprintf(stderr, "XS8 QUERY_STATUS settle %s", outcome.c_str());
+                const int owner = query_client;
+                settle.reset();
+                query_client = -1;
+                finish_owner(owner, outcome);
+            }
+        }
         if (query) {
             xs8_monitor_record records[8];
             size_t copied = 0;
@@ -578,7 +647,7 @@ int main(int argc, char **argv)
         std::string& input = clients[selected].input;
         char buffer[256];
         ssize_t size = read(client, buffer, sizeof(buffer));
-        if ((query || probe) && query_client == client) {
+        if ((query || probe || settle) && query_client == client) {
             if (size < 0 && (errno == EAGAIN || errno == EINTR)) continue;
             close_client(selected);
             continue;
@@ -593,7 +662,22 @@ int main(int argc, char **argv)
                 input.erase(0, newline + 1);
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 auto received = VolumeControl::Clock::now();
-                if ((query || probe) && line != "STATUS" &&
+                if (settle && (line.compare(0, 13, "VOLUME_PRESS ") == 0 ||
+                               line == "MUTE")) {
+                    // A settle has transmitted nothing, so a volume press or MUTE
+                    // (CEC) preempts it instead of being refused, then follows its
+                    // normal path and gates. The query owner gets a refusal and
+                    // may ask again; nothing is retried here.
+                    std::fprintf(stderr, "XS8 QUERY_STATUS settle preempted by "
+                                         "%s; nothing sent\n",
+                                 line == "MUTE" ? "MUTE" : "VOLUME_PRESS");
+                    const int owner = query_client;
+                    settle.reset();
+                    query_client = -1;
+                    // A failed reply is cleaned up when the owner socket closes.
+                    reply(owner, "ERR QUERY_STATUS reason=PREEMPTED\n");
+                }
+                if ((query || probe || settle) && line != "STATUS" &&
                     line != "RESEARCH_CONTEXT_STATUS" &&
                     line.compare(0, 15, "VOLUME_RELEASE ") != 0) {
                     if (!reply(client, probe ? "ERR CD_PROBE reason=SESSION_BUSY\n"
@@ -619,7 +703,8 @@ int main(int argc, char **argv)
                                  receiver.status_fields().find(" receiver_integrity=HEALTHY") ==
                                      std::string::npos)
                             result = "ERR RESEARCH_CONTEXT reason=MONITOR_OR_RECEIVER_INTEGRITY\n";
-                        else if (query || probe || (research && research->active()) ||
+                        else if (query || probe || settle ||
+                                 (research && research->active()) ||
                                  (chain && chain->active()) || research_tx_uncertain || stopping)
                             result = "ERR RESEARCH_CONTEXT reason=SESSION_BUSY\n";
                         else result = context_preparation.prepare(
@@ -891,7 +976,8 @@ int main(int argc, char **argv)
                         if (stopping) denied = "ERR CONTEXT_SESSION reason=SHUTDOWN\n";
                         else if (research_tx_uncertain)
                             denied = "ERR CONTEXT_SESSION reason=TX_UNCERTAIN_LATCHED\n";
-                        else if (query || probe || (research && research->active()) ||
+                        else if (query || probe || settle ||
+                                 (research && research->active()) ||
                                  (chain && chain->active()) || context_preparation.active())
                             denied = "ERR CONTEXT_SESSION reason=SESSION_BUSY\n";
                         else if (receiver.status_fields().find(" receiver_integrity=HEALTHY") ==
@@ -1002,7 +1088,7 @@ int main(int argc, char **argv)
                     if (!reply(client, result)) failed = true;
                     continue;
                 }
-                if (line == "QUERY_STATUS") {
+                if (line == "QUERY_STATUS" || line == "QUERY_STATUS SETTLE") {
                     if (query) {
                         if (!reply(client,
                                    "ERR QUERY_STATUS reason=SESSION_BUSY\n"))
@@ -1019,26 +1105,23 @@ int main(int argc, char **argv)
                             failed = true;
                         continue;
                     }
-                    query_cursor = xs8_monitor_checkpoint(monitor);
-                    std::string result = core.begin_query_status(received);
-                    if ((result.empty() || result.find("reason=TX_UNCERTAIN") !=
-                           std::string::npos) && transmitter.last_end_ns())
-                        receiver.suppress_until(transmitter.last_end_ns() +
-                                                Xs8QueryStatus::kWindowNs);
-                    if (result.empty()) {
-                        if (!transmitter.last_start_ns() ||
-                            transmitter.last_end_ns() <
-                                transmitter.last_start_ns()) {
+                    if (line == "QUERY_STATUS SETTLE") {
+                        // Holds the RX slot without transmitting; the loop sends
+                        // the one query frame once the bus is quiet.
+                        const int64_t settle_now = xs8_gpio_now_ns();
+                        if (settle_now <= 0) {
                             if (!reply(client,
-                                "ERR QUERY_STATUS reason=TX_TIME_UNAVAILABLE\n"))
+                                       "ERR QUERY_STATUS reason=CLOCK_FAILED\n"))
                                 failed = true;
                             continue;
                         }
-                        query.emplace(transmitter.last_start_ns(),
-                                      transmitter.last_end_ns());
+                        settle = Settle{(uint64_t)settle_now, (uint64_t)settle_now +
+                                        Xs8QueryStatus::kSettleMaxNs};
                         query_client = client;
                         break;
                     }
+                    const std::string result = start_query(client);
+                    if (result.empty()) break;
                     if (!reply(client, result)) failed = true;
                     continue;
                 }
@@ -1072,7 +1155,26 @@ int main(int argc, char **argv)
                         continue;
                     }
                 }
+                // A local source or MONITOR command may change what the receiver
+                // reports: once any frame of it was attempted (verified or not),
+                // the current observation is cleared and kept only as last-known.
+                const bool source_command = line.compare(0, 14, "SELECT_SOURCE ") == 0;
+                const bool monitor_command = line == "TAPE2_MONITOR_TOGGLE";
+                const int64_t command_ns = xs8_gpio_now_ns();
+                transmitter.mark();
                 std::string result = core.command(line, received, received, client_id);
+                if ((source_command || monitor_command) && transmitter.marked_frames()) {
+                    const uint64_t floor_ns = transmitter.marked_start_ns()
+                        ? transmitter.marked_start_ns()
+                        : command_ns > 0 ? (uint64_t)command_ns : 0;
+                    if (source_command) receiver.forget_source(floor_ns);
+                    else receiver.forget_monitor(floor_ns);
+                    std::fprintf(stderr, "XS8 RECEIVER %s cleared after local TX "
+                                         "floor_ns=%llu %s\n",
+                                 source_command ? "source" : "monitor",
+                                 (unsigned long long)floor_ns,
+                                 receiver.last_known_fields().c_str());
+                }
                 if (line == "STATUS" && context_preparation.active() &&
                     result.compare(0, 14, "OK state=IDLE ") == 0)
                     result.replace(3, 10, "state=RESEARCH_PREPARATION");

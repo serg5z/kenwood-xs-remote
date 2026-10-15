@@ -548,7 +548,8 @@ std::string Xs8ServiceCore::command(const std::string& line, Time received,
     // is ROOT 0xA1 (physically observed through CD_STOP on the KR-V6070; the earlier
     // 0x9C could provoke a changer restart on a following VIDEO1/VIDEO2 selection).
     // 0xBC is a historical PLAY/PAUSE mapping, not yet verified.
-    // ROOT 0x52 is physically observed; 0x62 is historical. Never CONTEXT 0x39.
+    // ROOT 0x52 ON and 0x62 OFF are physically verified; idempotence is not
+    // assumed. Never CONTEXT 0x39.
     if (line == "POWER_ON") return power(0x52, "ON");
     if (line == "POWER_OFF") return power(0x62, "OFF");
     // CONTEXT 0x48: historical MONITOR toggle, not yet physically validated.

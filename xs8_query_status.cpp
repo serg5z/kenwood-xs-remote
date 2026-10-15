@@ -126,15 +126,22 @@ bool Xs8QueryStatus::successful(uint64_t now_ns) const
 std::string Xs8QueryStatus::response(uint64_t now_ns) const
 {
     Fault fault = fault_;
+    // After a verified echo: NO_REPLY is a clean silent window, PARTIAL a single
+    // frame. Neither is an observation; every other fault keeps its own reason.
     if (fault == Fault::NONE && now_ns >= deadline_ns_ && count_ < 3)
-        fault = count_ ? Fault::MISSING : Fault::TX_MISSING;
+        fault = count_ == 0 ? Fault::TX_MISSING :
+                count_ == 1 ? Fault::NO_REPLY : Fault::PARTIAL;
     const bool pair = count_ == 3;
     const bool success = fault == Fault::NONE && pair;
     const char *reason = "NONE";
     switch (fault) {
-    case Fault::NONE: reason = pair ? "NONE" : "MISSING"; break;
+    case Fault::NONE:
+        reason = pair ? "NONE" : count_ == 1 ? "NO_REPLY" :
+                 count_ == 2 ? "PARTIAL" : "TX_MISSING";
+        break;
     case Fault::TX_MISSING: reason = "TX_MISSING"; break;
-    case Fault::MISSING: reason = "MISSING"; break;
+    case Fault::NO_REPLY: reason = "NO_REPLY"; break;
+    case Fault::PARTIAL: reason = "PARTIAL"; break;
     case Fault::TX_INVALID: reason = "TX_INVALID"; break;
     case Fault::TX_MISMATCH: reason = "TX_MISMATCH"; break;
     case Fault::EVENT_GAP: reason = "EVENT_GAP"; break;

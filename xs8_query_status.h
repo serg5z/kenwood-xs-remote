@@ -12,6 +12,12 @@
 class Xs8QueryStatus {
 public:
     static constexpr uint64_t kWindowNs = 500000000ULL;
+    // QUERY_STATUS SETTLE (provisional): transmit only once there has been no
+    // local TX for kSettleTxNs and no bus frame for kSettleBusNs, waiting at most
+    // kSettleMaxNs. 600 ms clears the changer's 0x94 report ~320 ms after STOP.
+    static constexpr uint64_t kSettleTxNs = 600000000ULL;
+    static constexpr uint64_t kSettleBusNs = 200000000ULL;
+    static constexpr uint64_t kSettleMaxNs = 1500000000ULL;
     Xs8QueryStatus(uint64_t tx_start_ns, uint64_t tx_end_ns);
     void observe(const xs8_monitor_record *records, size_t count);
     void overflow();
@@ -25,7 +31,7 @@ public:
     std::string response(uint64_t now_ns) const;
 private:
     enum class Fault {
-        NONE, TX_MISSING, MISSING, TX_INVALID, TX_MISMATCH, EVENT_GAP,
+        NONE, TX_MISSING, NO_REPLY, PARTIAL, TX_INVALID, TX_MISMATCH, EVENT_GAP,
         HISTORY_OVERFLOW, MONITOR_FAILED, CANCELLED, OVERLAP, INCOMPLETE,
         EXTRA, OUT_OF_ORDER
     };
