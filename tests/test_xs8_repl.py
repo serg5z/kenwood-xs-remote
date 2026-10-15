@@ -1,5 +1,8 @@
 import importlib.util
 import os
+import subprocess
+import sys
+import types
 import socketserver
 import tempfile
 import threading
@@ -393,6 +396,208 @@ class ReplTests(unittest.TestCase):
                      ["send", "0xFC", "0xEC", "--gap-ms", "200", "--gap-ms", "200"]):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 repl.parse_send(args, 1500)
+
+
+REPL_PATH = Path(__file__).resolve().parents[1] / "xs8_repl.py"
+
+
+class FakeReadline:
+    def __init__(self):
+        self.calls = []
+        self.items = []
+
+    def set_auto_history(self, enabled):
+        self.calls.append(("auto", enabled))
+
+    def clear_history(self):
+        self.calls.append(("clear",))
+        self.items.clear()
+
+    def add_history(self, line):
+        self.items.append(line)
+
+    def __getattr__(self, name):
+        if "history_file" in name or name.startswith("append_history"):
+            raise AssertionError(f"history must stay session-local: {name}")
+        raise AttributeError(name)
+
+
+class Tty:
+    def __init__(self, tty):
+        self.tty = tty
+
+    def isatty(self):
+        return self.tty
+
+
+class LineHistoryTests(unittest.TestCase):
+    def test_only_new_non_empty_commands_are_added(self):
+        module = FakeReadline()
+        history = repl.LineHistory(module)
+        self.assertEqual(module.calls, [("auto", False), ("clear",)])
+        for line in ("status", "status", "", "   ", "query", " query ", "status",
+                     "send 0x9C", "send 0x9C"):
+            history.add(line)
+        self.assertEqual(module.items, ["status", "query", "status", "send 0x9C"])
+
+    def test_editing_is_enabled_only_for_an_interactive_terminal(self):
+        imported = []
+
+        def importer(name):
+            imported.append(name)
+            return FakeReadline()
+
+        for stdin, stdout in ((Tty(False), Tty(True)), (Tty(True), Tty(False)),
+                              (object(), Tty(True))):
+            self.assertIsNone(repl.enable_line_editing(stdin, stdout, importer))
+        self.assertEqual(imported, [], "pipes and scripts never load readline")
+        self.assertIsInstance(repl.enable_line_editing(Tty(True), Tty(True), importer),
+                              repl.LineHistory)
+
+    def test_missing_or_incomplete_readline_falls_back_to_plain_input(self):
+        def missing(_):
+            raise ImportError("no readline on this platform")
+
+        self.assertIsNone(repl.enable_line_editing(Tty(True), Tty(True), missing))
+        # Without set_auto_history, confirmation answers would enter history.
+        self.assertIsNone(repl.enable_line_editing(
+            Tty(True), Tty(True), lambda _: types.SimpleNamespace(add_history=print)))
+
+
+class PipedInputTests(unittest.TestCase):
+    def test_piped_stdin_is_unchanged_and_never_loads_readline(self):
+        wrapper = ("import runpy, sys\n"
+                   f"sys.argv = ['xs8_repl.py', '--socket', '/nonexistent/xs8.sock']\n"
+                   f"runpy.run_path({str(REPL_PATH)!r}, run_name='__main__')\n"
+                   "print('readline_loaded=' + str('readline' in sys.modules), "
+                   "file=sys.stderr)\n")
+        result = subprocess.run([sys.executable, "-c", wrapper], input="help\n\nquit\n",
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("readline_loaded=False", result.stderr)
+        self.assertTrue(result.stdout.startswith("XS8 research console."))
+        self.assertEqual(result.stdout.count("xs8> "), 3)
+        self.assertIn("status | query | send 0xNN", result.stdout)
+        self.assertNotIn("\x1b", result.stdout)
+
+
+@unittest.skipUnless(hasattr(os, "openpty"), "needs a pseudo-terminal")
+class TerminalHistoryTests(ReplTests):
+    """The real REPL on a pseudo-terminal, against the fake service."""
+
+    for _name in [n for n in dir(ReplTests) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name
+
+    UP, LEFT = "\x1b[A", "\x1b[D"
+
+    def setUp(self):
+        super().setUp()
+        import pty
+        self.master, slave = pty.openpty()
+        env = dict(os.environ, TERM="xterm", PYTHONUNBUFFERED="1")
+        self.proc = subprocess.Popen([sys.executable, str(REPL_PATH), "--socket", self.path],
+                                     stdin=slave, stdout=slave, stderr=slave, env=env,
+                                     close_fds=True, start_new_session=True)
+        os.close(slave)
+        self.screen = bytearray()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+
+    def tearDown(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+        os.close(self.master)
+        super().tearDown()
+
+    def _read(self):
+        while True:
+            try:
+                data = os.read(self.master, 4096)
+            except OSError:
+                return
+            if not data:
+                return
+            self.screen.extend(data)
+
+    def wait(self, predicate, what, timeout=8.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        self.fail(f"timed out waiting for {what}; screen tail: {bytes(self.screen[-300:])!r}")
+
+    def text(self):
+        return self.screen.decode("utf-8", "replace")
+
+    def key(self, keys, prompts=None):
+        os.write(self.master, keys.encode())
+        if prompts is not None:
+            self.wait(lambda: self.text().count("xs8> ") >= prompts, f"prompt {prompts}")
+
+    def sent(self, command):
+        with self.server.lock:
+            return self.server.commands.count(command)
+
+    def test_arrows_edit_and_recall_without_executing(self):
+        self.wait(lambda: "xs8> " in self.text(), "first prompt")
+        self.key("status\r", prompts=2)
+        self.assertEqual(self.sent("STATUS"), 1)
+        # Up only recalls the line: nothing is sent until Enter.
+        self.key(self.UP)
+        time.sleep(0.6)
+        self.assertEqual(self.sent("STATUS"), 1)
+        self.key("\r", prompts=3)
+        self.assertEqual(self.sent("STATUS"), 2)
+        # Left moves the cursor: "qury" becomes "query" before Enter.
+        self.key("qury" + self.LEFT * 2 + "e\r", prompts=4)
+        self.assertEqual(self.sent("QUERY_STATUS"), 1)
+        # A repeated and an empty command add no entries: history is
+        # status, query, status, so two Up presses reach "query".
+        self.key("status\r", prompts=5)
+        self.key("status\r", prompts=6)
+        self.key("\r", prompts=7)
+        self.key(self.UP + self.UP)
+        time.sleep(0.3)
+        self.assertEqual(self.sent("QUERY_STATUS"), 1)
+        self.key("\r", prompts=8)
+        self.assertEqual(self.sent("QUERY_STATUS"), 2)
+        self.assertEqual(self.sent("STATUS"), 4)
+
+    def test_confirmation_answers_are_never_recallable(self):
+        self.wait(lambda: "xs8> " in self.text(), "first prompt")
+        self.key("context enter\r")
+        self.wait(lambda: "Type ENTER CONTEXT ATTENDED" in self.text(), "confirmation")
+        self.key("NO\r", prompts=2)
+        self.assertIn("CONTEXT entry declined", self.text())
+        # Up recalls the command, not the answer typed at the safety prompt.
+        self.key(self.UP + "\r")
+        self.wait(lambda: self.text().count("Type ENTER CONTEXT ATTENDED") == 2,
+                  "second confirmation")
+        self.key("NO\r", prompts=3)
+        self.assertNotIn("unknown command", self.text())
+        with self.server.lock:
+            self.assertEqual(self.server.commands, [], "declining sends nothing")
+
+    def test_reverse_search_recalls_a_command(self):
+        import readline
+        if "libedit" in (readline.__doc__ or ""):
+            self.skipTest("Ctrl+R search is tested with GNU readline (the Pi)")
+        self.wait(lambda: "xs8> " in self.text(), "first prompt")
+        self.key("query\r", prompts=2)
+        self.key("status\r", prompts=3)
+        self.key("\x12quer")
+        time.sleep(0.3)
+        self.assertEqual(self.sent("QUERY_STATUS"), 1, "searching executes nothing")
+        self.key("\r", prompts=4)
+        self.assertEqual(self.sent("QUERY_STATUS"), 2)
+
+    def test_quit_still_exits(self):
+        self.wait(lambda: "xs8> " in self.text(), "first prompt")
+        self.key("quit\r")
+        self.assertEqual(self.proc.wait(timeout=8), 0)
 
 
 if __name__ == "__main__":

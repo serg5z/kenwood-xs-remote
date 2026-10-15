@@ -2,9 +2,11 @@
 """Local XS8 research console. All GPIO access remains in xs8-service."""
 
 import argparse
+import importlib
 import re
 import shlex
 import socket
+import sys
 import threading
 import time
 
@@ -541,11 +543,56 @@ class Console:
             self.history.append(f"{display_command}: interrupted after {index} records")
 
 
+class LineHistory:
+    """Session-local line editing and command history for an interactive terminal.
+
+    readline's automatic history is switched off and only command lines are
+    added here, so answers typed at confirmation prompts (for example the
+    CONTEXT phrase) can never be recalled. Recalling a line only edits the
+    prompt; Enter alone executes it. Nothing is read from or written to a file.
+    """
+
+    def __init__(self, module):
+        self.readline = module
+        self.last = None
+        module.set_auto_history(False)
+        clear = getattr(module, "clear_history", None)
+        if clear:
+            clear()
+
+    def add(self, line):
+        entry = line.strip()
+        if not entry or entry == self.last:
+            return
+        self.readline.add_history(entry)
+        self.last = entry
+
+
+def enable_line_editing(stdin=None, stdout=None, importer=importlib.import_module):
+    """LineHistory for a terminal session, or None (pipes, scripts, no readline)."""
+    stdin = sys.stdin if stdin is None else stdin
+    stdout = sys.stdout if stdout is None else stdout
+    try:
+        if not (stdin.isatty() and stdout.isatty()):
+            return None
+    except (AttributeError, ValueError):
+        return None
+    try:
+        module = importer("readline")
+    except ImportError:
+        return None
+    # Without this switch every confirmation answer would enter history.
+    if not hasattr(module, "set_auto_history"):
+        return None
+    return LineHistory(module)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Local XS8 research console")
     parser.add_argument("--socket", default=DEFAULT_SOCKET)
     args = parser.parse_args()
     console = Console(args.socket)
+    editor = enable_line_editing()
     print("XS8 research console. Type help. SEND requires the service's "
           "default-off --enable-research-tx authorization; chains also "
           "require --enable-research-chain; CONTEXT sessions also require "
@@ -553,7 +600,10 @@ def main():
     try:
         while True:
             try:
-                if not console.command(input("xs8> ")):
+                line = input("xs8> ")
+                if editor:
+                    editor.add(line)
+                if not console.command(line):
                     break
             except EOFError:
                 break

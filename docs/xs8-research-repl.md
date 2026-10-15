@@ -4,6 +4,14 @@
 
 From the repository root, run `python3 xs8_repl.py [--socket /tmp/kenwood-xs8.sock]`. Starting the REPL sends no XS8 command. Type `help` for `status`, `query`, `send 0xNN [milliseconds]`, `observe N`, `set observe N`, `history`, and `quit`. The default post-TX observation window is 1500 ms; the server accepts windows of 1–5000 ms. `query` invokes the existing `QUERY_STATUS` request and does not depend on research TX authorization. `observe` is passive and can operate with research TX disabled if the monitor is healthy.
 
+**Line editing (interactive terminals only).** When both stdin and stdout are a terminal and Python's `readline` is available, the prompt supports Left/Right editing, Up/Down command history and, where the library provides it, Ctrl+R reverse search (GNU readline on the Pi; macOS libedit may differ).
+- History lives only for the session; no history file is read or written.
+- Empty lines and an immediately repeated command are not stored.
+- Recalling a line only places it at the prompt: Enter alone executes it.
+- readline's automatic history is switched off, so answers typed at confirmation prompts (such as the CONTEXT entry phrase) are never stored or recallable.
+- With piped or scripted stdin, or without `readline`, input is read exactly as before.
+- The existing `history` command still lists this session's experiment results, not typed commands.
+
 The attended **preparation-only** `context` commands below are available. They never enter receiver context or transmit the proposed experiment. General `context enter/send` remains unimplemented, and raw logical `0x17` remains forbidden in both single-byte and chained research TX.
 
 Example transcript (illustrative; **not** a recorded hardware result):
