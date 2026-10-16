@@ -18,6 +18,14 @@ time after the last trial, in back-to-back passive RESEARCH_OBSERVE windows.
 Any frame there stops the run, so a late report such as the DE -> 7D seen
 about 6 s after DISC SKIP is not lost between trials. Observation sends nothing.
 
+--grouped N sends the plan in consecutive groups of N prefixes (unattended
+style inside a group). Before each group it shows the group's prefixes and
+waits for the operator to restore the changer by hand and type
+"start-group N"; after each group it shows what was sent and waits for "ok"
+or "anomaly". ANOMALY stops with the changer left as it is. The harness sends
+no probe or reset. This is a group-level check: no pair is physically
+verified.
+
 --correlate-journal checks a finished log against an exported service
 journal: every OBSERVED_BUS frame in the run must be an echo of a logged TX.
 
@@ -93,6 +101,16 @@ def parse_byte(text):
     return int(text, 16)
 
 
+def make_groups(candidates, size):
+    """Consecutive groups of the full plan; numbering never depends on resume."""
+    groups = []
+    for number, start in enumerate(range(0, len(candidates), size), 1):
+        members = candidates[start:start + size]
+        groups.append({"number": number, "members": members,
+                       "first_rank": members[0]["rank"], "last_rank": members[-1]["rank"]})
+    return groups
+
+
 def load_candidates(path, set_name, unattended=False):
     """Returns (suffix, candidates, skipped). Each skipped item has a skip_reason.
 
@@ -135,10 +153,11 @@ def load_candidates(path, set_name, unattended=False):
 
 
 UNATTENDED = "unattended-rx-only"
+GROUPED = "grouped-operator"
 
 
 def approval_digest(set_name, suffix, gap_ms, window_ms, candidates, mode=None, delay_s=None,
-                    observe_delay=False):
+                    observe_delay=False, group_size=None):
     """Binds an approval to the exact set, order, suffix and timing.
 
     The attended digest keeps its original form. The unattended mode adds the
@@ -149,6 +168,8 @@ def approval_digest(set_name, suffix, gap_ms, window_ms, candidates, mode=None, 
         head += [f"mode={mode}", f"delay_s={delay_s:g}"]
         if observe_delay:
             head.append("observe_delay=1")
+        if group_size is not None:
+            head.append(f"group_size={group_size}")
     text = "|".join(head + [f"{c['rank']}:0x{c['value']:02X}" for c in candidates])
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
@@ -219,7 +240,7 @@ class MockService:
         self.current = None
 
     def _status(self):
-        if self.current is None:
+        if self.current is None or self.current[0] is None:
             return self.IDLE
         prefix, phase = self.current
         key = "pre_status" if phase == "pre" else "post_status"
@@ -333,7 +354,7 @@ class MockService:
 class Sweep:
     def __init__(self, service, suffix, candidates, *, gap_ms, window_ms, delay_s,
                  log, output=print, ask=input, sleep=time.sleep, attended=True,
-                 observe_delay=False):
+                 observe_delay=False, groups=None):
         self.service = service
         self.suffix = suffix
         self.candidates = candidates
@@ -348,6 +369,9 @@ class Sweep:
         self.attended = attended
         self.observe_delay = observe_delay
         self.covered_until_ns = None
+        self.groups = groups
+        self.group = None
+        self.group_plan = []
 
     def _read(self, command, deadline):
         """Indexed read-only requests may be repeated after ERR BUSY; nothing else is."""
@@ -388,7 +412,17 @@ class Sweep:
         try:
             return self._run()
         except Stop as stop:
+            if self.groups is not None:
+                self._stop_status()
             return self._finish(stop.verdict, stop.detail, self.current)
+
+    def _stop_status(self):
+        """Grouped runs leave the state for manual investigation: record it, change nothing."""
+        try:
+            line = self.service.request("STATUS")
+        except (OSError, ValueError) as error:
+            line = f"unavailable: {error}"
+        self.log.write({"event": "stop_status", "status": line, "at": now()})
 
     def panel_check(self, completed):
         word, answer = self.checkpoint(
@@ -422,6 +456,8 @@ class Sweep:
             window = min(MAX_OBSERVE_MS, remaining)
             record = {"event": "observe", "after": f"0x{candidate['value']:02X}",
                       "window_ms": window, "final": final}
+            if self.group is not None:
+                record["group"] = self.group
             try:
                 reply = self.service.request(f"RESEARCH_OBSERVE {window}")
                 record["reply"] = reply
@@ -463,6 +499,82 @@ class Sweep:
         if self.interrupted:
             raise Stop("OPERATOR_ABORT", "interrupt during passive observation")
 
+    def _run_grouped(self):
+        """Operator prompts before and after every group; the harness sends only the pairs."""
+        pending = [g for g in self.groups if g["plan"]]
+        self.output(f"GROUPED: {len(pending)} group(s) to send, prefix -> 0x{self.suffix:02X}, "
+                    f"gap {self.gap_ms} ms, window {self.window_ms} ms, delay {self.delay_s:g} s"
+                    + (" with passive observation" if self.observe_delay else "")
+                    + ". The operator checks the changer before and after every group.")
+        for group in self.groups:
+            if not group["plan"]:
+                self.log.write({"event": "group_skipped", "group": group["number"],
+                                "reason": "every prefix already sent in this log"})
+        for group in pending:
+            self._before_group(group)
+            self.group = group["number"]
+            self.group_plan = group["plan"]
+            self.log.write(group_record("group_start", group))
+            for position, candidate in enumerate(group["plan"]):
+                self.current = candidate
+                if self.interrupted:
+                    raise Stop("OPERATOR_ABORT", "interrupt before trial")
+                self.trial(candidate)
+                if self.interrupted:
+                    raise Stop("OPERATOR_ABORT", "interrupt during trial")
+                last = position == len(group["plan"]) - 1
+                if self.observe_delay:
+                    self._observe_quiet(candidate, final=last)
+                elif not last:
+                    self._wait(candidate)
+            self.log.write(group_record("group_end", group))
+            self.current = None
+            self._after_group(group)
+            self.group = None
+        return self._finish(
+            "SET_COMPLETE_GROUPED",
+            f"all {sum(len(g['plan']) for g in pending)} pairs sent in {len(pending)} group(s) "
+            "and the operator reported every group OK. Group-level check only: no per-prefix "
+            "physical verification, no prefix is a verified negative, and DISC SELECT is not "
+            "ruled out")
+
+    def _operator(self, phase, group, prompt, allowed):
+        word, answer = self.checkpoint(prompt, allowed)
+        self.log.write({"event": "checkpoint", "phase": phase, "group": group["number"],
+                        "answer": answer, "at": now()})
+        if word == "abort":
+            raise Stop("OPERATOR_ABORT", f"{phase} group {group['number']}")
+        return word, answer
+
+    def _before_group(self, group):
+        """Show the group, then wait for the operator's manual baseline and explicit start."""
+        self.output(f"NEXT: group {group['number']}, ranks {group['first_rank']}-"
+                    f"{group['last_rank']}, {len(group['plan'])} prefix(es) in order: "
+                    + " ".join(f"0x{c['value']:02X}" for c in group["plan"]))
+        while True:
+            _, answer = self._operator(
+                "before", group, f"Restore the changer's known initial state by hand. Nothing is "
+                f"sent until you type 'start-group {group['number']}' (or 'abort'): ",
+                ("start-group", "abort"))
+            if answer.split()[1:] == [str(group["number"])]:
+                return
+            self.output(f"Type exactly: start-group {group['number']}")
+
+    def _after_group(self, group):
+        """Show what was just sent; ANOMALY stops with the changer left as it is."""
+        self.output(f"DONE: group {group['number']}, ranks {group['first_rank']}-"
+                    f"{group['last_rank']}, sent in order: "
+                    + " ".join(f"0x{c['value']:02X}" for c in group["plan"]))
+        word, answer = self._operator(
+            "after", group, "Check the changer state and digit/track selection by hand. Type "
+            "'ok <note>', 'anomaly <description>' or 'abort': ", ("ok", "anomaly", "abort"))
+        if word == "anomaly":
+            raise Stop("OPERATOR_ANOMALY",
+                       f"group {group['number']} (ranks {group['first_rank']}-"
+                       f"{group['last_rank']}: " + " ".join(f"0x{c['value']:02X}"
+                                                             for c in group["plan"])
+                       + f"): {answer}. Changer state left for REPL investigation")
+
     def _run_unattended(self):
         """No checkpoints or resets: continue only while TX, STATUS and RX stay clean."""
         self.output(f"{len(self.candidates)} trial(s), UNATTENDED RX-ONLY: prefix -> "
@@ -490,6 +602,8 @@ class Sweep:
             "and no candidate is a verified negative; no wider set is started")
 
     def _run(self):
+        if self.groups is not None:
+            return self._run_grouped()
         if not self.attended:
             return self._run_unattended()
         completed = 0
@@ -538,9 +652,12 @@ class Sweep:
                             "is started", None)
 
     def _finish(self, verdict, detail, candidate=None):
-        record = {"event": "stop", "verdict": verdict, "detail": detail}
+        record = {"event": "stop", "verdict": verdict, "detail": detail, "at": now()}
         if candidate:
             record["prefix"] = f"0x{candidate['value']:02X}"
+            record["rank"] = candidate["rank"]
+        if self.group is not None:
+            record["group"] = self.group
         self.log.write(record)
         self.output(f"STOP {verdict}: {detail}")
         return verdict
@@ -551,7 +668,15 @@ class Sweep:
                   "suffix": f"0x{self.suffix:02X}", "tier": candidate.get("tier"),
                   "gap_ms": self.gap_ms, "window_ms": self.window_ms,
                   "chain_sent": False, "started": now()}
-        self.output(f"Trial rank {candidate['rank']}: 0x{prefix:02X} -> 0x{self.suffix:02X}")
+        if self.group is not None:
+            record["group"] = self.group
+        if self.group is not None:
+            position = next(i for i, c in enumerate(self.group_plan, 1) if c is candidate)
+            self.output(f">>> GROUP {self.group} | TRIAL {position}/{len(self.group_plan)} | "
+                        f"RANK {candidate['rank']} | PREFIX 0x{prefix:02X} -> 0x{self.suffix:02X} "
+                        f"| {datetime.datetime.now().strftime('%H:%M:%S')}")
+        else:
+            self.output(f"Trial rank {candidate['rank']}: 0x{prefix:02X} -> 0x{self.suffix:02X}")
         try:
             if hasattr(self.service, "prepare"):
                 self.service.prepare(prefix)
@@ -653,6 +778,13 @@ class Sweep:
                        f" differ from the sent 0x{prefix:02X} 0x{self.suffix:02X}")
 
 
+def group_record(event, group):
+    return {"event": event, "group": group["number"], "first_rank": group["first_rank"],
+            "last_rank": group["last_rank"],
+            "prefixes": [f"0x{c['value']:02X}" for c in group["members"]],
+            "plan": [f"0x{c['value']:02X}" for c in group["plan"]], "at": now()}
+
+
 def timing(tx_lines, rx_lines=()):
     """Durations and offsets in ms, relative to the start of the first TX frame."""
     tx = [xs8_repl.fields(line) for line in tx_lines]
@@ -682,8 +814,15 @@ def correlate(log_records, journal_lines):
     frame is an echo when it starts inside a logged TX window (1 ms slack for
     the journal's microsecond rounding). Everything else is reported.
     """
-    tx_windows, deadlines = [], []
+    tx_windows, deadlines, group_spans = [], [], {}
     for record in log_records:
+        if "group" in record and record.get("done"):
+            d = xs8_repl.fields(record["done"])
+            if "start_ns" in d and "deadline_ns" in d:
+                low, high = group_spans.get(record["group"], (None, None))
+                start, end = int(d["start_ns"]) // 1000, int(d["deadline_ns"]) // 1000
+                group_spans[record["group"]] = (start if low is None else min(low, start),
+                                                end if high is None else max(high, end))
         for line in record.get("tx", []):
             f = xs8_repl.fields(line)
             tx_windows.append((int(f["tx_start_ns"]) // 1000, int(f["tx_end_ns"]) // 1000,
@@ -694,8 +833,8 @@ def correlate(log_records, journal_lines):
             if deadline:
                 deadlines.append(int(deadline) // 1000)
     if not tx_windows:
-        return {"frames": 0, "echoes": 0, "non_echo": [], "journal_tx_missing": [],
-                "unlogged_tx": [], "span_us": None}
+        return {"frames": 0, "echoes": 0, "non_echo": [], "between_groups": [],
+                "journal_tx_missing": [], "unlogged_tx": [], "span_us": None}
     span = (min(w[0] for w in tx_windows) - 1000, max(deadlines + [w[1] for w in tx_windows]))
     frames, journal_tx = [], []
     for line in journal_lines:
@@ -709,20 +848,32 @@ def correlate(log_records, journal_lines):
             frames.append((mono, f.get("waveform_lsb"), f.get("legacy_msb_short1"), line.strip()))
         elif " XS8 TX 0x" in line:
             journal_tx.append((mono, line.split(" XS8 TX ", 1)[1].split()[0]))
-    echoes, non_echo = 0, []
+    echoes, non_echo, between_groups = 0, [], []
     for mono, waveform, label, line in frames:
         match = [w for w in tx_windows if w[0] - 1000 <= mono <= w[1] and w[2] == waveform]
         if match:
             echoes += 1
         else:
             before = [w for w in tx_windows if w[0] <= mono]
-            non_echo.append({"mono_us": mono, "waveform": waveform, "legacy": label,
-                             "after_prefix": before[-1][3] if before else None,
-                             "ms_after_last_tx": round((mono - before[-1][0]) / 1000, 1)
-                             if before else None, "line": line})
+            entry = {"mono_us": mono, "waveform": waveform, "legacy": label,
+                     "after_prefix": before[-1][3] if before else None,
+                     "ms_after_last_tx": round((mono - before[-1][0]) / 1000, 1)
+                     if before else None, "line": line}
+            groups = [g for g, (low, high) in group_spans.items() if low <= mono <= high]
+            if group_spans and not groups:
+                between_groups.append(entry)  # Operator checkpoint time: reported only.
+            else:
+                entry["group"] = groups[0] if groups else None
+                non_echo.append(entry)
     logged = {(w[0], w[2]) for w in tx_windows}
+    if group_spans:
+        inside = lambda mono: any(low <= mono <= high for low, high in group_spans.values())
+        between_groups += [{"mono_us": m, "tx": b} for m, b in journal_tx
+                           if (m, b) not in logged and not inside(m)]
+        journal_tx = [(m, b) for m, b in journal_tx if (m, b) in logged or inside(m)]
     journal_tx_set = set(journal_tx)
     return {"span_us": span, "frames": len(frames), "echoes": echoes, "non_echo": non_echo,
+            "between_groups": between_groups,
             "journal_tx_missing": sorted(f"{m}:{b}" for m, b in logged - journal_tx_set),
             "unlogged_tx": sorted(f"{m}:{b}" for m, b in journal_tx_set - logged)}
 
@@ -761,6 +912,8 @@ def main(argv=None):
                         help="no operator checkpoints or resets; anomaly discovery only")
     parser.add_argument("--observe-delay", action="store_true",
                         help="unattended only: passive observation through every delay")
+    parser.add_argument("--grouped", type=int, metavar="N",
+                        help="groups of N prefixes, each followed by an operator checkpoint")
     parser.add_argument("--correlate-journal", metavar="JOURNAL",
                         help="offline: check --log against an exported service journal")
     parser.add_argument("--auto-observe", action="store_true",
@@ -776,11 +929,21 @@ def main(argv=None):
             and not result["unlogged_tx"]
         print("CORRELATION " + ("CLEAN: every frame is an echo of a logged TX" if clean
                                 else "FOUND FRAMES OR TX NOT ACCOUNTED FOR"))
+        if result["between_groups"]:
+            print(f"NOTE: {len(result['between_groups'])} frame(s) or TX during operator "
+                  "checkpoints, outside every group's capture span (listed above)")
         return 0 if clean else 1
     if not args.set_name:
         parser.error("--set is required")
-    if args.observe_delay and not args.unattended_rx_only:
-        parser.error("--observe-delay needs --unattended-rx-only")
+    if args.grouped is not None:
+        if args.unattended_rx_only:
+            parser.error("--grouped has its own checkpoints; drop --unattended-rx-only")
+        if args.grouped < 1:
+            parser.error("--grouped needs a group size of at least 1")
+        if args.max_trials:
+            parser.error("--max-trials does not apply to --grouped")
+    if args.observe_delay and not (args.unattended_rx_only or args.grouped):
+        parser.error("--observe-delay needs --unattended-rx-only or --grouped")
 
     if not xs8_repl.MIN_GAP_MS <= args.gap_ms <= xs8_repl.MAX_GAP_MS:
         parser.error("--gap-ms must be 50..1000")
@@ -789,12 +952,18 @@ def main(argv=None):
     if args.delay_s < 0 or args.max_trials < 0:
         parser.error("--delay-s and --max-trials must not be negative")
     try:
-        suffix, candidates, skipped = load_candidates(args.candidates, args.set_name,
-                                                      unattended=args.unattended_rx_only)
+        suffix, candidates, skipped = load_candidates(
+            args.candidates, args.set_name,
+            unattended=args.unattended_rx_only or args.grouped is not None)
     except (OSError, ValueError, KeyError) as error:
         parser.error(f"candidate file: {error}")
-    mode = UNATTENDED if args.unattended_rx_only else "attended"
-    if args.unattended_rx_only:
+    mode = (GROUPED if args.grouped is not None else
+            UNATTENDED if args.unattended_rx_only else "attended")
+    if args.grouped is not None:
+        digest = approval_digest(args.set_name, suffix, args.gap_ms, args.observe_ms,
+                                 candidates, mode=GROUPED, delay_s=args.delay_s,
+                                 observe_delay=args.observe_delay, group_size=args.grouped)
+    elif args.unattended_rx_only:
         digest = approval_digest(args.set_name, suffix, args.gap_ms, args.observe_ms,
                                  candidates, mode=UNATTENDED, delay_s=args.delay_s,
                                  observe_delay=args.observe_delay)
@@ -810,7 +979,8 @@ def main(argv=None):
 
     print(f"Set {args.set_name}: {len(candidates)} candidate(s), suffix 0x{suffix:02X}, "
           f"gap {args.gap_ms} ms, window {args.observe_ms} ms, mode {mode}"
-          + (f", delay {args.delay_s:g} s" if args.unattended_rx_only else "")
+          + (f", delay {args.delay_s:g} s" if args.unattended_rx_only or args.grouped else "")
+          + (f", groups of {args.grouped}" if args.grouped else "")
           + (", passive observation through delays" if args.observe_delay else "")
           + f", digest {digest}")
     for c in skipped:
@@ -819,6 +989,15 @@ def main(argv=None):
         if c["value"] in done:
             print(f"  skip 0x{c['value']:02X} (rank {c['rank']}): sent in {args.log}")
     print("  plan: " + " ".join(f"{c['rank']}:0x{c['value']:02X}" for c in plan))
+    groups = None
+    if args.grouped is not None:
+        groups = make_groups(candidates, args.grouped)
+        for group in groups:
+            group["plan"] = [c for c in group["members"] if c["value"] not in done]
+            print(f"  group {group['number']}: ranks {group['first_rank']}-{group['last_rank']}, "
+                  f"{len(group['members'])} prefix(es)"
+                  + (f", {len(group['plan'])} to send" if done else "") + ": "
+                  + " ".join(f"0x{c['value']:02X}" for c in group["members"]))
     if args.list:
         return 0
     if not plan:
@@ -827,13 +1006,17 @@ def main(argv=None):
     ask = input
     if args.auto_observe and not args.dry_run:
         parser.error("--auto-observe is only for --dry-run")
-    if args.auto_observe and args.unattended_rx_only:
+    if args.auto_observe and args.unattended_rx_only and args.grouped is None:
         parser.error("--auto-observe does not apply to --unattended-rx-only")
     if args.dry_run:
         service = MockService()
         if args.auto_observe:
             def ask(prompt):
-                if "What did the changer do" in prompt:
+                if "digit/track selection" in prompt:
+                    answer = "ok dry-run"
+                elif "start-group" in prompt:
+                    answer = "start-group " + prompt.split("'start-group ", 1)[1].split("'")[0]
+                elif "What did the changer do" in prompt:
                     answer = "t4"
                 elif "front-panel check" in prompt:
                     answer = "panel-ok dry-run"
@@ -856,7 +1039,8 @@ def main(argv=None):
     log = JsonLog(args.log if args.log else "/dev/null")
     sweep = Sweep(service, suffix, plan, gap_ms=args.gap_ms, window_ms=args.observe_ms,
                   delay_s=args.delay_s, log=log, ask=ask,
-                  attended=not args.unattended_rx_only, observe_delay=args.observe_delay)
+                  attended=not args.unattended_rx_only, observe_delay=args.observe_delay,
+                  groups=groups)
 
     def interrupt(signum, frame):
         sweep.interrupted = True
@@ -868,7 +1052,8 @@ def main(argv=None):
                "suffix": f"0x{suffix:02X}", "gap_ms": args.gap_ms,
                "window_ms": args.observe_ms, "delay_s": args.delay_s,
                "dry_run": args.dry_run, "mode": mode,
-               "observe_delay": args.observe_delay, "plan": [f"0x{c['value']:02X}" for c in plan],
+               "observe_delay": args.observe_delay, "group_size": args.grouped,
+               "plan": [f"0x{c['value']:02X}" for c in plan],
                "started": now()})
     try:
         verdict = sweep.run()
@@ -876,7 +1061,8 @@ def main(argv=None):
         signal.signal(signal.SIGINT, previous)
         signal.signal(signal.SIGTERM, previous_term)
         log.close()
-    return 0 if verdict in ("SET_COMPLETE", "SET_COMPLETE_RX_SILENT") else 1
+    return 0 if verdict in ("SET_COMPLETE", "SET_COMPLETE_RX_SILENT",
+                            "SET_COMPLETE_GROUPED") else 1
 
 
 if __name__ == "__main__":

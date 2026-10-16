@@ -652,6 +652,210 @@ class CorrelationTest(unittest.TestCase):
         self.assertEqual(len(result["journal_tx_missing"]), 2)
 
 
+def grouped_script(group_count, after="ok d2 t4 playing"):
+    script = []
+    for number in range(1, group_count + 1):
+        script += [f"start-group {number}", after]
+    return script
+
+
+def run_grouped(replies=None, scenario=None, size=4, count=10, done=(), interrupt_after=None):
+    suffix, loaded, _ = sweep.load_candidates(CANDIDATES, "structural-26", unattended=True)
+    groups = sweep.make_groups(loaded[:count], size)
+    for group in groups:
+        group["plan"] = [c for c in group["members"] if f"{c['value']:02X}" not in done]
+    service = sweep.MockService(scenario)
+    log = MemoryLog()
+    out = []
+    if replies is None:
+        replies = grouped_script(len([g for g in groups if g["plan"]]))
+    scripted = answers(*replies)
+    runner = None
+
+    def operator(prompt):
+        service.clock_ns += 20_000_000_000  # Each answer takes the operator time.
+        return scripted(prompt)
+    if interrupt_after is not None:
+        original = service.request
+
+        def request(command):
+            reply = original(command)
+            if (command.startswith("RESEARCH_CHAIN") and
+                    len(chains(service)) == interrupt_after):
+                runner.interrupted = True  # The operator's visual abort (SIGTERM).
+            return reply
+        service.request = request
+    runner = sweep.Sweep(service, suffix, [c for g in groups for c in g["plan"]], gap_ms=200,
+                         window_ms=3000, delay_s=8.0, log=log, output=out.append,
+                         ask=operator, sleep=lambda s: None, attended=True,
+                         observe_delay=True, groups=groups)
+    return runner.run(), service, log, out
+
+
+def transmissions(service):
+    """Every request that could put a frame on the bus."""
+    return [c for c in service.commands
+            if c.split()[0] in ("RESEARCH_CHAIN", "RESEARCH_SEND", "QUERY_STATUS")
+            or c.startswith(("CD_", "VOLUME", "MUTE", "SELECT_SOURCE", "CONTEXT"))]
+
+
+GROUP_PREFIXES = [RANKED_26[1:5], RANKED_26[5:9], RANKED_26[9:11]]
+
+
+class GroupedTest(unittest.TestCase):
+    def test_real_plan_splits_into_eleven_twelves_and_a_ten(self):
+        _, candidates, _ = sweep.load_candidates(REAL_CANDIDATES, "filtered-169", unattended=True)
+        groups = sweep.make_groups(candidates, 12)
+        self.assertEqual([len(g["members"]) for g in groups], [12] * 11 + [10])
+        self.assertEqual([(g["first_rank"], g["last_rank"]) for g in groups],
+                         [(27 + 12 * i, 38 + 12 * i) for i in range(11)] + [(159, 168)])
+        self.assertEqual([c for g in groups for c in g["members"]], candidates)
+        self.assertNotIn(0xD4, [c["value"] for c in candidates])
+
+    def test_only_the_pairs_are_transmitted_in_original_order(self):
+        verdict, service, log, _ = run_grouped()
+        self.assertEqual(verdict, "SET_COMPLETE_GROUPED")
+        self.assertEqual(transmissions(service),
+                         [f"RESEARCH_CHAIN 2 200 3000 0x{b} 0x48"
+                          for group in GROUP_PREFIXES for b in group])
+        verbs = {c.split()[0] for c in service.commands}
+        self.assertEqual(verbs, {"STATUS", "RESEARCH_CHAIN", "RESEARCH_TX_READ",
+                                 "RESEARCH_READ", "RESEARCH_OBSERVE"})
+        detail = log.records[-1]["detail"]
+        self.assertNotIn("group", log.records[-1])  # Completion belongs to no single group.
+        self.assertIn("no per-prefix physical verification", detail)
+        self.assertIn("no prefix is a verified negative", detail)
+
+    def test_prompts_show_the_exact_prefixes_before_and_after_each_group(self):
+        _, _, log, out = run_grouped()
+        nexts = [line for line in out if line.startswith("NEXT: group")]
+        dones = [line for line in out if line.startswith("DONE: group")]
+        self.assertEqual(nexts[0], "NEXT: group 1, ranks 2-5, 4 prefix(es) in order: "
+                                   "0xCA 0xA8 0xBA 0xAA")
+        self.assertEqual(dones[1], "DONE: group 2, ranks 6-9, sent in order: "
+                                   "0xFA 0x0A 0x1A 0x2A")
+        self.assertEqual(len(nexts), 3)
+        self.assertEqual(len(dones), 3)
+        # Strict order: NEXT, then the pairs, then DONE, for every group.
+        events = [r["event"] for r in log.records if r["event"] in
+                  ("checkpoint", "group_start", "group_end")]
+        self.assertEqual(events, ["checkpoint", "group_start", "group_end", "checkpoint"] * 3)
+        phases = [r["phase"] for r in log.records if r["event"] == "checkpoint"]
+        self.assertEqual(phases, ["before", "after"] * 3)
+
+    def test_nothing_is_sent_before_the_first_start(self):
+        verdict, service, _, _ = run_grouped(["abort"])
+        self.assertEqual(verdict, "OPERATOR_ABORT")
+        self.assertEqual(transmissions(service), [])
+        verdict, service, _, _ = run_grouped([])  # Input closed at the first prompt.
+        self.assertEqual(verdict, "CHECKPOINT_SKIPPED")
+        self.assertEqual(transmissions(service), [])
+
+    def test_next_group_never_starts_without_explicit_start(self):
+        for script in (["start-group 1", "ok"],                      # Input ends.
+                       ["start-group 1", "ok", "abort"],
+                       ["start-group 1", "ok", "start-group 1", "go", "start", "abort"]):
+            verdict, service, _, out = run_grouped(script)
+            self.assertIn(verdict, ("CHECKPOINT_SKIPPED", "OPERATOR_ABORT"), script)
+            self.assertEqual(len(chains(service)), 4, script)
+        self.assertEqual(out.count("Type exactly: start-group 2"), 1)  # Wrong number.
+        self.assertEqual(out.count("Answer one of: start-group, abort"), 2)  # "go", "start".
+
+    def test_after_group_requires_an_explicit_ok(self):
+        script = ["start-group 1", "", "fine", "ok all normal", "start-group 2", "ok",
+                  "start-group 3", "ok"]
+        verdict, service, log, out = run_grouped(script)
+        self.assertEqual(verdict, "SET_COMPLETE_GROUPED")
+        self.assertEqual(out.count("Answer one of: ok, anomaly, abort"), 2)
+
+    def test_anomaly_stops_and_leaves_everything_as_it_is(self):
+        for at_group, chains_sent in ((1, 4), (2, 8), (3, 10)):
+            script = grouped_script(at_group)[:-1] + ["anomaly disc changed to 3"]
+            verdict, service, log, _ = run_grouped(script)
+            self.assertEqual(verdict, "OPERATOR_ANOMALY")
+            self.assertEqual(len(chains(service)), chains_sent)
+            self.assertEqual(service.commands[-1], "STATUS")  # Only a read afterwards.
+            stop_status, stop = log.records[-2], log.records[-1]
+            self.assertEqual(stop_status["event"], "stop_status")
+            self.assertEqual(stop["group"], at_group)
+            for prefix in GROUP_PREFIXES[at_group - 1]:
+                self.assertIn(f"0x{prefix}", stop["detail"])
+            self.assertIn("disc changed to 3", stop["detail"])
+
+    def test_abort_after_a_group_stops(self):
+        verdict, service, _, _ = run_grouped(["start-group 1", "abort"])
+        self.assertEqual(verdict, "OPERATOR_ABORT")
+        self.assertEqual(len(chains(service)), 4)
+
+    def test_current_candidate_is_shown_prominently(self):
+        _, _, _, out = run_grouped()
+        banners = [line for line in out if line.startswith(">>> GROUP")]
+        self.assertEqual(len(banners), 10)
+        self.assertRegex(banners[0], r"^>>> GROUP 1 \| TRIAL 1/4 \| RANK 2 \| PREFIX 0xCA -> 0x48 "
+                                     r"\| \d\d:\d\d:\d\d$")
+        self.assertIn(">>> GROUP 3 | TRIAL 2/2 | RANK 11 | PREFIX 0x4A -> 0x48", banners[-1])
+
+    def test_visual_abort_preserves_the_exact_trial_and_changes_nothing(self):
+        verdict, service, log, _ = run_grouped(interrupt_after=7)
+        self.assertEqual(verdict, "OPERATOR_ABORT")
+        self.assertEqual(transmissions(service)[-1], "RESEARCH_CHAIN 2 200 3000 0x1A 0x48")
+        trial = log.trials()[-1]
+        self.assertEqual((trial["prefix"], trial["rank"], trial["group"], trial["verdict"]),
+                         ("0x1A", 8, 2, "RX_SILENT"))
+        self.assertTrue(trial["started"] and trial["ended"] and trial["rx"])
+        self.assertIn("state=IDLE", trial["post_status"])
+        stop_status, stop = log.records[-2], log.records[-1]
+        self.assertEqual(stop_status["event"], "stop_status")
+        self.assertEqual((stop["verdict"], stop["prefix"], stop["rank"], stop["group"]),
+                         ("OPERATOR_ABORT", "0x1A", 8, 2))
+        self.assertEqual(service.commands[-1], "STATUS")
+
+    def test_automatic_stops_inside_a_group_keep_working(self):
+        cases = {"POSSIBLE_DISC_CHANGE": {0x1A: {"rx": [(1150, 0xD4)]}},
+                 "UNEXPECTED_RX": {0x0A: {"between_rx": [(2000, 0x7D)]}},
+                 "TX_FAILURE": {0x1A: {"tx_fail": 1}},
+                 "MONITOR_FAULT": {0x1A: {"monitor_failed": True}},
+                 "ANOMALOUS_STATUS": {0x1A: {"post_status": sweep.MockService.IDLE.replace(
+                     "receiver_integrity=HEALTHY", "receiver_integrity=UNCERTAIN")}}}
+        for verdict, scenario in cases.items():
+            result, service, log, _ = run_grouped(scenario=scenario)
+            self.assertEqual(result, verdict)
+            self.assertEqual(log.records[-1]["group"], 2)
+            self.assertEqual(log.records[-2]["event"], "stop_status")
+            self.assertFalse([r for r in log.records if r["event"] == "checkpoint"
+                              and r["group"] == 2 and r["phase"] == "after"])
+
+    def test_resume_keeps_group_numbers_and_skips_finished_groups(self):
+        done = RANKED_26[1:5] + RANKED_26[5:7]
+        script = ["start-group 2", "ok", "start-group 3", "ok"]
+        result, service, log, _ = run_grouped(script, done=done)
+        self.assertEqual(result, "SET_COMPLETE_GROUPED")
+        self.assertEqual([r["group"] for r in log.records if r["event"] == "group_skipped"], [1])
+        starts = [r for r in log.records if r["event"] == "group_start"]
+        self.assertEqual([(g["group"], g["plan"]) for g in starts],
+                         [(2, ["0x1A", "0x2A"]), (3, ["0x3A", "0x4A"])])
+
+    def test_correlation_separates_group_spans_from_operator_time(self):
+        _, _, log, _ = run_grouped()
+        records = log.records
+        lines = CorrelationTest().journal(records)
+        group1_end = max(int(sweep.xs8_repl.fields(r["done"])["deadline_ns"]) // 1000
+                         for r in records if r.get("group") == 1 and r.get("done"))
+        group2 = [t for t in log.trials() if t["group"] == 2][0]
+        inside = int(sweep.xs8_repl.fields(group2["tx"][1])["tx_end_ns"]) // 1000 + 1_500_000
+        lines += [f"x: mono_us={group1_end + 10_000_000} XS8 OBSERVED_BUS status=VALID "
+                  "waveform_lsb=0x84 legacy_msb_short1=0xDE",
+                  f"x: mono_us={group1_end + 11_000_000} XS8 TX 0x38 timing result=TX_OK"]
+        result = sweep.correlate(records, lines)
+        self.assertEqual((result["non_echo"], result["unlogged_tx"]), ([], []))
+        self.assertEqual(len(result["between_groups"]), 2)
+        self.assertEqual(result["echoes"], len(log.trials()) * 2)
+        lines.append(f"x: mono_us={inside} XS8 OBSERVED_BUS status=VALID waveform_lsb=0xD4 "
+                     "legacy_msb_short1=0xD4")
+        result = sweep.correlate(records, lines)
+        self.assertEqual([(e["legacy"], e["group"]) for e in result["non_echo"]], [("0xD4", 2)])
+
+
 class CommandLineTest(unittest.TestCase):
     def main(self, *args, stdin=""):
         out = io.StringIO()
@@ -795,6 +999,61 @@ class CommandLineTest(unittest.TestCase):
                       text)
         self.assertEqual(text.count(": already tested"), 26)
         self.assertIn("skip 0xD4 (rank 169): reserved for an attended experiment", text)
+
+    def grouped_args(self, *extra):
+        return ("--candidates", str(REAL_CANDIDATES), "--set", "filtered-169", "--grouped", "12",
+                "--observe-delay", "--delay-s", "8") + extra
+
+    def test_grouped_listing_digest_and_groups(self):
+        code, text = self.main(*self.grouped_args("--list"))
+        self.assertEqual(code, 0)
+        self.assertIn("mode grouped-operator, delay 8 s, groups of 12, passive observation "
+                      "through delays, digest a98d41d7120e1070", text)
+        self.assertIn("group 1: ranks 27-38, 12 prefix(es): 0x00 0x01", text)
+        self.assertIn("group 12: ranks 159-168, 10 prefix(es): 0xF3", text)
+        self.assertIn("skip 0xD4 (rank 169): reserved for an attended experiment", text)
+
+    def test_grouped_digest_covers_mode_and_group_size(self):
+        suffix, candidates, _ = sweep.load_candidates(REAL_CANDIDATES, "filtered-169",
+                                                      unattended=True)
+
+        def digest(mode=sweep.GROUPED, size=12):
+            return sweep.approval_digest("filtered-169", suffix, 200, 3000, candidates, mode=mode,
+                                         delay_s=8.0, observe_delay=True, group_size=size)
+        self.assertEqual(digest(), "a98d41d7120e1070")
+        self.assertEqual(digest(sweep.UNATTENDED, None), "fd87fc32fb88cf68")
+        self.assertEqual(len({digest(), digest(size=11), digest(size=10), digest(sweep.UNATTENDED)}), 4)
+
+    def test_other_digests_cannot_start_a_grouped_run(self):
+        for digest in ("fd87fc32fb88cf68", "c2d03a77f3e2396f"):
+            with patch.object(sweep, "SocketService") as real:
+                code, text = self.main(*self.grouped_args("--log", "/dev/null", "--approve", digest),
+                                       stdin=sweep.START_PHRASE)
+                self.assertEqual(code, 2)
+                self.assertIn("Refused", text)
+                real.assert_not_called()
+
+    def test_grouped_option_conflicts(self):
+        for extra in (("--unattended-rx-only",), ("--max-trials", "3")):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                self.main(*self.grouped_args("--dry-run", *extra))
+
+    def test_grouped_dry_run_end_to_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "run.jsonl"
+            with patch.object(sweep.xs8_repl, "request") as real:
+                code, text = self.main(*self.grouped_args("--dry-run", "--auto-observe",
+                                                          "--log", str(log)))
+                real.assert_not_called()
+            self.assertEqual(code, 0)
+            self.assertIn("STOP SET_COMPLETE_GROUPED", text)
+            records = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual((records[0]["mode"], records[0]["group_size"]),
+                             ("grouped-operator", 12))
+            self.assertEqual(len([r for r in records if r["event"] == "trial"]), 142)
+            self.assertEqual([r["phase"] for r in records if r["event"] == "checkpoint"],
+                             ["before", "after"] * 12)
+            self.assertFalse([r for r in records if r["event"] in ("probe", "digit_check")])
 
     def test_observe_delay_needs_unattended(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
