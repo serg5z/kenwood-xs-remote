@@ -269,6 +269,12 @@ enum ControlOutcome: Equatable, Sendable {
         case .txVerified(let r), .nothingSent(let r), .uncertain(let r), .fault(let r): r
         }
     }
+
+    /// Anything but a clean refusal may have started Gateway-side spacing.
+    var sentSomething: Bool {
+        if case .nothingSent = self { return false }
+        return true
+    }
 }
 
 extension TransportError {

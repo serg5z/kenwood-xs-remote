@@ -109,6 +109,40 @@ actor GatewayClient {
         }
     }
 
+    /// `GET /api/v1/status` alone. It needs no Gateway session (none is
+    /// created) and transmits nothing on the XS8 bus.
+    func status() async -> Result<StatusResponse, GatewayIssue> {
+        await enterLane()
+        defer { leaveLane() }
+        do {
+            return .success(try await fetchStatus())
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    /// `GET /api/v1/session`: confirms the session cookie (the Gateway issues a
+    /// new one if it no longer knows it) and takes the session's current CSRF
+    /// token and availability. A read; nil when every control gate is off.
+    func session() async -> Result<SessionAvailability?, GatewayIssue> {
+        await enterLane()
+        defer { leaveLane() }
+        do {
+            return .success(try await fetchSession())
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    /// Replaces the session cookie (or drops it with nil) and forgets any token
+    /// that belonged to the previous one.
+    func useSessionCookie(_ cookie: String?) async {
+        await enterLane()
+        defer { leaveLane() }
+        if cookie != sessionCookie { csrfToken = nil }
+        sessionCookie = cookie
+    }
+
     private func fetchStatus() async throws(GatewayIssue) -> StatusResponse {
         let (data, response) = try await get(.status)
         // 503 is a well-formed Gateway reply: the Gateway is up, the service is not.

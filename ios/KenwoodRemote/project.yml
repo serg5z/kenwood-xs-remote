@@ -17,9 +17,20 @@ targets:
     platform: iOS
     sources:
       - path: KenwoodRemote
+      - path: Shared
       # The private CA (public certificate only). Not tracked; see README.md.
       - path: Local/KenwoodCA.der
         buildPhase: resources
+    dependencies:
+      - target: KenwoodControls
+    entitlements:
+      path: KenwoodRemote/KenwoodRemote.entitlements
+      properties:
+        # The shared group comes first (new items go there); the app's own
+        # group stays readable for the one-time credential migration.
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)local.woodland.KenwoodRemote.shared
+          - $(AppIdentifierPrefix)local.woodland.KenwoodRemote
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: local.woodland.KenwoodRemote
@@ -31,6 +42,47 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         ENABLE_PREVIEWS: YES
+  # Control Center controls (iOS 18+). Compiles the app's Gateway client and
+  # credential store directly rather than through a separate framework.
+  KenwoodControls:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: KenwoodControls
+      - path: Shared
+      - path: KenwoodRemote/Gateway
+      - path: KenwoodRemote/Credentials
+      # Source, used by the control command model in Gateway/.
+      - path: KenwoodRemote/State/ReceiverDisplay.swift
+      - path: Local/KenwoodCA.der
+        buildPhase: resources
+    info:
+      path: KenwoodControls/Info.plist
+      properties:
+        CFBundleDisplayName: Kenwood Controls
+        CFBundleName: $(PRODUCT_NAME)
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundlePackageType: $(PRODUCT_BUNDLE_PACKAGE_TYPE)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleInfoDictionaryVersion: "6.0"
+        CFBundleDevelopmentRegion: $(DEVELOPMENT_LANGUAGE)
+        NSLocalNetworkUsageDescription: Kenwood Controls connects to the Raspberry Pi gateway (woodland-pi.local) on your home network.
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      path: KenwoodControls/KenwoodControls.entitlements
+      properties:
+        # Shared credentials, then the extension's own group (session cookie).
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)local.woodland.KenwoodRemote.shared
+          - $(AppIdentifierPrefix)local.woodland.KenwoodRemote.KenwoodControls
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.woodland.KenwoodRemote.KenwoodControls
+        TARGETED_DEVICE_FAMILY: "1"
   KenwoodRemoteTests:
     type: bundle.unit-test
     platform: iOS

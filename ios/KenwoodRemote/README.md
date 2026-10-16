@@ -30,6 +30,50 @@ It enables only what the Gateway's capabilities advertise:
   - An uncertain START gets one stop-only RELEASE without `hold_id`.
   - The release runs inside an OS background task. The service lease (1.2 s), the Gateway's 1.5 s browser timeout and the maxima remain the backstops.
 
+## Control Center (`KenwoodControls`, iOS 18+)
+
+A WidgetKit extension, embedded in the app, provides:
+
+- **Control Center buttons** (`ControlWidgetButton`): Open Kenwood (`OpenIntent`); Kenwood Status, a diagnostic that sends only `GET /api/v1/status`; MUTE; Volume +; Volume −.
+  - Volume is one step per tap. There is no hold.
+  - Every hardware action requires an unlocked device (`authenticationPolicy = .requiresAuthentication`). No state is ever shown on the buttons.
+
+How a control tap runs (`Shared/ExtensionCommandRunner.swift`):
+
+1. It reads the password from the shared keychain group `TWMHP49N84.local.woodland.KenwoodRemote.shared`. The app moves its credentials into this group once, copying before deleting.
+2. It runs `GET /session`: that confirms or renews the session cookie and fetches a fresh one-use token and the Gateway's current availability.
+3. It sends one POST, using the app's outcome policy, never retried.
+
+The rules around that:
+
+- One tap at a time per extension process. A tap that arrives meanwhile is dropped.
+- **Separate session:** the extension keeps its own Gateway session, so it never uses up the app's CSRF tokens. Its cookie lives in the extension-only keychain group.
+- **Cookie lifetime:** 25 minutes from when the Gateway issued it, because the Gateway's 30 minutes start at creation and use doesn't extend them. No CSRF token is ever stored.
+- **Results:** each tap's command, timing and result are saved for Kenwood → Details → Control Center.
+
+## Platform findings (iOS 26.7.1, iPhone 13 mini)
+
+Recorded from the Control Center, Lock Screen and snippet spikes (2026-10-15). All spike code has been removed.
+
+- **Control Center buttons** work.
+  - Shared keychain, pinned TLS and Local Network access all work from the extension.
+  - iOS reuses the extension process between taps (run #10 observed). A status read typically completes in about 574 ms.
+  - From the Lock Screen, iOS asks for Face ID before running an action.
+  - Keychain sharing works with the existing wildcard team profile (`keychain-access-groups TWMHP49N84.*`). No account changes were needed.
+- **Lock Screen widgets:** dropped.
+  - A four-button `accessoryRectangular` widget (`Button(intent:)`) triggered each button's own action reliably, but the targets were too small for comfortable use.
+  - A single-tap "Open Kenwood" launcher widget wasn't useful enough to keep.
+- **Interactive snippet from a control** (`ShowsSnippetIntent` / `SnippetIntent`): negative result.
+  - The control's intent ran and returned `.result(snippetIntent:)`, the documented iOS 26 mechanism, but iOS never asked for the snippet itself and no panel appeared.
+  - Apple's documentation doesn't say that control actions present snippets. Closed.
+- **"Failed to load Asset / Could not load asset"** while adding a widget came from the Photos-based Lock Screen wallpaper, not from the widget. The sysdiagnose showed `PhotosPosterProvider: Failed to load layer stack from wallpaper … Code=260` at every editing session, and `assetsd` exited at the same time. The widget itself registered, rendered and ran its intents.
+- **Widget `ForEach` IDs must be Encodable.** Widget views are archived, so `ForEach(…, id: \.self)` over an `AppEnum` (which isn't `Codable`) triggers a SwiftUI fault `ID type is not Encodable`.
+- **Continuous press-and-hold** is not possible outside the app on iOS 26.
+  - Widget, Live Activity, control and snippet buttons run an intent only after a completed tap. They report no press, release or repeat.
+  - The system Now Playing FF/REW hold is reserved for the app whose audio session is playing.
+  - The NowPlaying `RemoteMediaSession` API, which has seek begin and end, needs iOS 27.
+- **Collecting device logs:** `xcrun devicectl device sysdiagnose --device <id>` (confirm on stdin). Then use `/usr/bin/log show --archive …/system_logs.logarchive`. In zsh, a bare `log` is a built-in command, not the macOS tool.
+
 ## Setup
 
 Requirements: Xcode 26 or later, [XcodeGen](https://github.com/yonaskolb/XcodeGen), an iOS 17+ device, and the Apple team set in `project.yml`.
@@ -78,7 +122,10 @@ KenwoodRemote/
                 outcome policy, GatewayClient (actor, serial lane)
   Credentials/  Keychain credential store
   State/        RemoteModel (@Observable) and its controls/holds, observation → display rules
-  Views/        main screen, account, details (live capabilities and STATUS)
+  Views/        main screen, account, details (live capabilities and STATUS, last Control Center run)
+KenwoodControls/  WidgetKit extension: Control Center buttons and their intents
+Shared/       compiled into app and extension: OpenIntent, extension command runner,
+                extension session-cookie store, Control Center diagnostic record
 KenwoodRemoteTests/
   Fixtures/     JSON produced by xs8_gateway.py itself; throwaway test PKI (no real certificates)
 ```

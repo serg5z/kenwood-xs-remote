@@ -12,6 +12,17 @@ struct GatewayConfiguration: Sendable {
 
     var baseURL: URL { URL(string: "https://\(host)")! }
 
+    /// The signing team's App ID prefix; keychain groups are named under it
+    /// (the team profile allows `TWMHP49N84.*`).
+    static let appIdentifierPrefix = "TWMHP49N84"
+    /// Shared by the app and the Control Center extension.
+    static let sharedKeychainGroup = "\(appIdentifierPrefix).local.woodland.KenwoodRemote.shared"
+    /// The app's own default group, where credentials lived before sharing.
+    static let legacyKeychainGroup = "\(appIdentifierPrefix).local.woodland.KenwoodRemote"
+    /// The Control Center extension's own group: its Gateway session cookie,
+    /// which the app cannot read.
+    static let extensionKeychainGroup = "\(appIdentifierPrefix).local.woodland.KenwoodRemote.KenwoodControls"
+
     static let woodland = GatewayConfiguration(
         host: "woodland-pi.local",
         // "Woodland Private CA", valid 2026-10-11 to 2036-10-08.

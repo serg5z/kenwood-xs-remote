@@ -274,7 +274,10 @@ final class RemoteModel {
 extension RemoteModel {
     static func live(configuration: GatewayConfiguration = .woodland,
                      beginBackgroundTask: @escaping BackgroundTaskStarter) -> RemoteModel {
-        RemoteModel(credentialStore: KeychainCredentialStore(server: configuration.host),
+        RemoteModel(credentialStore: KeychainCredentialStore(
+                        server: configuration.host,
+                        accessGroup: GatewayConfiguration.sharedKeychainGroup,
+                        legacyAccessGroup: GatewayConfiguration.legacyKeychainGroup),
                     beginBackgroundTask: beginBackgroundTask) { credentials in
             let anchor = try PinnedCertificateAuthority.load(configuration)
             let transport = URLSessionTransport(

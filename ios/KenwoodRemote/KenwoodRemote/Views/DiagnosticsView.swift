@@ -18,6 +18,30 @@ struct DiagnosticsView: View {
                         row("Control info", ConnectionState(issue).detail ?? ConnectionState(issue).title)
                     }
                 }
+                Section {
+                    row("Shared credentials", KeychainCredentialStore(
+                        server: GatewayConfiguration.woodland.host,
+                        accessGroup: GatewayConfiguration.sharedKeychainGroup).exists() ? "present" : "missing")
+                    if let run = ControlDiagnostic.load() {
+                        row("Last run", run.date.formatted(date: .omitted, time: .standard))
+                        row("Command", run.command ?? "STATUS")
+                        row("Result", run.summary)
+                        if let reused = run.sessionReused {
+                            row("Session", (reused ? "reused" : "new")
+                                + (run.sessionMs.map { " · \($0) ms" } ?? ""))
+                        }
+                        row("Process", "pid \(run.processID) · run #\(run.invocationInProcess)"
+                            + (run.processAgeMs.map { " · age \($0) ms" } ?? ""))
+                        row("Timing", "keychain \(run.keychainMs.map(String.init) ?? "—") ms · request "
+                            + "\(run.requestMs.map(String.init) ?? "—") ms · total \(run.totalMs) ms")
+                    } else {
+                        row("Last run", "none yet")
+                    }
+                } header: {
+                    Text("Control Center")
+                } footer: {
+                    Text("Written by the Kenwood controls: the last command, its timing and result.")
+                }
                 if let status = model.snapshot?.status.status {
                     Section("XS8 Service") {
                         ForEach(["state", "monitor", "stop_owed", "context_may_be_open",

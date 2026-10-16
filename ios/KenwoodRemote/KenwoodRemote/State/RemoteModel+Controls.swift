@@ -626,11 +626,3 @@ extension RemoteModel {
         }
     }
 }
-
-extension ControlOutcome {
-    /// Anything but a clean refusal may have started Gateway-side spacing.
-    var sentSomething: Bool {
-        if case .nothingSent = self { return false }
-        return true
-    }
-}
