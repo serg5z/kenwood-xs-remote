@@ -16,7 +16,14 @@ spec = importlib.util.spec_from_file_location("xs8_disc_select_sweep",
 sweep = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sweep)
 
-CANDIDATES = ROOT / "research" / "disc-select-candidates.json"
+REAL_CANDIDATES = ROOT / "research" / "disc-select-candidates.json"
+# Fixture: the real sets with only chain 9 (0x9A) marked tested, so the harness
+# tests keep a full structural-26 plan however far the real research has got.
+_fixture = json.loads(REAL_CANDIDATES.read_text())
+_fixture["tested"] = [t for t in _fixture["tested"] if t["byte"] == "0x9A"]
+_fixture_dir = tempfile.TemporaryDirectory()
+CANDIDATES = Path(_fixture_dir.name) / "candidates.json"
+CANDIDATES.write_text(json.dumps(_fixture))
 RANKED_26 = ("9A CA A8 BA AA FA 0A 1A 2A 3A 4A 5A B8 E8 F8 "
              "8C AC DC 0C 1C 2C 3C 5C 6C 7C 4C").split()
 
@@ -59,7 +66,8 @@ def no_questions(prompt):
 
 
 def run_unattended(candidates=None, scenario=None, interrupt_on_sleep=False,
-                   interrupt_after_chains=None):
+                   interrupt_after_chains=None, observe_delay=False, delay_s=5.0,
+                   interrupt_after_observes=None):
     suffix, loaded, _ = sweep.load_candidates(CANDIDATES, "structural-26")
     plan = loaded if candidates is None else [
         c for c in loaded if f"{c['value']:02X}" in candidates]
@@ -82,9 +90,19 @@ def run_unattended(candidates=None, scenario=None, interrupt_on_sleep=False,
                 runner.interrupted = True
             return reply
         service.request = counting
-    runner = sweep.Sweep(service, suffix, plan, gap_ms=200, window_ms=3000, delay_s=5.0,
+    if interrupt_after_observes is not None:
+        original_observe = service.request
+
+        def counting_observe(command):
+            reply = original_observe(command)
+            if (command.startswith("RESEARCH_OBSERVE") and
+                    len(service.observed) == interrupt_after_observes):
+                runner.interrupted = True
+            return reply
+        service.request = counting_observe
+    runner = sweep.Sweep(service, suffix, plan, gap_ms=200, window_ms=3000, delay_s=delay_s,
                          log=log, output=lambda line: None, ask=no_questions, sleep=sleep,
-                         attended=False)
+                         attended=False, observe_delay=observe_delay)
     with patch.object(sweep.time, "monotonic", side_effect=fake_clock(sleeps)):
         verdict = runner.run()
     return verdict, service, log, sleeps
@@ -160,8 +178,7 @@ class CandidateSetTest(unittest.TestCase):
         self.assertNotEqual(base, sweep.approval_digest("structural-26", suffix, 200, 3000, swapped))
 
     def test_9a_is_recorded_as_a_physical_negative(self):
-        tested = json.loads(CANDIDATES.read_text())["tested"]
-        self.assertEqual(len(tested), 1)
+        tested = json.loads(REAL_CANDIDATES.read_text())["tested"]
         entry = tested[0]
         self.assertEqual((entry["byte"], entry["suffix"], entry["chain_id"], entry["gap_ms"]),
                          ("0x9A", "0x48", 9, 214.1))
@@ -456,6 +473,185 @@ class UnattendedTest(unittest.TestCase):
             "structural-26", suffix, 250, 3000, candidates, mode=sweep.UNATTENDED, delay_s=5.0))
 
 
+class ExtendedPlanTest(unittest.TestCase):
+    """The real candidate file after the structural sweep."""
+
+    def test_filtered_169_leaves_142_unattended_candidates_in_documented_order(self):
+        data = json.loads(REAL_CANDIDATES.read_text())
+        tested = [t["byte"] for t in data["tested"]]
+        self.assertEqual(len(tested), 26)
+        self.assertEqual(len(set(tested)), 26)
+        self.assertEqual(sorted(int(b, 16) for b in tested),
+                         sorted(int(b, 16) for b in RANKED_26))
+        suffix, candidates, skipped = sweep.load_candidates(REAL_CANDIDATES, "filtered-169",
+                                                            unattended=True)
+        self.assertEqual(suffix, 0x48)
+        self.assertEqual(len(candidates), 142)
+        self.assertEqual(len({c["value"] for c in candidates}), 142)
+        self.assertEqual({f"0x{c['value']:02X}": c["skip_reason"] for c in skipped},
+                         dict({b: "already tested" for b in tested},
+                              **{"0xD4": "reserved for an attended experiment"}))
+        self.assertFalse({f"0x{c['value']:02X}" for c in candidates} & (set(tested) | {"0xD4"}))
+        documented = [e["byte"] for e in data["sets"]["filtered-169"]["candidates"]
+                      if e["byte"] not in tested and e["byte"] != "0xD4"]
+        self.assertEqual([f"0x{c['value']:02X}" for c in candidates], documented)
+        ranks = [c["rank"] for c in candidates]
+        self.assertEqual(ranks, sorted(ranks))
+        self.assertEqual((candidates[0]["rank"], f"{candidates[0]['value']:02X}"), (27, "00"))
+        self.assertEqual([f"{c['value']:02X}" for c in candidates[-2:]], ["A4", "C4"])
+        self.assertEqual(candidates[-1]["rank"], 168)
+        self.assertTrue({c["value"] for c in candidates} <= sweep.ALLOWED_PREFIXES)
+        _, structural, _ = sweep.load_candidates(REAL_CANDIDATES, "structural-26")
+        self.assertEqual(structural, [])
+
+    def test_d4_is_reserved_for_attended_runs_only(self):
+        reserved = json.loads(REAL_CANDIDATES.read_text())["reserved_attended"]
+        self.assertEqual([r["byte"] for r in reserved], ["0xD4"])
+        _, attended, _ = sweep.load_candidates(REAL_CANDIDATES, "filtered-169")
+        self.assertEqual(len(attended), 143)
+        self.assertEqual(f"{attended[-1]['value']:02X}", "D4")
+        data = json.loads(CANDIDATES.read_text())
+        data["reserved_attended"] = [{"byte": "0xA8"}]
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
+            json.dump(data, handle)
+            handle.flush()
+            _, plan, skipped = sweep.load_candidates(handle.name, "structural-26", unattended=True)
+            self.assertNotIn(0xA8, [c["value"] for c in plan])
+            self.assertIn(("0xA8", "reserved for an attended experiment"),
+                          [(f"0x{c['value']:02X}", c["skip_reason"]) for c in skipped])
+            _, plan, _ = sweep.load_candidates(handle.name, "structural-26")
+            self.assertIn(0xA8, [c["value"] for c in plan])
+
+    def test_unattended_trials_are_never_recorded_as_negatives(self):
+        tested = json.loads(REAL_CANDIDATES.read_text())["tested"]
+        for entry in tested[1:]:
+            self.assertTrue(entry["rx"].startswith("RX_SILENT"))
+            self.assertIn("Not a verified negative", entry["physical"])
+            self.assertFalse(entry["physical"].startswith("NEGATIVE"))
+        self.assertEqual([t["chain_id"] for t in tested[1:]], list(range(10, 35)))
+
+    def test_extended_digest_covers_list_order_timing_and_observation(self):
+        suffix, candidates, _ = sweep.load_candidates(REAL_CANDIDATES, "filtered-169",
+                                                      unattended=True)
+
+        def digest(items=candidates, delay=8.0, observe=True, gap=200, window=3000):
+            return sweep.approval_digest("filtered-169", suffix, gap, window, items,
+                                         mode=sweep.UNATTENDED, delay_s=delay,
+                                         observe_delay=observe)
+        self.assertEqual(digest(), "fd87fc32fb88cf68")
+        self.assertEqual(len({digest(), digest(delay=5.0), digest(observe=False),
+                              digest(gap=250), digest(window=2000), digest(candidates[1:]),
+                              digest([candidates[1], candidates[0]] + candidates[2:])}), 7)
+
+
+class ObserveDelayTest(unittest.TestCase):
+    def test_each_delay_and_the_tail_are_covered_by_passive_windows(self):
+        verdict, service, log, sleeps = run_unattended(["CA", "A8", "BA"], observe_delay=True,
+                                                       delay_s=8.0)
+        self.assertEqual(verdict, "SET_COMPLETE_RX_SILENT")
+        self.assertEqual(service.observed, [5000, 3000] * 3)
+        observes = [r for r in log.records if r["event"] == "observe"]
+        self.assertEqual([o["final"] for o in observes], [False] * 4 + [True] * 2)
+        self.assertEqual({o["verdict"] for o in observes}, {"QUIET"})
+        self.assertTrue(all("uncovered_ms" in o for o in observes))
+        self.assertTrue(all("uncovered_before_ms" in t for t in log.trials()[1:]))
+        self.assertNotIn(5.0, sleeps)  # The delay is observation, not sleep.
+        self.assertIn("quiet passive observation", log.records[-1]["detail"])
+        # Order: chain, two windows, chain, ...
+        verbs = [c.split()[0] for c in service.commands
+                 if c.startswith(("RESEARCH_CHAIN", "RESEARCH_OBSERVE"))]
+        self.assertEqual(verbs, ["RESEARCH_CHAIN", "RESEARCH_OBSERVE", "RESEARCH_OBSERVE"] * 3)
+
+    def test_frame_between_trials_stops_before_the_next_pair(self):
+        for label, verdict in ((0xDE, "UNEXPECTED_RX"), (0x7D, "UNEXPECTED_RX"),
+                               (0xD4, "POSSIBLE_DISC_CHANGE")):
+            result, service, log, _ = run_unattended(
+                ["CA", "A8", "BA"], {0xA8: {"between_rx": [(2700, label)]}},
+                observe_delay=True, delay_s=8.0)
+            self.assertEqual(result, verdict, hex(label))
+            self.assertEqual(len(chains(service)), 2)
+            self.assertIn("after 0xA8", log.records[-1]["detail"])
+            self.assertIn("2700.0 ms into a passive window", log.records[-1]["detail"])
+
+    def test_frame_after_the_last_trial_prevents_completion(self):
+        result, service, _, _ = run_unattended(["CA", "A8"], {0xA8: {"between_rx": [(100, 0xDE)]}},
+                                               observe_delay=True, delay_s=8.0)
+        self.assertEqual(result, "UNEXPECTED_RX")
+        self.assertEqual(len(chains(service)), 2)
+
+    def test_observation_fault_or_refusal_stops(self):
+        result, service, _, _ = run_unattended(["CA", "A8"], {0xCA: {"observe_monitor_failed": True}},
+                                               observe_delay=True, delay_s=8.0)
+        self.assertEqual(result, "MONITOR_FAULT")
+        self.assertEqual(len(chains(service)), 1)
+        suffix, loaded, _ = sweep.load_candidates(CANDIDATES, "structural-26")
+        service = sweep.MockService()
+        original = service.request
+        service.request = lambda c: ("ERR RESEARCH reason=SESSION_BUSY"
+                                     if c.startswith("RESEARCH_OBSERVE") else original(c))
+        runner = sweep.Sweep(service, suffix, loaded[:2], gap_ms=200, window_ms=3000,
+                             delay_s=8.0, log=MemoryLog(), output=lambda line: None,
+                             ask=no_questions, sleep=lambda s: None, attended=False,
+                             observe_delay=True)
+        self.assertEqual(runner.run(), "OBSERVE_REFUSED")
+        self.assertEqual(len(chains(service)), 1)
+
+    def test_interrupt_during_observation_stops_before_the_next_pair(self):
+        result, service, _, _ = run_unattended(["CA", "A8", "BA"], observe_delay=True,
+                                               delay_s=8.0, interrupt_after_observes=1)
+        self.assertEqual(result, "OPERATOR_ABORT")
+        self.assertEqual(len(chains(service)), 1)
+        self.assertEqual(service.observed, [5000])
+
+
+class CorrelationTest(unittest.TestCase):
+    def logged_run(self, scenario=None):
+        _, _, log, _ = run_unattended(["CA", "A8"], scenario, observe_delay=True, delay_s=8.0)
+        return log.records
+
+    def journal(self, records, extra=()):
+        lines = []
+        for record in records:
+            for line in record.get("tx", []):
+                f = sweep.xs8_repl.fields(line)
+                start = int(f["tx_start_ns"]) // 1000
+                byte = f["requested"]
+                lines.append(f"Oct 16 x xs8-service[1]: mono_us={start} XS8 TX {byte} timing "
+                             "result=TX_OK")
+                lines.append(f"Oct 16 x xs8-service[1]: mono_us={start + 31} XS8 OBSERVED_BUS "
+                             f"source=UNATTRIBUTED status=VALID waveform_lsb={byte} "
+                             f"legacy_msb_short1=0x{sweep.legacy(int(byte, 16)):02X}")
+        return lines + list(extra)
+
+    def test_echo_only_journal_is_clean(self):
+        records = self.logged_run()
+        result = sweep.correlate(records, self.journal(records))
+        self.assertEqual((result["frames"], result["echoes"], result["non_echo"]), (4, 4, []))
+        self.assertEqual((result["journal_tx_missing"], result["unlogged_tx"]), ([], []))
+
+    def test_late_frames_and_unlogged_tx_are_reported(self):
+        records = self.logged_run()
+        last_tx = max(int(sweep.xs8_repl.fields(line)["tx_start_ns"]) // 1000
+                      for record in records for line in record.get("tx", []))
+        extra = [f"x: mono_us={last_tx + 6_103_300} XS8 OBSERVED_BUS status=VALID "
+                 "waveform_lsb=0x84 legacy_msb_short1=0xDE",
+                 f"x: mono_us={last_tx + 4_000_000} XS8 TX 0xF9 timing result=TX_OK",
+                 f"x: mono_us={last_tx + 900_000_000} XS8 OBSERVED_BUS status=VALID "
+                 "waveform_lsb=0x41 legacy_msb_short1=0x7D"]  # Outside the span: ignored.
+        result = sweep.correlate(records, self.journal(records, extra))
+        self.assertEqual(len(result["non_echo"]), 1)
+        late = result["non_echo"][0]
+        self.assertEqual((late["legacy"], late["after_prefix"], late["ms_after_last_tx"]),
+                         ("0xDE", "0xA8", 6103.3))
+        self.assertEqual(result["unlogged_tx"], [f"{last_tx + 4_000_000}:0xF9"])
+
+    def test_missing_journal_tx_is_reported(self):
+        records = self.logged_run()
+        lines = [l for l in self.journal(records) if " XS8 TX 0x48" not in l]
+        result = sweep.correlate(records, lines)
+        self.assertEqual(len(result["journal_tx_missing"]), 2)
+
+
 class CommandLineTest(unittest.TestCase):
     def main(self, *args, stdin=""):
         out = io.StringIO()
@@ -588,6 +784,39 @@ class CommandLineTest(unittest.TestCase):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             self.main("--candidates", str(CANDIDATES), "--set", "structural-26", "--dry-run",
                       "--unattended-rx-only", "--auto-observe")
+
+    def test_extended_plan_listing_prints_the_approval_digest(self):
+        code, text = self.main("--candidates", str(REAL_CANDIDATES), "--set", "filtered-169",
+                               "--unattended-rx-only", "--observe-delay", "--delay-s", "8",
+                               "--list")
+        self.assertEqual(code, 0)
+        self.assertIn("142 candidate(s)", text)
+        self.assertIn("delay 8 s, passive observation through delays, digest fd87fc32fb88cf68",
+                      text)
+        self.assertEqual(text.count(": already tested"), 26)
+        self.assertIn("skip 0xD4 (rank 169): reserved for an attended experiment", text)
+
+    def test_observe_delay_needs_unattended(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.main("--candidates", str(CANDIDATES), "--set", "structural-26", "--dry-run",
+                      "--observe-delay")
+
+    def test_correlation_cli_exit_codes(self):
+        records = CorrelationTest().logged_run()
+        first = [r for r in records if r["event"] == "trial"][0]
+        with tempfile.TemporaryDirectory() as directory:
+            log, journal = Path(directory) / "run.jsonl", Path(directory) / "journal.txt"
+            log.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+            journal.write_text("\n".join(CorrelationTest().journal(records)) + "\n")
+            code, text = self.main("--log", str(log), "--correlate-journal", str(journal))
+            self.assertEqual(code, 0)
+            self.assertIn("CORRELATION CLEAN", text)
+            journal.write_text("\n".join(CorrelationTest().journal(records, [
+                f"x: mono_us={int(sweep.xs8_repl.fields(first['tx'][1])['tx_end_ns']) // 1000 + 1500000} "
+                "XS8 OBSERVED_BUS status=VALID waveform_lsb=0xD4 legacy_msb_short1=0xD4"])) + "\n")
+            code, text = self.main("--log", str(log), "--correlate-journal", str(journal))
+            self.assertEqual(code, 1)
+            self.assertIn("FOUND FRAMES", text)
 
     def test_one_set_per_run(self):
         code, text = self.main("--candidates", str(CANDIDATES), "--set", "structural-26",

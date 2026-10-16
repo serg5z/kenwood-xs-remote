@@ -13,6 +13,14 @@ pair is sent after a fixed delay while TX, STATUS and RX stay clean. Without
 resets it is an anomaly-discovery sweep only. Its RX_SILENT trials are never
 negatives, and a completed run does not rule out DISC SELECT.
 
+--observe-delay (unattended only) spends each inter-trial delay, and the same
+time after the last trial, in back-to-back passive RESEARCH_OBSERVE windows.
+Any frame there stops the run, so a late report such as the DE -> 7D seen
+about 6 s after DISC SKIP is not lost between trials. Observation sends nothing.
+
+--correlate-journal checks a finished log against an exported service
+journal: every OBSERVED_BUS frame in the run must be an echo of a logged TX.
+
 --dry-run talks to an in-process mock service and never opens the socket.
 """
 
@@ -42,6 +50,7 @@ F7 F8 FA FB FD FE FF""".split())
 assert len(ALLOWED_PREFIXES) == 169
 ALLOWED_SUFFIXES = frozenset({0x48})  # TRACK 4, physically validated.
 
+MAX_OBSERVE_MS = 5000  # The service's research window limit.
 DISC_CHANGE_LEGACY = 0xD4  # Candidate disc-change report; same in both notations.
 NOMINAL_STATUS = {
     "state": "IDLE", "stop_owed": "0", "context_may_be_open": "0",
@@ -84,7 +93,12 @@ def parse_byte(text):
     return int(text, 16)
 
 
-def load_candidates(path, set_name):
+def load_candidates(path, set_name, unattended=False):
+    """Returns (suffix, candidates, skipped). Each skipped item has a skip_reason.
+
+    Tested bytes are always skipped. Bytes listed under reserved_attended are
+    also skipped in unattended runs, but stay in attended plans.
+    """
     data = json.loads(Path(path).read_text())
     if data.get("schema") != 1:
         raise ValueError("unsupported candidate file schema")
@@ -96,6 +110,7 @@ def load_candidates(path, set_name):
         raise ValueError(f"suffix 0x{suffix:02X} is not an allowed suffix")
     tested = {parse_byte(t["byte"]) for t in data.get("tested", [])
               if parse_byte(t.get("suffix", data["suffix"])) == suffix}
+    reserved = {parse_byte(r["byte"]) for r in data.get("reserved_attended", [])}
     entries = sets[set_name]["candidates"]
     ranks = [e["rank"] for e in entries]
     if ranks != list(range(1, len(entries) + 1)):
@@ -110,14 +125,20 @@ def load_candidates(path, set_name):
         if byte not in ALLOWED_PREFIXES:
             raise ValueError(f"0x{byte:02X} is outside the allowed prefix union")
         item = dict(entry, value=byte)
-        (skipped if byte in tested else candidates).append(item)
+        if byte in tested:
+            skipped.append(dict(item, skip_reason="already tested"))
+        elif unattended and byte in reserved:
+            skipped.append(dict(item, skip_reason="reserved for an attended experiment"))
+        else:
+            candidates.append(item)
     return suffix, candidates, skipped
 
 
 UNATTENDED = "unattended-rx-only"
 
 
-def approval_digest(set_name, suffix, gap_ms, window_ms, candidates, mode=None, delay_s=None):
+def approval_digest(set_name, suffix, gap_ms, window_ms, candidates, mode=None, delay_s=None,
+                    observe_delay=False):
     """Binds an approval to the exact set, order, suffix and timing.
 
     The attended digest keeps its original form. The unattended mode adds the
@@ -126,6 +147,8 @@ def approval_digest(set_name, suffix, gap_ms, window_ms, candidates, mode=None, 
     head = [set_name, f"0x{suffix:02X}", str(gap_ms), str(window_ms)]
     if mode is not None:
         head += [f"mode={mode}", f"delay_s={delay_s:g}"]
+        if observe_delay:
+            head.append("observe_delay=1")
     text = "|".join(head + [f"{c['rank']}:0x{c['value']:02X}" for c in candidates])
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
@@ -191,6 +214,7 @@ class MockService:
         self.commands = []
         self.chains = {}
         self.next_id = 100
+        self.observed = []
         self.clock_ns = 62_913_000_000_000
         self.current = None
 
@@ -216,9 +240,37 @@ class MockService:
             rx = self.chains[int(parts[1])]["rx"]
             index = int(parts[2])
             return rx[index] if index < len(rx) else self.chains[int(parts[1])]["done"]
+        if parts[0] == "RESEARCH_OBSERVE":
+            return self._observe(int(parts[1]))
         if parts[0] == "RESEARCH_CANCEL":
             return f"OK RESEARCH_CANCELLED id={parts[1]}"
         return "ERR UNKNOWN_COMMAND"
+
+    def _observe(self, window_ms):
+        """Passive window. scenario[prefix]["between_rx"] frames land in the first one."""
+        prefix = self.current[0] if self.current else None
+        scenario = self.scenario.get(prefix, {})
+        frames = scenario.pop("between_rx", []) if scenario.get("between_rx") else []
+        observe_id = self.next_id
+        self.next_id += 1
+        start = self.clock_ns + 2_000_000
+        deadline = start + window_ms * 1_000_000
+        records = [
+            f"OK RESEARCH_RECORD id={observe_id} index={i} kind=FRAME "
+            f"start_ns={start + offset * 1_000_000} end_ns={start + offset * 1_000_000 + 100_000_000} "
+            f"waveform_lsb=0x{legacy(label):02X} legacy_msb_short1=0x{label:02X} valid=1 bits=8 "
+            "lost_events=0 reason=NONE relation=OTHER_TRAFFIC origin=UNATTRIBUTED "
+            "receiver_execution=UNVERIFIED"
+            for i, (offset, label) in enumerate(frames)]
+        failed = int(bool(scenario.get("observe_monitor_failed")))
+        self.chains[observe_id] = {
+            "tx": [], "tx_done": "", "rx": records,
+            "done": (f"OK RESEARCH_DONE id={observe_id} count={len(records)} start_ns={start} "
+                     f"deadline_ns={deadline} kind=OBSERVE overflow=0 "
+                     f"monitor_failed={failed} cancelled=0")}
+        self.clock_ns = deadline + 3_000_000
+        self.observed.append(window_ms)
+        return f"OK RESEARCH_OBSERVE id={observe_id} start_ns={start} deadline_ns={deadline}"
 
     def prepare(self, prefix):
         self.current = (prefix, "pre")
@@ -280,7 +332,8 @@ class MockService:
 
 class Sweep:
     def __init__(self, service, suffix, candidates, *, gap_ms, window_ms, delay_s,
-                 log, output=print, ask=input, sleep=time.sleep, attended=True):
+                 log, output=print, ask=input, sleep=time.sleep, attended=True,
+                 observe_delay=False):
         self.service = service
         self.suffix = suffix
         self.candidates = candidates
@@ -293,6 +346,8 @@ class Sweep:
         self.sleep = sleep
         self.interrupted = False
         self.attended = attended
+        self.observe_delay = observe_delay
+        self.covered_until_ns = None
 
     def _read(self, command, deadline):
         """Indexed read-only requests may be repeated after ERR BUSY; nothing else is."""
@@ -356,6 +411,58 @@ class Sweep:
         if self.interrupted:
             raise Stop("OPERATOR_ABORT", "interrupt during delay")
 
+    def _observe_quiet(self, candidate, final):
+        """Cover the delay with passive windows; any frame at all stops the run."""
+        label = "after the last trial" if final else "before the next trial"
+        self.output(f"Passive observation {self.delay_s:g} s {label} (Ctrl-C or SIGTERM stops)")
+        remaining = int(round(self.delay_s * 1000))
+        while remaining > 0:
+            if self.interrupted:
+                raise Stop("OPERATOR_ABORT", "interrupt during passive observation")
+            window = min(MAX_OBSERVE_MS, remaining)
+            record = {"event": "observe", "after": f"0x{candidate['value']:02X}",
+                      "window_ms": window, "final": final}
+            try:
+                reply = self.service.request(f"RESEARCH_OBSERVE {window}")
+                record["reply"] = reply
+                fields = xs8_repl.fields(reply)
+                if not reply.startswith("OK RESEARCH_OBSERVE ") or \
+                        not fields.get("id", "").isdecimal():
+                    raise Stop("OBSERVE_REFUSED", reply)
+                start = int(fields["start_ns"])
+                if self.covered_until_ns is not None:
+                    record["uncovered_ms"] = round((start - self.covered_until_ns) / 1e6, 1)
+                deadline = time.monotonic() + READ_DEADLINE_S + window / 1000
+                record["rx"], record["done"] = self._rx_records(fields["id"], deadline)
+                done = xs8_repl.fields(record["done"])
+                self.covered_until_ns = int(done.get("deadline_ns", start))
+                if any(done.get(k) != "0" for k in ("overflow", "monitor_failed", "cancelled")):
+                    raise Stop("MONITOR_FAULT", record["done"])
+                for line in record["rx"]:
+                    f = xs8_repl.fields(line)
+                    if (f.get("kind") != "FRAME" or f.get("valid") != "1" or
+                            f.get("lost_events") != "0"):
+                        raise Stop("MONITOR_FAULT", line)
+                    offset = round((int(f["start_ns"]) - start) / 1e6, 1)
+                    where = f"{offset} ms into a passive window {label}, after 0x{candidate['value']:02X}"
+                    if int(f["legacy_msb_short1"], 16) == DISC_CHANGE_LEGACY:
+                        raise Stop("POSSIBLE_DISC_CHANGE",
+                                   f"RX D4 (candidate disc-change report, not confirmed "
+                                   f"success) {where}: {line}")
+                    raise Stop("UNEXPECTED_RX", f"{where}: {line}")
+                record["verdict"] = "QUIET"
+            except Stop as stop:
+                record["verdict"] = stop.verdict
+                raise
+            except (OSError, ValueError) as error:
+                record["verdict"] = "SERVICE_UNREACHABLE"
+                raise Stop("SERVICE_UNREACHABLE", str(error)) from error
+            finally:
+                self.log.write(record)
+            remaining -= window
+        if self.interrupted:
+            raise Stop("OPERATOR_ABORT", "interrupt during passive observation")
+
     def _run_unattended(self):
         """No checkpoints or resets: continue only while TX, STATUS and RX stay clean."""
         self.output(f"{len(self.candidates)} trial(s), UNATTENDED RX-ONLY: prefix -> "
@@ -369,12 +476,16 @@ class Sweep:
             self.trial(candidate)
             if self.interrupted:
                 raise Stop("OPERATOR_ABORT", "interrupt during trial")
-            if position != len(self.candidates) - 1:
+            if self.observe_delay:
+                self._observe_quiet(candidate, final=position == len(self.candidates) - 1)
+            elif position != len(self.candidates) - 1:
                 self._wait(candidate)
         self.current = None
         return self._finish(
             "SET_COMPLETE_RX_SILENT",
-            f"all {len(self.candidates)} pairs sent with clean TX, STATUS and RX. "
+            f"all {len(self.candidates)} pairs sent with clean TX, STATUS and RX"
+            + (" and quiet passive observation between and after trials" if self.observe_delay
+               else "") + ". "
             "No track reset or physical observation: this does NOT rule out DISC SELECT "
             "and no candidate is a verified negative; no wider set is started")
 
@@ -457,6 +568,10 @@ class Sweep:
             record["tx"], record["tx_done"] = self._tx_records(session, deadline, prefix)
             record["rx"], record["done"] = self._rx_records(session, deadline)
             record["timing"] = timing(record["tx"], record["rx"])
+            if self.covered_until_ns is not None and record["tx"]:
+                first_tx = int(xs8_repl.fields(record["tx"][0])["tx_start_ns"])
+                record["uncovered_before_ms"] = round((first_tx - self.covered_until_ns) / 1e6, 1)
+            self.covered_until_ns = int(xs8_repl.fields(record["done"]).get("deadline_ns", 0)) or None
             self._classify(record, prefix)
             self._status("post", record)
             record["verdict"] = "RX_SILENT"
@@ -560,6 +675,58 @@ def timing(tx_lines, rx_lines=()):
     return result
 
 
+def correlate(log_records, journal_lines):
+    """Match every journal OBSERVED_BUS frame in the run's span to a logged TX echo.
+
+    Spans run from the first logged TX start to the last capture deadline. A
+    frame is an echo when it starts inside a logged TX window (1 ms slack for
+    the journal's microsecond rounding). Everything else is reported.
+    """
+    tx_windows, deadlines = [], []
+    for record in log_records:
+        for line in record.get("tx", []):
+            f = xs8_repl.fields(line)
+            tx_windows.append((int(f["tx_start_ns"]) // 1000, int(f["tx_end_ns"]) // 1000,
+                               f["requested"], record.get("prefix")))
+        done = record.get("done")
+        if done:
+            deadline = xs8_repl.fields(done).get("deadline_ns")
+            if deadline:
+                deadlines.append(int(deadline) // 1000)
+    if not tx_windows:
+        return {"frames": 0, "echoes": 0, "non_echo": [], "journal_tx_missing": [],
+                "unlogged_tx": [], "span_us": None}
+    span = (min(w[0] for w in tx_windows) - 1000, max(deadlines + [w[1] for w in tx_windows]))
+    frames, journal_tx = [], []
+    for line in journal_lines:
+        if "mono_us=" not in line:
+            continue
+        mono = int(line.split("mono_us=", 1)[1].split()[0])
+        if not span[0] <= mono <= span[1]:
+            continue
+        if " OBSERVED_BUS " in line:
+            f = xs8_repl.fields(line)
+            frames.append((mono, f.get("waveform_lsb"), f.get("legacy_msb_short1"), line.strip()))
+        elif " XS8 TX 0x" in line:
+            journal_tx.append((mono, line.split(" XS8 TX ", 1)[1].split()[0]))
+    echoes, non_echo = 0, []
+    for mono, waveform, label, line in frames:
+        match = [w for w in tx_windows if w[0] - 1000 <= mono <= w[1] and w[2] == waveform]
+        if match:
+            echoes += 1
+        else:
+            before = [w for w in tx_windows if w[0] <= mono]
+            non_echo.append({"mono_us": mono, "waveform": waveform, "legacy": label,
+                             "after_prefix": before[-1][3] if before else None,
+                             "ms_after_last_tx": round((mono - before[-1][0]) / 1000, 1)
+                             if before else None, "line": line})
+    logged = {(w[0], w[2]) for w in tx_windows}
+    journal_tx_set = set(journal_tx)
+    return {"span_us": span, "frames": len(frames), "echoes": echoes, "non_echo": non_echo,
+            "journal_tx_missing": sorted(f"{m}:{b}" for m, b in logged - journal_tx_set),
+            "unlogged_tx": sorted(f"{m}:{b}" for m, b in journal_tx_set - logged)}
+
+
 def now():
     return datetime.datetime.now().astimezone().isoformat(timespec="milliseconds")
 
@@ -579,7 +746,7 @@ class JsonLog:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--candidates", default="research/disc-select-candidates.json")
-    parser.add_argument("--set", required=True, dest="set_name")
+    parser.add_argument("--set", dest="set_name")
     parser.add_argument("--gap-ms", type=int, default=200)
     parser.add_argument("--observe-ms", type=int, default=3000)
     parser.add_argument("--delay-s", type=float, default=5.0,
@@ -592,9 +759,28 @@ def main(argv=None):
     parser.add_argument("--approve", help="approval digest printed by --list (real runs only)")
     parser.add_argument("--unattended-rx-only", action="store_true",
                         help="no operator checkpoints or resets; anomaly discovery only")
+    parser.add_argument("--observe-delay", action="store_true",
+                        help="unattended only: passive observation through every delay")
+    parser.add_argument("--correlate-journal", metavar="JOURNAL",
+                        help="offline: check --log against an exported service journal")
     parser.add_argument("--auto-observe", action="store_true",
                         help="dry-run only: answer every checkpoint as the expected track change")
     args = parser.parse_args(argv)
+    if args.correlate_journal:
+        if not args.log:
+            parser.error("--correlate-journal needs --log")
+        records = [json.loads(line) for line in Path(args.log).read_text().splitlines()]
+        result = correlate(records, Path(args.correlate_journal).read_text().splitlines())
+        print(json.dumps({k: v for k, v in result.items()}, indent=1))
+        clean = not result["non_echo"] and not result["journal_tx_missing"] \
+            and not result["unlogged_tx"]
+        print("CORRELATION " + ("CLEAN: every frame is an echo of a logged TX" if clean
+                                else "FOUND FRAMES OR TX NOT ACCOUNTED FOR"))
+        return 0 if clean else 1
+    if not args.set_name:
+        parser.error("--set is required")
+    if args.observe_delay and not args.unattended_rx_only:
+        parser.error("--observe-delay needs --unattended-rx-only")
 
     if not xs8_repl.MIN_GAP_MS <= args.gap_ms <= xs8_repl.MAX_GAP_MS:
         parser.error("--gap-ms must be 50..1000")
@@ -603,13 +789,15 @@ def main(argv=None):
     if args.delay_s < 0 or args.max_trials < 0:
         parser.error("--delay-s and --max-trials must not be negative")
     try:
-        suffix, candidates, skipped = load_candidates(args.candidates, args.set_name)
+        suffix, candidates, skipped = load_candidates(args.candidates, args.set_name,
+                                                      unattended=args.unattended_rx_only)
     except (OSError, ValueError, KeyError) as error:
         parser.error(f"candidate file: {error}")
     mode = UNATTENDED if args.unattended_rx_only else "attended"
     if args.unattended_rx_only:
         digest = approval_digest(args.set_name, suffix, args.gap_ms, args.observe_ms,
-                                 candidates, mode=UNATTENDED, delay_s=args.delay_s)
+                                 candidates, mode=UNATTENDED, delay_s=args.delay_s,
+                                 observe_delay=args.observe_delay)
     else:
         digest = approval_digest(args.set_name, suffix, args.gap_ms, args.observe_ms, candidates)
     try:
@@ -623,9 +811,10 @@ def main(argv=None):
     print(f"Set {args.set_name}: {len(candidates)} candidate(s), suffix 0x{suffix:02X}, "
           f"gap {args.gap_ms} ms, window {args.observe_ms} ms, mode {mode}"
           + (f", delay {args.delay_s:g} s" if args.unattended_rx_only else "")
+          + (", passive observation through delays" if args.observe_delay else "")
           + f", digest {digest}")
     for c in skipped:
-        print(f"  skip 0x{c['value']:02X} (rank {c['rank']}): already tested")
+        print(f"  skip 0x{c['value']:02X} (rank {c['rank']}): {c['skip_reason']}")
     for c in candidates:
         if c["value"] in done:
             print(f"  skip 0x{c['value']:02X} (rank {c['rank']}): sent in {args.log}")
@@ -667,7 +856,7 @@ def main(argv=None):
     log = JsonLog(args.log if args.log else "/dev/null")
     sweep = Sweep(service, suffix, plan, gap_ms=args.gap_ms, window_ms=args.observe_ms,
                   delay_s=args.delay_s, log=log, ask=ask,
-                  attended=not args.unattended_rx_only)
+                  attended=not args.unattended_rx_only, observe_delay=args.observe_delay)
 
     def interrupt(signum, frame):
         sweep.interrupted = True
@@ -678,7 +867,8 @@ def main(argv=None):
     log.write({"event": "run", "set": args.set_name, "digest": digest,
                "suffix": f"0x{suffix:02X}", "gap_ms": args.gap_ms,
                "window_ms": args.observe_ms, "delay_s": args.delay_s,
-               "dry_run": args.dry_run, "mode": mode, "plan": [f"0x{c['value']:02X}" for c in plan],
+               "dry_run": args.dry_run, "mode": mode,
+               "observe_delay": args.observe_delay, "plan": [f"0x{c['value']:02X}" for c in plan],
                "started": now()})
     try:
         verdict = sweep.run()

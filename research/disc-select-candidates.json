@@ -13,6 +13,263 @@
    "start": "Disc 1 / Track 1",
    "end": "Disc 1 / Track 4",
    "physical": "NEGATIVE: no disc change; 0x48 was read as track 4 (operator observation)"
+  },
+  {
+   "byte": "0xCA",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 10,
+   "gap_ms": 210.9,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0xA8",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 11,
+   "gap_ms": 209.3,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0xBA",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 12,
+   "gap_ms": 213.6,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0xAA",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 13,
+   "gap_ms": 211.3,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0xFA",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 14,
+   "gap_ms": 201.2,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x0A",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 15,
+   "gap_ms": 209.8,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x1A",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 16,
+   "gap_ms": 206.9,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x2A",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 17,
+   "gap_ms": 216.6,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x3A",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 18,
+   "gap_ms": 210.1,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x4A",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 19,
+   "gap_ms": 208.3,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x5A",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 20,
+   "gap_ms": 209.9,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0xB8",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 21,
+   "gap_ms": 211.4,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0xE8",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 22,
+   "gap_ms": 210.7,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0xF8",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 23,
+   "gap_ms": 209.3,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x8C",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 24,
+   "gap_ms": 218.7,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0xAC",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 25,
+   "gap_ms": 210.1,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0xDC",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 26,
+   "gap_ms": 209.0,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x0C",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 27,
+   "gap_ms": 206.6,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x1C",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 28,
+   "gap_ms": 207.9,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x2C",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 29,
+   "gap_ms": 209.8,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x3C",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 30,
+   "gap_ms": 209.8,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x5C",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 31,
+   "gap_ms": 210.6,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x6C",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 32,
+   "gap_ms": 210.0,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x7C",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 33,
+   "gap_ms": 209.1,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  },
+  {
+   "byte": "0x4C",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 34,
+   "gap_ms": 210.0,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "run": "disc-select-structural-26-unattended-20261016-085839 (unattended RX-only)",
+   "physical": "NOT VERIFIED per trial: no track reset or observation. After the run the changer was on Disc 1 / Track 4 with no indicator or persistent mode change (operator observation). Not a verified negative."
+  }
+ ],
+ "reserved_attended": [
+  {
+   "byte": "0xD4",
+   "date": "2026-10-16",
+   "reason": "Incoming RX 0xD4 is the suspected disc-change indication (seen after 0x8A on two occasions). Sending 0xD4 as a prefix is excluded from unattended runs and reserved for a separate operator-attended experiment."
   }
  ],
  "sets": {
