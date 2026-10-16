@@ -835,6 +835,57 @@ class GroupedTest(unittest.TestCase):
         self.assertEqual([(g["group"], g["plan"]) for g in starts],
                          [(2, ["0x1A", "0x2A"]), (3, ["0x3A", "0x4A"])])
 
+    def test_correlation_handles_a_group_split_across_sessions(self):
+        """Regression: operator REPL traffic between two parts of one group is not inside it."""
+        first_log = run_grouped(["start-group 1", "ok", "start-group 2"], interrupt_after=6)[2]
+        part1 = [{"event": "run"}] + first_log.records
+        part1_end = max(int(sweep.xs8_repl.fields(r["done"])["deadline_ns"]) // 1000
+                        for r in part1 if r.get("group") == 2 and r.get("done"))
+        # The resumed session: group 2's remaining prefixes, much later.
+        _, service, second_log, _ = run_grouped(["start-group 2", "ok", "start-group 3", "ok"],
+                                                done=RANKED_26[1:7])
+        offset = part1_end + 300_000_000  # 300 s of operator time, in microseconds.
+
+        def shift(record):
+            moved = dict(record)
+            for key in ("done",):
+                if key in moved:
+                    d = sweep.xs8_repl.fields(moved[key])
+                    moved[key] = moved[key].replace(
+                        f"start_ns={d['start_ns']}", f"start_ns={int(d['start_ns']) + offset * 1000}"
+                    ).replace(f"deadline_ns={d['deadline_ns']}",
+                              f"deadline_ns={int(d['deadline_ns']) + offset * 1000}")
+            if "tx" in moved:
+                lines = []
+                for line in moved["tx"]:
+                    d = sweep.xs8_repl.fields(line)
+                    lines.append(line.replace(f"tx_start_ns={d['tx_start_ns']}",
+                                              f"tx_start_ns={int(d['tx_start_ns']) + offset * 1000}")
+                                 .replace(f"tx_end_ns={d['tx_end_ns']}",
+                                          f"tx_end_ns={int(d['tx_end_ns']) + offset * 1000}"))
+                moved["tx"] = lines
+            return moved
+        part2 = [{"event": "run"}] + [shift(r) for r in second_log.records]
+        records = part1 + part2
+        lines = CorrelationTest().journal(records)
+        gap = part1_end + 120_000_000  # Operator REPL traffic between the parts.
+        lines += [f"x: mono_us={gap} XS8 TX 0xA7 timing result=TX_OK",
+                  f"x: mono_us={gap + 30} XS8 OBSERVED_BUS status=VALID waveform_lsb=0xA7 "
+                  "legacy_msb_short1=0x1A",
+                  f"x: mono_us={gap + 5_000_000} XS8 OBSERVED_BUS status=VALID "
+                  "waveform_lsb=0x41 legacy_msb_short1=0x7D"]
+        result = sweep.correlate(records, lines)
+        self.assertEqual((result["non_echo"], result["unlogged_tx"], result["journal_tx_missing"]),
+                         ([], [], []))
+        self.assertEqual(len(result["between_groups"]), 3)
+        # A frame inside the resumed part of group 2 is still an anomaly.
+        resumed = [r for r in part2 if r.get("event") == "trial" and r.get("group") == 2][0]
+        inside = int(sweep.xs8_repl.fields(resumed["tx"][1])["tx_end_ns"]) // 1000 + 1_000_000
+        lines.append(f"x: mono_us={inside} XS8 OBSERVED_BUS status=VALID waveform_lsb=0xD4 "
+                     "legacy_msb_short1=0xD4")
+        result = sweep.correlate(records, lines)
+        self.assertEqual([(e["legacy"], e["group"]) for e in result["non_echo"]], [("0xD4", 2)])
+
     def test_correlation_separates_group_spans_from_operator_time(self):
         _, _, log, _ = run_grouped()
         records = log.records

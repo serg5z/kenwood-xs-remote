@@ -813,16 +813,24 @@ def correlate(log_records, journal_lines):
     Spans run from the first logged TX start to the last capture deadline. A
     frame is an echo when it starts inside a logged TX window (1 ms slack for
     the journal's microsecond rounding). Everything else is reported.
+
+    Group spans are kept per session (the records after each "run" record), so
+    a group resumed in a later session does not cover the operator time
+    between its parts.
     """
     tx_windows, deadlines, group_spans = [], [], {}
+    session = 0
     for record in log_records:
+        if record.get("event") == "run":
+            session += 1
         if "group" in record and record.get("done"):
             d = xs8_repl.fields(record["done"])
             if "start_ns" in d and "deadline_ns" in d:
-                low, high = group_spans.get(record["group"], (None, None))
+                key = (session, record["group"])
+                low, high = group_spans.get(key, (None, None))
                 start, end = int(d["start_ns"]) // 1000, int(d["deadline_ns"]) // 1000
-                group_spans[record["group"]] = (start if low is None else min(low, start),
-                                                end if high is None else max(high, end))
+                group_spans[key] = (start if low is None else min(low, start),
+                                    end if high is None else max(high, end))
         for line in record.get("tx", []):
             f = xs8_repl.fields(line)
             tx_windows.append((int(f["tx_start_ns"]) // 1000, int(f["tx_end_ns"]) // 1000,
@@ -859,7 +867,7 @@ def correlate(log_records, journal_lines):
                      "after_prefix": before[-1][3] if before else None,
                      "ms_after_last_tx": round((mono - before[-1][0]) / 1000, 1)
                      if before else None, "line": line}
-            groups = [g for g, (low, high) in group_spans.items() if low <= mono <= high]
+            groups = [g for (_, g), (low, high) in group_spans.items() if low <= mono <= high]
             if group_spans and not groups:
                 between_groups.append(entry)  # Operator checkpoint time: reported only.
             else:
