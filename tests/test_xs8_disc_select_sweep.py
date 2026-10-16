@@ -54,6 +54,49 @@ def full_script(count):
     return replies
 
 
+def no_questions(prompt):
+    raise AssertionError("unattended mode asked the operator: " + prompt)
+
+
+def run_unattended(candidates=None, scenario=None, interrupt_on_sleep=False,
+                   interrupt_after_chains=None):
+    suffix, loaded, _ = sweep.load_candidates(CANDIDATES, "structural-26")
+    plan = loaded if candidates is None else [
+        c for c in loaded if f"{c['value']:02X}" in candidates]
+    service = sweep.MockService(scenario)
+    log = MemoryLog()
+    sleeps = []
+    runner = None
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if interrupt_on_sleep:
+            runner.interrupted = True
+    if interrupt_after_chains is not None:
+        original = service.request
+
+        def counting(command):
+            reply = original(command)
+            if (command.startswith("RESEARCH_CHAIN") and
+                    len(chains(service)) == interrupt_after_chains):
+                runner.interrupted = True
+            return reply
+        service.request = counting
+    runner = sweep.Sweep(service, suffix, plan, gap_ms=200, window_ms=3000, delay_s=5.0,
+                         log=log, output=lambda line: None, ask=no_questions, sleep=sleep,
+                         attended=False)
+    with patch.object(sweep.time, "monotonic", side_effect=fake_clock(sleeps)):
+        verdict = runner.run()
+    return verdict, service, log, sleeps
+
+
+def fake_clock(sleeps):
+    """monotonic() that advances only by the harness's own sleeps."""
+    def now():
+        return 1000.0 + sum(sleeps)
+    return now
+
+
 def run(candidates, scenario=None, replies=None, delay_s=0.0):
     suffix, loaded, _ = sweep.load_candidates(CANDIDATES, "structural-26")
     plan = [c for c in loaded if f"{c['value']:02X}" in candidates]
@@ -147,7 +190,11 @@ class TrialTest(unittest.TestCase):
             "RESEARCH_CHAIN 2 200 3000 0xBA 0x48"])
         trials = log.trials()
         self.assertEqual([t["verdict"] for t in trials], ["RX_SILENT"] * 3)
-        self.assertEqual(trials[0]["timing"], {"tx_ms": [100.0, 100.0], "gap_ms": 214.0})
+        timing = trials[0]["timing"]
+        self.assertEqual((timing["tx_ms"], timing["gap_ms"], timing["tx_start_ms"]),
+                         ([100.0, 100.0], 214.0, [0.0, 314.0]))
+        self.assertEqual([(r["waveform"], r["legacy"], r["relation"]) for r in timing["rx"]],
+                         [("0xCA", "0xAC", "TX_WINDOW"), ("0x48", "0xED", "TX_WINDOW")])
         self.assertIn("state=IDLE", trials[0]["pre_status"])
         self.assertIn("state=IDLE", trials[0]["post_status"])
         self.assertEqual(len(trials[0]["rx"]), 2)
@@ -314,6 +361,101 @@ class CheckpointTest(unittest.TestCase):
         self.assertLessEqual(sleeps[0], 0.1)
 
 
+class UnattendedTest(unittest.TestCase):
+    def test_all_25_pairs_run_in_rank_order_without_questions(self):
+        verdict, service, log, sleeps = run_unattended()
+        self.assertEqual(verdict, "SET_COMPLETE_RX_SILENT")
+        self.assertEqual(chains(service),
+                         [f"RESEARCH_CHAIN 2 200 3000 0x{b} 0x48" for b in RANKED_26[1:]])
+        self.assertEqual(len(log.trials()), 25)
+        self.assertEqual({t["verdict"] for t in log.trials()}, {"RX_SILENT"})
+        self.assertFalse([r for r in log.records if r["event"] == "checkpoint"])
+        self.assertAlmostEqual(sum(sleeps), 5.0 * 24)  # Between trials, not after the last.
+        self.assertNotIn("NEGATIVE", json.dumps(log.records))
+        stop = log.records[-1]
+        self.assertIn("does NOT rule out DISC SELECT", stop["detail"])
+        self.assertIn("no candidate is a verified negative", stop["detail"])
+
+    def test_each_trial_logs_full_tx_and_rx_timing(self):
+        verdict, _, log, _ = run_unattended(["CA", "A8"], {0xA8: {"rx": [(1150, 0xD4)]}})
+        self.assertEqual(verdict, "POSSIBLE_DISC_CHANGE")
+        silent, flagged = log.trials()
+        self.assertEqual(len(silent["tx"]), 2)
+        self.assertEqual(len(silent["rx"]), 2)
+        self.assertIn("RESEARCH_DONE", silent["done"])
+        self.assertEqual(flagged["timing"]["rx"][-1],
+                         {"start_ms": 1564.0, "end_ms": 1664.0, "waveform": "0xD4",
+                          "legacy": "0xD4", "relation": "OTHER_TRAFFIC"})
+
+    def test_every_stop_condition_ends_the_sweep_at_that_trial(self):
+        bad = sweep.MockService.IDLE
+        cases = {
+            "POSSIBLE_DISC_CHANGE": {"rx": [(1150, 0xD4)]},
+            "UNEXPECTED_RX": {"rx": [(300, 0xDE)]},
+            "TX_FAILURE": {"tx_fail": 1},
+            "MONITOR_FAULT": {"monitor_failed": True},
+            "ANOMALOUS_STATUS": {"post_status": bad.replace("receiver_integrity=HEALTHY",
+                                                            "receiver_integrity=UNCERTAIN")},
+        }
+        for verdict, scenario in cases.items():
+            result, service, log, _ = run_unattended(None, {0xBA: scenario})
+            self.assertEqual(result, verdict)
+            self.assertEqual(chains(service)[-1], "RESEARCH_CHAIN 2 200 3000 0xBA 0x48")
+            self.assertEqual(len(chains(service)), 3, verdict)
+            self.assertEqual(log.records[-1]["verdict"], verdict)
+        for name, scenario in (("echo", {"echo_missing": True}),
+                               ("aborted", {"done_aborted": True}),
+                               ("tx0", {"tx_fail": 0})):
+            result, service, _, _ = run_unattended(None, {0xBA: scenario})
+            self.assertIn(result, ("UNEXPECTED_RX", "TX_FAILURE"), name)
+            self.assertEqual(len(chains(service)), 3, name)
+
+    def test_abnormal_status_before_a_trial_sends_nothing_more(self):
+        bad = sweep.MockService.IDLE.replace("state=IDLE", "state=VOLUME_HOLD")
+        result, service, log, _ = run_unattended(None, {0xBA: {"pre_status": bad}})
+        self.assertEqual(result, "ANOMALOUS_STATUS")
+        self.assertEqual(len(chains(service)), 2)
+        self.assertFalse(log.trials()[-1]["chain_sent"])
+
+    def test_interrupt_stops_during_delay_or_after_the_current_pair(self):
+        result, service, _, sleeps = run_unattended(interrupt_on_sleep=True)
+        self.assertEqual(result, "OPERATOR_ABORT")
+        self.assertEqual(len(chains(service)), 1)
+        self.assertEqual(len(sleeps), 1)
+        result, service, log, _ = run_unattended(interrupt_after_chains=3)
+        self.assertEqual(result, "OPERATOR_ABORT")
+        self.assertEqual(len(chains(service)), 3)
+        self.assertEqual(log.trials()[-1]["verdict"], "RX_SILENT")  # The pair completed.
+
+    def test_interrupt_before_start_sends_nothing(self):
+        suffix, loaded, _ = sweep.load_candidates(CANDIDATES, "structural-26")
+        service = sweep.MockService()
+        runner = sweep.Sweep(service, suffix, loaded, gap_ms=200, window_ms=3000,
+                             delay_s=5.0, log=MemoryLog(), output=lambda line: None,
+                             ask=no_questions, sleep=lambda s: None, attended=False)
+        runner.interrupted = True
+        self.assertEqual(runner.run(), "OPERATOR_ABORT")
+        self.assertEqual(chains(service), [])
+
+    def test_interrupt_during_the_last_pair_is_not_reported_as_complete(self):
+        result, service, log, _ = run_unattended(interrupt_after_chains=25)
+        self.assertEqual(result, "OPERATOR_ABORT")
+        self.assertEqual(len(chains(service)), 25)
+        self.assertEqual(log.records[-1]["detail"], "interrupt during trial")
+
+    def test_unattended_digest_covers_mode_and_delay(self):
+        suffix, candidates, _ = sweep.load_candidates(CANDIDATES, "structural-26")
+        attended = sweep.approval_digest("structural-26", suffix, 200, 3000, candidates)
+        unattended = sweep.approval_digest("structural-26", suffix, 200, 3000, candidates,
+                                           mode=sweep.UNATTENDED, delay_s=5.0)
+        self.assertEqual(attended, "ebe5699f2ec3b291")
+        self.assertNotEqual(unattended, attended)
+        self.assertNotEqual(unattended, sweep.approval_digest(
+            "structural-26", suffix, 200, 3000, candidates, mode=sweep.UNATTENDED, delay_s=4.0))
+        self.assertNotEqual(unattended, sweep.approval_digest(
+            "structural-26", suffix, 250, 3000, candidates, mode=sweep.UNATTENDED, delay_s=5.0))
+
+
 class CommandLineTest(unittest.TestCase):
     def main(self, *args, stdin=""):
         out = io.StringIO()
@@ -388,6 +530,64 @@ class CommandLineTest(unittest.TestCase):
                 self.main("--candidates", str(CANDIDATES), "--set", "structural-26",
                           "--log", str(log), "--approve", "x")
             real.assert_not_called()
+
+    def unattended_digest(self):
+        _, listing = self.main("--candidates", str(CANDIDATES), "--set", "structural-26",
+                               "--unattended-rx-only", "--list")
+        self.assertIn("mode unattended-rx-only, delay 5 s", listing)
+        return listing.split("digest ")[1].split()[0]
+
+    def test_attended_digest_cannot_start_an_unattended_run(self):
+        with patch.object(sweep, "SocketService") as real:
+            code, text = self.main("--candidates", str(CANDIDATES), "--set", "structural-26",
+                                   "--unattended-rx-only", "--log", "/dev/null",
+                                   "--approve", "ebe5699f2ec3b291",
+                                   stdin=sweep.START_PHRASE)
+            self.assertEqual(code, 2)
+            self.assertIn("Refused", text)
+            real.assert_not_called()
+
+    def test_unattended_digest_cannot_start_an_attended_run(self):
+        digest = self.unattended_digest()
+        with patch.object(sweep, "SocketService") as real:
+            code, _ = self.main("--candidates", str(CANDIDATES), "--set", "structural-26",
+                                "--log", "/dev/null", "--approve", digest,
+                                stdin=sweep.START_PHRASE)
+            self.assertEqual(code, 2)
+            real.assert_not_called()
+
+    def test_unattended_real_run_still_needs_the_start_phrase(self):
+        digest = self.unattended_digest()
+        with patch.object(sweep, "SocketService") as real:
+            code, _ = self.main("--candidates", str(CANDIDATES), "--set", "structural-26",
+                                "--unattended-rx-only", "--log", "/dev/null",
+                                "--approve", digest, stdin="go")
+            self.assertEqual(code, 2)
+            real.assert_not_called()
+
+    def test_unattended_dry_run_end_to_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "run.jsonl"
+            with patch.object(sweep.xs8_repl, "request") as real, \
+                    patch.object(sweep.time, "sleep"):
+                code, text = self.main("--candidates", str(CANDIDATES), "--set", "structural-26",
+                                       "--unattended-rx-only", "--dry-run", "--delay-s", "0",
+                                       "--log", str(log))
+                real.assert_not_called()
+            self.assertEqual(code, 0)
+            self.assertIn("STOP SET_COMPLETE_RX_SILENT", text)
+            records = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual(records[0]["mode"], "unattended-rx-only")
+            self.assertEqual(len([r for r in records if r["event"] == "trial"]), 25)
+            # An attended run may not reuse (and so skip) unattended trials.
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                self.main("--candidates", str(CANDIDATES), "--set", "structural-26",
+                          "--dry-run", "--log", str(log), "--list")
+
+    def test_auto_observe_is_refused_with_unattended(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.main("--candidates", str(CANDIDATES), "--set", "structural-26", "--dry-run",
+                      "--unattended-rx-only", "--auto-observe")
 
     def test_one_set_per_run(self):
         code, text = self.main("--candidates", str(CANDIDATES), "--set", "structural-26",

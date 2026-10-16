@@ -8,6 +8,11 @@ monitor fault, abnormal STATUS, or any operator observation other than the
 expected track change. RX silence is recorded as RX_SILENT: the bus cannot
 show a track change, so only the operator's checkpoint decides the outcome.
 
+--unattended-rx-only drops every operator checkpoint and track reset: each
+pair is sent after a fixed delay while TX, STATUS and RX stay clean. Without
+resets it is an anomaly-discovery sweep only. Its RX_SILENT trials are never
+negatives, and a completed run does not rule out DISC SELECT.
+
 --dry-run talks to an in-process mock service and never opens the socket.
 """
 
@@ -109,14 +114,23 @@ def load_candidates(path, set_name):
     return suffix, candidates, skipped
 
 
-def approval_digest(set_name, suffix, gap_ms, window_ms, candidates):
-    """Binds an approval to the exact set, order, suffix and timing."""
-    text = "|".join([set_name, f"0x{suffix:02X}", str(gap_ms), str(window_ms)] +
-                    [f"{c['rank']}:0x{c['value']:02X}" for c in candidates])
+UNATTENDED = "unattended-rx-only"
+
+
+def approval_digest(set_name, suffix, gap_ms, window_ms, candidates, mode=None, delay_s=None):
+    """Binds an approval to the exact set, order, suffix and timing.
+
+    The attended digest keeps its original form. The unattended mode adds the
+    mode and the inter-trial delay, so no attended approval can authorize it.
+    """
+    head = [set_name, f"0x{suffix:02X}", str(gap_ms), str(window_ms)]
+    if mode is not None:
+        head += [f"mode={mode}", f"delay_s={delay_s:g}"]
+    text = "|".join(head + [f"{c['rank']}:0x{c['value']:02X}" for c in candidates])
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def completed_bytes(log_path, dry_run):
+def completed_bytes(log_path, dry_run, mode="attended"):
     """Candidates already attempted in an earlier log: never sent again.
 
     A log belongs to either dry runs or real runs; mixing them is refused so
@@ -131,6 +145,9 @@ def completed_bytes(log_path, dry_run):
         if record.get("event") == "run" and bool(record.get("dry_run")) != dry_run:
             raise ValueError(f"{log_path} holds {'real' if dry_run else 'dry-run'} "
                              "records; use a separate log")
+        if record.get("event") == "run" and record.get("mode", "attended") != mode:
+            raise ValueError(f"{log_path} holds {record.get('mode', 'attended')} records; "
+                             "use a separate log")
         if record.get("event") == "trial" and record.get("chain_sent"):
             done.add(parse_byte(record["prefix"]))
     return done
@@ -227,7 +244,7 @@ class MockService:
                       "receiver_execution=UNVERIFIED")
             attempted += 1
             if not scenario.get("echo_missing"):
-                rx.append((t + 30_000, end - 400_000, value, value, "TX_WINDOW"))
+                rx.append((t + 30_000, end - 400_000, value, legacy(value), "TX_WINDOW"))
             if failed:
                 break
             last_end = end
@@ -263,7 +280,7 @@ class MockService:
 
 class Sweep:
     def __init__(self, service, suffix, candidates, *, gap_ms, window_ms, delay_s,
-                 log, output=print, ask=input, sleep=time.sleep):
+                 log, output=print, ask=input, sleep=time.sleep, attended=True):
         self.service = service
         self.suffix = suffix
         self.candidates = candidates
@@ -275,6 +292,7 @@ class Sweep:
         self.ask = ask
         self.sleep = sleep
         self.interrupted = False
+        self.attended = attended
 
     def _read(self, command, deadline):
         """Indexed read-only requests may be repeated after ERR BUSY; nothing else is."""
@@ -330,7 +348,39 @@ class Sweep:
         if word == "abort":
             raise Stop("OPERATOR_ABORT", "at receiver panel check")
 
+    def _wait(self, candidate):
+        self.output(f"Next trial in {self.delay_s:g} s (Ctrl-C or SIGTERM stops)")
+        resume_at = time.monotonic() + self.delay_s
+        while not self.interrupted and time.monotonic() < resume_at:
+            self.sleep(min(0.1, max(0.0, resume_at - time.monotonic())))
+        if self.interrupted:
+            raise Stop("OPERATOR_ABORT", "interrupt during delay")
+
+    def _run_unattended(self):
+        """No checkpoints or resets: continue only while TX, STATUS and RX stay clean."""
+        self.output(f"{len(self.candidates)} trial(s), UNATTENDED RX-ONLY: prefix -> "
+                    f"0x{self.suffix:02X}, gap {self.gap_ms} ms, window {self.window_ms} ms, "
+                    f"delay {self.delay_s:g} s. Anomaly discovery only; RX_SILENT is not "
+                    "a negative.")
+        for position, candidate in enumerate(self.candidates):
+            self.current = candidate
+            if self.interrupted:
+                raise Stop("OPERATOR_ABORT", "interrupt before trial")
+            self.trial(candidate)
+            if self.interrupted:
+                raise Stop("OPERATOR_ABORT", "interrupt during trial")
+            if position != len(self.candidates) - 1:
+                self._wait(candidate)
+        self.current = None
+        return self._finish(
+            "SET_COMPLETE_RX_SILENT",
+            f"all {len(self.candidates)} pairs sent with clean TX, STATUS and RX. "
+            "No track reset or physical observation: this does NOT rule out DISC SELECT "
+            "and no candidate is a verified negative; no wider set is started")
+
     def _run(self):
+        if not self.attended:
+            return self._run_unattended()
         completed = 0
         self.output(f"{len(self.candidates)} trial(s): prefix -> 0x{self.suffix:02X}, "
                     f"gap {self.gap_ms} ms, window {self.window_ms} ms")
@@ -371,12 +421,7 @@ class Sweep:
             self.log.write({"event": "checkpoint", "phase": "reset", "answer": answer})
             if word == "abort":
                 return self._finish("OPERATOR_ABORT", "at reset checkpoint", candidate)
-            self.output(f"Next trial in {self.delay_s:g} s (Ctrl-C aborts)")
-            resume_at = time.monotonic() + self.delay_s
-            while not self.interrupted and time.monotonic() < resume_at:
-                self.sleep(min(0.1, max(0.0, resume_at - time.monotonic())))
-            if self.interrupted:
-                return self._finish("OPERATOR_ABORT", "interrupt during delay", candidate)
+            self._wait(candidate)
         return self._finish("SET_COMPLETE", "every candidate was RX_SILENT, observed as a "
                             "track change, and the final panel check passed; no wider set "
                             "is started", None)
@@ -411,7 +456,7 @@ class Sweep:
             deadline = time.monotonic() + READ_DEADLINE_S + self.window_ms / 1000
             record["tx"], record["tx_done"] = self._tx_records(session, deadline, prefix)
             record["rx"], record["done"] = self._rx_records(session, deadline)
-            record["timing"] = timing(record["tx"])
+            record["timing"] = timing(record["tx"], record["rx"])
             self._classify(record, prefix)
             self._status("post", record)
             record["verdict"] = "RX_SILENT"
@@ -493,12 +538,25 @@ class Sweep:
                        f" differ from the sent 0x{prefix:02X} 0x{self.suffix:02X}")
 
 
-def timing(tx_lines):
+def timing(tx_lines, rx_lines=()):
+    """Durations and offsets in ms, relative to the start of the first TX frame."""
     tx = [xs8_repl.fields(line) for line in tx_lines]
+    origin = int(tx[0]["tx_start_ns"]) if tx else 0
     result = {"tx_ms": [round((int(t["tx_end_ns"]) - int(t["tx_start_ns"])) / 1e6, 1)
-                        for t in tx]}
+                        for t in tx],
+              "tx_start_ms": [round((int(t["tx_start_ns"]) - origin) / 1e6, 1) for t in tx]}
     if len(tx) == 2:
         result["gap_ms"] = round((int(tx[1]["tx_start_ns"]) - int(tx[0]["tx_end_ns"])) / 1e6, 1)
+    rx = []
+    for line in rx_lines:
+        f = xs8_repl.fields(line)
+        if "start_ns" in f:
+            rx.append({"start_ms": round((int(f["start_ns"]) - origin) / 1e6, 1),
+                       "end_ms": round((int(f["end_ns"]) - origin) / 1e6, 1),
+                       "waveform": f.get("waveform_lsb"),
+                       "legacy": f.get("legacy_msb_short1"),
+                       "relation": f.get("relation")})
+    result["rx"] = rx
     return result
 
 
@@ -532,6 +590,8 @@ def main(argv=None):
     parser.add_argument("--list", action="store_true", help="print the plan and digest; send nothing")
     parser.add_argument("--dry-run", action="store_true", help="mock service; never opens the socket")
     parser.add_argument("--approve", help="approval digest printed by --list (real runs only)")
+    parser.add_argument("--unattended-rx-only", action="store_true",
+                        help="no operator checkpoints or resets; anomaly discovery only")
     parser.add_argument("--auto-observe", action="store_true",
                         help="dry-run only: answer every checkpoint as the expected track change")
     args = parser.parse_args(argv)
@@ -546,9 +606,14 @@ def main(argv=None):
         suffix, candidates, skipped = load_candidates(args.candidates, args.set_name)
     except (OSError, ValueError, KeyError) as error:
         parser.error(f"candidate file: {error}")
-    digest = approval_digest(args.set_name, suffix, args.gap_ms, args.observe_ms, candidates)
+    mode = UNATTENDED if args.unattended_rx_only else "attended"
+    if args.unattended_rx_only:
+        digest = approval_digest(args.set_name, suffix, args.gap_ms, args.observe_ms,
+                                 candidates, mode=UNATTENDED, delay_s=args.delay_s)
+    else:
+        digest = approval_digest(args.set_name, suffix, args.gap_ms, args.observe_ms, candidates)
     try:
-        done = completed_bytes(args.log, args.dry_run) if args.log else set()
+        done = completed_bytes(args.log, args.dry_run, mode) if args.log else set()
     except (OSError, ValueError) as error:
         parser.error(f"log: {error}")
     plan = [c for c in candidates if c["value"] not in done]
@@ -556,7 +621,9 @@ def main(argv=None):
         plan = plan[:args.max_trials]
 
     print(f"Set {args.set_name}: {len(candidates)} candidate(s), suffix 0x{suffix:02X}, "
-          f"gap {args.gap_ms} ms, window {args.observe_ms} ms, digest {digest}")
+          f"gap {args.gap_ms} ms, window {args.observe_ms} ms, mode {mode}"
+          + (f", delay {args.delay_s:g} s" if args.unattended_rx_only else "")
+          + f", digest {digest}")
     for c in skipped:
         print(f"  skip 0x{c['value']:02X} (rank {c['rank']}): already tested")
     for c in candidates:
@@ -571,6 +638,8 @@ def main(argv=None):
     ask = input
     if args.auto_observe and not args.dry_run:
         parser.error("--auto-observe is only for --dry-run")
+    if args.auto_observe and args.unattended_rx_only:
+        parser.error("--auto-observe does not apply to --unattended-rx-only")
     if args.dry_run:
         service = MockService()
         if args.auto_observe:
@@ -597,24 +666,27 @@ def main(argv=None):
 
     log = JsonLog(args.log if args.log else "/dev/null")
     sweep = Sweep(service, suffix, plan, gap_ms=args.gap_ms, window_ms=args.observe_ms,
-                  delay_s=args.delay_s, log=log, ask=ask)
+                  delay_s=args.delay_s, log=log, ask=ask,
+                  attended=not args.unattended_rx_only)
 
     def interrupt(signum, frame):
         sweep.interrupted = True
         print("\nInterrupt: stopping after the current step; nothing is cancelled or resent.")
 
     previous = signal.signal(signal.SIGINT, interrupt)
+    previous_term = signal.signal(signal.SIGTERM, interrupt)
     log.write({"event": "run", "set": args.set_name, "digest": digest,
                "suffix": f"0x{suffix:02X}", "gap_ms": args.gap_ms,
                "window_ms": args.observe_ms, "delay_s": args.delay_s,
-               "dry_run": args.dry_run, "plan": [f"0x{c['value']:02X}" for c in plan],
+               "dry_run": args.dry_run, "mode": mode, "plan": [f"0x{c['value']:02X}" for c in plan],
                "started": now()})
     try:
         verdict = sweep.run()
     finally:
         signal.signal(signal.SIGINT, previous)
+        signal.signal(signal.SIGTERM, previous_term)
         log.close()
-    return 0 if verdict == "SET_COMPLETE" else 1
+    return 0 if verdict in ("SET_COMPLETE", "SET_COMPLETE_RX_SILENT") else 1
 
 
 if __name__ == "__main__":
