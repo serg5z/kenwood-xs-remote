@@ -1,0 +1,1200 @@
+{
+ "schema": 1,
+ "description": "DISC SELECT prefix candidates for the RX-driven harness xs8_disc_select_sweep.py. Logical ROOT TX bytes. Every byte is in the 169-byte ROOT no-visible-effect union (research/notes/xs8-key-release-candidates.md); known, dangerous, context-active and ambiguous bytes are excluded by construction and again by the harness. Ranking: research/XS8_COMMAND_COVERAGE.md ROOT columns, see the DISC SELECT candidate review of 2026-10-16.",
+ "suffix": "0x48",
+ "tested": [
+  {
+   "byte": "0x9A",
+   "suffix": "0x48",
+   "date": "2026-10-16",
+   "chain_id": 9,
+   "gap_ms": 214.1,
+   "rx": "RX_SILENT (only the two TX echoes)",
+   "start": "Disc 1 / Track 1",
+   "end": "Disc 1 / Track 4",
+   "physical": "NEGATIVE: no disc change; 0x48 was read as track 4 (operator observation)"
+  }
+ ],
+ "sets": {
+  "structural-26": {
+   "description": "The 26 structurally motivated prefixes, in documented rank order",
+   "candidates": [
+    {
+     "rank": 1,
+     "byte": "0x9A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Next to 8A DISC SKIP, mirroring the 6A/7A SEEK pair"
+    },
+    {
+     "rank": 2,
+     "byte": "0xCA",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Next to DA +10, the known multi-frame numeric-entry modifier"
+    },
+    {
+     "rank": 3,
+     "byte": "0xA8",
+     "tier": "Keypad column x8 continuation (08-98 are digits 0-9)",
+     "rationale": "First keypad slot after digit 9 (98)"
+    },
+    {
+     "rank": 4,
+     "byte": "0xBA",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Unused cell in the CD-only column"
+    },
+    {
+     "rank": 5,
+     "byte": "0xAA",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Unused cell in the CD-only column"
+    },
+    {
+     "rank": 6,
+     "byte": "0xFA",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 7,
+     "byte": "0x0A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 8,
+     "byte": "0x1A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 9,
+     "byte": "0x2A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 10,
+     "byte": "0x3A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 11,
+     "byte": "0x4A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 12,
+     "byte": "0x5A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 13,
+     "byte": "0xB8",
+     "tier": "Keypad column x8 continuation (08-98 are digits 0-9)",
+     "rationale": "Remaining non-digit keypad slot (C8/D8 excluded)"
+    },
+    {
+     "rank": 14,
+     "byte": "0xE8",
+     "tier": "Keypad column x8 continuation (08-98 are digits 0-9)",
+     "rationale": "Remaining non-digit keypad slot (C8/D8 excluded)"
+    },
+    {
+     "rank": 15,
+     "byte": "0xF8",
+     "tier": "Keypad column x8 continuation (08-98 are digits 0-9)",
+     "rationale": "Remaining non-digit keypad slot (C8/D8 excluded)"
+    },
+    {
+     "rank": 16,
+     "byte": "0x8C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Unused cell in the CD-only column"
+    },
+    {
+     "rank": 17,
+     "byte": "0xAC",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Unused cell in the CD-only column"
+    },
+    {
+     "rank": 18,
+     "byte": "0xDC",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Unused cell in the CD-only column"
+    },
+    {
+     "rank": 19,
+     "byte": "0x0C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 20,
+     "byte": "0x1C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 21,
+     "byte": "0x2C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 22,
+     "byte": "0x3C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 23,
+     "byte": "0x5C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 24,
+     "byte": "0x6C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 25,
+     "byte": "0x7C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 26,
+     "byte": "0x4C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "CD-only column; individually sent in a ROOT+CD follow-up with no RX and no visible effect"
+    }
+   ]
+  },
+  "filtered-169": {
+   "description": "All 169 filtered prefixes: the structural 26 first, then 140 unranked bytes in ascending order, then A4, C4, D4",
+   "candidates": [
+    {
+     "rank": 1,
+     "byte": "0x9A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Next to 8A DISC SKIP, mirroring the 6A/7A SEEK pair"
+    },
+    {
+     "rank": 2,
+     "byte": "0xCA",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Next to DA +10, the known multi-frame numeric-entry modifier"
+    },
+    {
+     "rank": 3,
+     "byte": "0xA8",
+     "tier": "Keypad column x8 continuation (08-98 are digits 0-9)",
+     "rationale": "First keypad slot after digit 9 (98)"
+    },
+    {
+     "rank": 4,
+     "byte": "0xBA",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Unused cell in the CD-only column"
+    },
+    {
+     "rank": 5,
+     "byte": "0xAA",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Unused cell in the CD-only column"
+    },
+    {
+     "rank": 6,
+     "byte": "0xFA",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 7,
+     "byte": "0x0A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 8,
+     "byte": "0x1A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 9,
+     "byte": "0x2A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 10,
+     "byte": "0x3A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 11,
+     "byte": "0x4A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 12,
+     "byte": "0x5A",
+     "tier": "CD-only column xA (6A/7A SEEK, 8A DISC SKIP, DA +10, EA TIME)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 13,
+     "byte": "0xB8",
+     "tier": "Keypad column x8 continuation (08-98 are digits 0-9)",
+     "rationale": "Remaining non-digit keypad slot (C8/D8 excluded)"
+    },
+    {
+     "rank": 14,
+     "byte": "0xE8",
+     "tier": "Keypad column x8 continuation (08-98 are digits 0-9)",
+     "rationale": "Remaining non-digit keypad slot (C8/D8 excluded)"
+    },
+    {
+     "rank": 15,
+     "byte": "0xF8",
+     "tier": "Keypad column x8 continuation (08-98 are digits 0-9)",
+     "rationale": "Remaining non-digit keypad slot (C8/D8 excluded)"
+    },
+    {
+     "rank": 16,
+     "byte": "0x8C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Unused cell in the CD-only column"
+    },
+    {
+     "rank": 17,
+     "byte": "0xAC",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Unused cell in the CD-only column"
+    },
+    {
+     "rank": 18,
+     "byte": "0xDC",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Unused cell in the CD-only column"
+    },
+    {
+     "rank": 19,
+     "byte": "0x0C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 20,
+     "byte": "0x1C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 21,
+     "byte": "0x2C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 22,
+     "byte": "0x3C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 23,
+     "byte": "0x5C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 24,
+     "byte": "0x6C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 25,
+     "byte": "0x7C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "Remaining unused cell in the CD-only column"
+    },
+    {
+     "rank": 26,
+     "byte": "0x4C",
+     "tier": "CD-only column xC (9C STOP, BC PLAY/PAUSE, CC REPEAT, EC/FC track skip)",
+     "rationale": "CD-only column; individually sent in a ROOT+CD follow-up with no RX and no visible effect"
+    },
+    {
+     "rank": 27,
+     "byte": "0x00",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 28,
+     "byte": "0x01",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 29,
+     "byte": "0x02",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 30,
+     "byte": "0x03",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 31,
+     "byte": "0x06",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 32,
+     "byte": "0x0B",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 33,
+     "byte": "0x0D",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 34,
+     "byte": "0x0E",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 35,
+     "byte": "0x0F",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 36,
+     "byte": "0x10",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 37,
+     "byte": "0x11",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 38,
+     "byte": "0x12",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 39,
+     "byte": "0x16",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 40,
+     "byte": "0x19",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 41,
+     "byte": "0x1B",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 42,
+     "byte": "0x1D",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 43,
+     "byte": "0x1E",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 44,
+     "byte": "0x1F",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 45,
+     "byte": "0x20",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 46,
+     "byte": "0x22",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 47,
+     "byte": "0x23",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 48,
+     "byte": "0x26",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 49,
+     "byte": "0x27",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 50,
+     "byte": "0x29",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 51,
+     "byte": "0x2B",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 52,
+     "byte": "0x2D",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 53,
+     "byte": "0x2E",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 54,
+     "byte": "0x2F",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 55,
+     "byte": "0x30",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 56,
+     "byte": "0x32",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 57,
+     "byte": "0x33",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 58,
+     "byte": "0x37",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 59,
+     "byte": "0x3B",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 60,
+     "byte": "0x3D",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 61,
+     "byte": "0x3E",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 62,
+     "byte": "0x3F",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 63,
+     "byte": "0x40",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 64,
+     "byte": "0x43",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 65,
+     "byte": "0x47",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 66,
+     "byte": "0x4B",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 67,
+     "byte": "0x4D",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 68,
+     "byte": "0x4E",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 69,
+     "byte": "0x4F",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 70,
+     "byte": "0x50",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 71,
+     "byte": "0x53",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 72,
+     "byte": "0x57",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 73,
+     "byte": "0x59",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 74,
+     "byte": "0x5B",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 75,
+     "byte": "0x5D",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 76,
+     "byte": "0x5E",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 77,
+     "byte": "0x5F",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 78,
+     "byte": "0x60",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 79,
+     "byte": "0x63",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 80,
+     "byte": "0x6B",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 81,
+     "byte": "0x6D",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 82,
+     "byte": "0x6E",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 83,
+     "byte": "0x6F",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 84,
+     "byte": "0x70",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 85,
+     "byte": "0x73",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 86,
+     "byte": "0x79",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 87,
+     "byte": "0x7B",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 88,
+     "byte": "0x7D",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 89,
+     "byte": "0x7E",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 90,
+     "byte": "0x7F",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 91,
+     "byte": "0x80",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 92,
+     "byte": "0x87",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 93,
+     "byte": "0x89",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 94,
+     "byte": "0x8B",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 95,
+     "byte": "0x8D",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 96,
+     "byte": "0x8E",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 97,
+     "byte": "0x8F",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 98,
+     "byte": "0x90",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 99,
+     "byte": "0x91",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 100,
+     "byte": "0x92",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 101,
+     "byte": "0x93",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 102,
+     "byte": "0x95",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 103,
+     "byte": "0x96",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 104,
+     "byte": "0x97",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 105,
+     "byte": "0x99",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 106,
+     "byte": "0x9B",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 107,
+     "byte": "0x9D",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 108,
+     "byte": "0x9E",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 109,
+     "byte": "0x9F",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 110,
+     "byte": "0xA0",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 111,
+     "byte": "0xA2",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 112,
+     "byte": "0xA3",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 113,
+     "byte": "0xA7",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 114,
+     "byte": "0xAB",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 115,
+     "byte": "0xAD",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 116,
+     "byte": "0xAE",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 117,
+     "byte": "0xAF",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 118,
+     "byte": "0xB0",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 119,
+     "byte": "0xB1",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 120,
+     "byte": "0xB2",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 121,
+     "byte": "0xB3",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 122,
+     "byte": "0xB5",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 123,
+     "byte": "0xB7",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 124,
+     "byte": "0xB9",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 125,
+     "byte": "0xBB",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 126,
+     "byte": "0xBD",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 127,
+     "byte": "0xBE",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 128,
+     "byte": "0xBF",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 129,
+     "byte": "0xC0",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 130,
+     "byte": "0xC1",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 131,
+     "byte": "0xC2",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 132,
+     "byte": "0xC5",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 133,
+     "byte": "0xC6",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 134,
+     "byte": "0xC7",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 135,
+     "byte": "0xC9",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 136,
+     "byte": "0xCB",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 137,
+     "byte": "0xCD",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 138,
+     "byte": "0xCE",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 139,
+     "byte": "0xCF",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 140,
+     "byte": "0xD0",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 141,
+     "byte": "0xD1",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 142,
+     "byte": "0xD2",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 143,
+     "byte": "0xD7",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 144,
+     "byte": "0xD9",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 145,
+     "byte": "0xDB",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 146,
+     "byte": "0xDD",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 147,
+     "byte": "0xDE",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 148,
+     "byte": "0xDF",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 149,
+     "byte": "0xE0",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 150,
+     "byte": "0xE1",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 151,
+     "byte": "0xE2",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 152,
+     "byte": "0xE7",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 153,
+     "byte": "0xEB",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 154,
+     "byte": "0xED",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 155,
+     "byte": "0xEE",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 156,
+     "byte": "0xEF",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 157,
+     "byte": "0xF0",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 158,
+     "byte": "0xF2",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 159,
+     "byte": "0xF3",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 160,
+     "byte": "0xF5",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 161,
+     "byte": "0xF6",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 162,
+     "byte": "0xF7",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 163,
+     "byte": "0xFB",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 164,
+     "byte": "0xFD",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 165,
+     "byte": "0xFE",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 166,
+     "byte": "0xFF",
+     "tier": "Unranked ROOT no-visible-effect byte",
+     "rationale": "No structural evidence; ascending byte order"
+    },
+    {
+     "rank": 167,
+     "byte": "0xA4",
+     "tier": "Deprioritised",
+     "rationale": "Negative in ROOT and in the 0x17 tuner-family pass; tuner submode dependence possible"
+    },
+    {
+     "rank": 168,
+     "byte": "0xC4",
+     "tier": "Deprioritised",
+     "rationale": "Negative in ROOT and in the 0x17 tuner-family pass; tuner submode dependence possible"
+    },
+    {
+     "rank": 169,
+     "byte": "0xD4",
+     "tier": "Deprioritised",
+     "rationale": "D4 is also the candidate disc-change RX label; A4/C4 share its tuner-family negative pass"
+    }
+   ]
+  }
+ }
+}
