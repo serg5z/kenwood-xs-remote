@@ -186,6 +186,32 @@ static void test_self_capture(void)
     assert(result.additional_frames == 1);
 }
 
+static void test_self_capture_rejects_incompatible_tail(void)
+{
+    for (unsigned int variant = 0; variant < 4; ++variant) {
+        struct capture_fixture fixture = new_capture();
+        captured_frame(&fixture, 0x84);
+        if (variant == 0) {
+            /* Missing final DATA fall, dense global numbering. */
+            fixture.edges[18] = fixture.edges[19];
+            fixture.edges[18].sequence = 19;
+            --fixture.capture.count;
+        } else if (variant == 1) {
+            /* BUSY-first: same bit value, different tail ordering. */
+            fixture.edges[18].gpio = 23;
+            fixture.edges[19].gpio = 27;
+        } else if (variant == 2) {
+            fixture.edges[19].timestamp_ns = fixture.edges[18].timestamp_ns;
+        } else {
+            fixture.edges[19].timestamp_ns = fixture.edges[18].timestamp_ns + 2000001;
+        }
+        fixture.capture.edges = fixture.edges;
+        struct self_capture_result result = verify_self_capture(
+            &fixture.capture, 0x84, true, 500000, 150000000, false);
+        assert(result.capture == CAPTURE_INCOMPLETE && result.match == MATCH_UNKNOWN);
+    }
+}
+
 int main(void)
 {
     struct fixture fixture = {0};
@@ -244,6 +270,7 @@ int main(void)
     xs8_decoder_flush(&fixture.decoder, collect, &fixture);
     assert(fixture.count == 7 && !fixture.results[6].valid);
     test_self_capture();
+    test_self_capture_rejects_incompatible_tail();
     puts("XS8 offline decoder tests passed");
     return 0;
 }

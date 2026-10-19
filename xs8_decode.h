@@ -23,6 +23,10 @@ struct xs8_decoded {
     uint8_t legacy_msb_short1;
     unsigned int bits;
     const char *reason;
+    /* Observations at frame emission, not receiver acknowledgments. A passive
+     * BUSY-first frame can be valid before its final DATA fall is observed. */
+    uint64_t final_data_rise_ns, final_data_fall_ns, busy_fall_ns;
+    bool tail_fell;
 };
 
 typedef void (*xs8_decode_output)(void *, const struct xs8_decoded *);
@@ -38,6 +42,7 @@ struct xs8_decoder {
     bool synced;
     bool active;
     bool tail_fell;
+    uint64_t final_data_rise_ns, final_data_fall_ns, busy_fall_ns;
     const char *error;
 };
 
@@ -46,5 +51,9 @@ void xs8_decoder_edge(struct xs8_decoder *decoder, const struct xs8_edge *edge,
                       xs8_decode_output output, void *user);
 void xs8_decoder_flush(struct xs8_decoder *decoder, xs8_decode_output output,
                        void *user);
+/* Stricter than passive validity: our GPIO TX ends DATA HIGH (~4.9 ms),
+ * then drops DATA before BUSY (~0.75 ms guard). Allows a 3..7 ms HIGH
+ * and a strictly positive guard up to 2 ms; does not prove execution. */
+bool xs8_decoded_local_tx_tail_valid(const struct xs8_decoded *frame);
 
 #endif

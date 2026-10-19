@@ -22,7 +22,11 @@ static void emit_frame(struct xs8_decoder *decoder, const char *reason,
         .waveform_lsb = decoder->waveform_lsb,
         .legacy_msb_short1 = decoder->legacy_msb_short1,
         .bits = decoder->bits,
-        .reason = reason ? reason : decoder->error
+        .reason = reason ? reason : decoder->error,
+        .final_data_rise_ns = decoder->final_data_rise_ns,
+        .final_data_fall_ns = decoder->final_data_fall_ns,
+        .busy_fall_ns = decoder->busy_fall_ns,
+        .tail_fell = decoder->tail_fell
     };
     if (!result.valid && !result.reason) result.reason = "TRUNCATED";
     output(user, &result);
@@ -53,6 +57,7 @@ void xs8_decoder_edge(struct xs8_decoder *decoder, const struct xs8_edge *edge,
 
     if (edge->gpio == BUSY_GPIO) {
         if (edge->kind == XS8_FALLING) {
+            decoder->busy_fall_ns = edge->time_ns;
             if (decoder->active && decoder->stage == 4 &&
                 !decoder->tail_fell &&
                 (edge->time_ns < decoder->phase_start_ns ||
@@ -70,6 +75,9 @@ void xs8_decoder_edge(struct xs8_decoder *decoder, const struct xs8_edge *edge,
             decoder->bits = 0;
             decoder->stage = 0;
             decoder->tail_fell = false;
+            decoder->final_data_rise_ns = 0;
+            decoder->final_data_fall_ns = 0;
+            decoder->busy_fall_ns = 0;
             decoder->error = NULL;
         }
         return;
@@ -93,6 +101,7 @@ void xs8_decoder_edge(struct xs8_decoder *decoder, const struct xs8_edge *edge,
                 (decoder->legacy_msb_short1 << 1) | !long_low);
             ++decoder->bits;
             decoder->stage = decoder->bits == 8 ? 4 : 3;
+            if (decoder->bits == 8) decoder->final_data_rise_ns = edge->time_ns;
         } else decoder->error = "UNEXPECTED_DATA_EDGE";
     } else {
         if (decoder->stage == 1) {
@@ -107,6 +116,7 @@ void xs8_decoder_edge(struct xs8_decoder *decoder, const struct xs8_edge *edge,
             if (decoder->tail_fell || !within(elapsed, 3000000, 7000000))
                 decoder->error = "TAIL_TIMING";
             decoder->tail_fell = true;
+            decoder->final_data_fall_ns = edge->time_ns;
         } else decoder->error = "UNEXPECTED_DATA_EDGE";
     }
     decoder->phase_start_ns = edge->time_ns;
@@ -116,4 +126,14 @@ void xs8_decoder_flush(struct xs8_decoder *decoder, xs8_decode_output output,
                        void *user)
 {
     emit_frame(decoder, "CAPTURE_ENDED", output, user);
+}
+
+bool xs8_decoded_local_tx_tail_valid(const struct xs8_decoded *frame)
+{
+    if (frame->kind != XS8_FRAME || !frame->valid || !frame->tail_fell ||
+        frame->final_data_fall_ns <= frame->final_data_rise_ns ||
+        frame->busy_fall_ns <= frame->final_data_fall_ns) return false;
+    return within(frame->final_data_fall_ns - frame->final_data_rise_ns,
+                  3000000, 7000000) &&
+           frame->busy_fall_ns - frame->final_data_fall_ns <= 2000000;
 }

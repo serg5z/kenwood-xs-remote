@@ -470,7 +470,8 @@ enum xs8_observation xs8_monitor_verify_tx(struct xs8_monitor *monitor,
                 pthread_mutex_unlock(&monitor->observation_lock);
                 return XS8_OBS_INVALID;
             }
-            enum xs8_observation result = !record.decoded.valid
+            enum xs8_observation result =
+                !xs8_decoded_local_tx_tail_valid(&record.decoded)
                 ? XS8_OBS_INVALID
                 : record.decoded.waveform_lsb == byte
                     ? XS8_OBS_MATCH : XS8_OBS_MISMATCH;

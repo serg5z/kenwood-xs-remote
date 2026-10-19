@@ -191,7 +191,7 @@ static void inspect_frame(void *user, const struct xs8_decoded *decoded)
     if (!verification->candidate_seen) {
         if (decoded->time_ns > verification->end_ns) return;
         verification->candidate_seen = true;
-        verification->candidate_valid = decoded->valid;
+        verification->candidate_valid = xs8_decoded_local_tx_tail_valid(decoded);
         if (!decoded->valid) return;
         verification->observed_lsb = decoded->waveform_lsb;
         verification->observed_legacy = decoded->legacy_msb_short1;

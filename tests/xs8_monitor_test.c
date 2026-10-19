@@ -26,7 +26,7 @@ struct gpiod_edge_event_buffer {
 };
 
 static struct {
-    struct gpiod_edge_event batches[8][16];
+    struct gpiod_edge_event batches[8][128];
     size_t sizes[8];
     size_t queued, next;
     int pipe[2];
@@ -150,7 +150,7 @@ static const char *logged_so_far(void)
 
 static void queue(const struct gpiod_edge_event *events, size_t count)
 {
-    assert(fake.queued < 8 && count <= 16);
+    assert(fake.queued < 8 && count <= 128);
     memcpy(fake.batches[fake.queued], events, count * sizeof(events[0]));
     fake.sizes[fake.queued++] = count;
     assert(write(fake.pipe[1], "x", 1) == 1);
@@ -311,6 +311,276 @@ static void test_unreadable_busy_level_still_fails_start(void)
     assert(!strstr(log, "monitor armed"));
 }
 
+/* Counter continuity is assessed independently of the production decoder.
+ * Dense numbering models an edge absent before event numbering; retaining the
+ * original counters models a record lost after numbering. Neither proves the
+ * electrical cause of an actual kernel discontinuity. */
+static void number_trace(struct gpiod_edge_event *events, size_t count)
+{
+    unsigned long lines[64] = {0};
+    for (size_t i = 0; i < count; ++i) {
+        events[i].global_seqno = i + 1;
+        events[i].line_seqno = ++lines[events[i].offset];
+    }
+}
+
+static size_t frame_trace(struct gpiod_edge_event *events, uint8_t byte)
+{
+    uint64_t t = 1000000;
+    size_t n = 0;
+    events[n++] = edge(BUSY, 0, 0, t, GPIOD_EDGE_EVENT_RISING_EDGE);
+    t += 1150000;
+    events[n++] = edge(DATA, 0, 0, t, GPIOD_EDGE_EVENT_RISING_EDGE);
+    t += 9800000;
+    events[n++] = edge(DATA, 0, 0, t, GPIOD_EDGE_EVENT_FALLING_EDGE);
+    for (unsigned int bit = 0; bit < 8; ++bit) {
+        t += (byte & (1u << bit)) ? 9800000 : 4900000;
+        events[n++] = edge(DATA, 0, 0, t, GPIOD_EDGE_EVENT_RISING_EDGE);
+        t += 4900000;
+        events[n++] = edge(DATA, 0, 0, t, GPIOD_EDGE_EVENT_FALLING_EDGE);
+    }
+    events[n++] = edge(BUSY, 0, 0, t + 750000,
+                       GPIOD_EDGE_EVENT_FALLING_EDGE);
+    number_trace(events, n);
+    assert(n == 20);
+    return n;
+}
+
+struct decoded_trace {
+    struct xs8_decoded records[8];
+    size_t count;
+};
+
+static void save_decoded(void *user, const struct xs8_decoded *record)
+{
+    struct decoded_trace *trace = user;
+    assert(trace->count < 8);
+    trace->records[trace->count++] = *record;
+}
+
+enum injection { CONTROL, GLOBAL_ONLY, MISSING_DATA_GAP, MISSING_DATA_DENSE,
+                 EXTRA_BUSY, MISSING_TAIL_GAP, MISSING_TAIL_DENSE };
+
+static void test_frame_injection(enum injection injection, bool split_batch)
+{
+    static const char *names[] = {"control", "global-only-2-to-5",
+        "missing-data-retained-counters", "missing-data-dense-counters",
+        "extra-busy-rise", "missing-tail-retained-counters",
+        "missing-tail-dense-counters"};
+    struct gpiod_edge_event events[21];
+    size_t n = frame_trace(events, 0x84);
+    const uint64_t start = events[0].timestamp_ns;
+    const uint64_t end = events[n - 1].timestamp_ns;
+    if (injection == GLOBAL_ONLY) {
+        for (size_t i = 2; i < n; ++i) events[i].global_seqno += 2;
+        assert(events[2].global_seqno == 5 && events[2].line_seqno == 2);
+    } else if (injection == MISSING_DATA_GAP || injection == MISSING_DATA_DENSE ||
+               injection == MISSING_TAIL_GAP || injection == MISSING_TAIL_DENSE) {
+        size_t removed = (injection == MISSING_TAIL_GAP ||
+                          injection == MISSING_TAIL_DENSE) ? n - 2 : 3;
+        assert(events[removed].offset == DATA);
+        memmove(events + removed, events + removed + 1,
+                (n - removed - 1) * sizeof(events[0]));
+        --n;
+        if (injection == MISSING_DATA_DENSE || injection == MISSING_TAIL_DENSE)
+            number_trace(events, n);
+    } else if (injection == EXTRA_BUSY) {
+        /* Deliberately inconsistent BUSY rising event while BUSY is HIGH. */
+        memmove(events + 5, events + 4, (n - 4) * sizeof(events[0]));
+        events[4] = edge(BUSY, 0, 0, events[3].timestamp_ns - ARMED_NS + 1000000,
+                         GPIOD_EDGE_EVENT_RISING_EDGE);
+        number_trace(events, ++n);
+    }
+
+    unsigned long global = 0, lines[64] = {0};
+    unsigned int global_breaks = 0, line_breaks = 0;
+    for (size_t i = 0; i < n; ++i) {
+        global_breaks += events[i].global_seqno != global + 1;
+        line_breaks += events[i].line_seqno != lines[events[i].offset] + 1;
+        global = events[i].global_seqno;
+        lines[events[i].offset] = events[i].line_seqno;
+    }
+    bool gap = injection == GLOBAL_ONLY || injection == MISSING_DATA_GAP ||
+               injection == MISSING_TAIL_GAP;
+    assert(global_breaks == (gap ? 1u : 0u));
+    /* A missing final DATA event has no later DATA counter to expose its loss. */
+    assert(line_breaks == (injection == MISSING_DATA_GAP ? 1u : 0u));
+
+    /* Replay unchanged events through the real decoder to inspect its final
+     * internal state, then compare every emitted record to the real monitor. */
+    struct xs8_decoder decoder;
+    struct decoded_trace decoded = {0};
+    xs8_decoder_init(&decoder, true);
+    for (size_t i = 0; i < n; ++i) {
+        struct xs8_edge e = {events[i].timestamp_ns, events[i].global_seqno,
+            events[i].offset, events[i].type == GPIOD_EDGE_EVENT_RISING_EDGE
+                ? XS8_RISING : XS8_FALLING};
+        xs8_decoder_edge(&decoder, &e, save_decoded, &decoded);
+    }
+    assert(!decoder.active && decoder.synced);
+    assert(decoded.count > 0);
+    static const unsigned int expected_bits[] = {8, 0, 0, 7, 6, 8, 8};
+    static const unsigned int expected_stage[] = {4, 1, 2, 2, 2, 4, 4};
+    static const char *first_reason[] = {NULL, "EVENT_GAP", "EVENT_GAP",
+        "UNEXPECTED_DATA_EDGE", "NEW_BUSY_RISE", "EVENT_GAP", NULL};
+    assert(decoder.bits == expected_bits[injection]);
+    assert(decoder.stage == expected_stage[injection]);
+    assert(first_reason[injection] ? decoded.records[0].reason &&
+        strcmp(decoded.records[0].reason, first_reason[injection]) == 0 :
+        decoded.records[0].reason == NULL);
+
+    setup(0, 0);
+    struct xs8_monitor *monitor = NULL;
+    assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
+    uint64_t checkpoint = xs8_monitor_checkpoint(monitor);
+    if (split_batch) {
+        queue(events, 2);
+        assert(xs8_monitor_poll(monitor, 0) == 0);
+        assert(xs8_monitor_healthy(monitor));
+    }
+    queue(events + (split_batch ? 2 : 0), n - (split_batch ? 2 : 0));
+    assert(xs8_monitor_poll(monitor, 0) == 0);
+    bool healthy = xs8_monitor_healthy(monitor);
+    assert(healthy == !gap);
+    struct xs8_monitor_record records[8];
+    size_t count = 0;
+    uint64_t cursor = checkpoint;
+    assert(xs8_monitor_snapshot(monitor, &cursor, records, 8, &count) == 0);
+    assert(count == decoded.count);
+    unsigned int valid = 0, invalid = 0, gaps = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const struct xs8_decoded *actual = &records[i].decoded;
+        const struct xs8_decoded *expected = &decoded.records[i];
+        assert(actual->kind == expected->kind && actual->valid == expected->valid);
+        assert(actual->time_ns == expected->time_ns && actual->bits == expected->bits);
+        assert(actual->waveform_lsb == expected->waveform_lsb);
+        assert(actual->legacy_msb_short1 == expected->legacy_msb_short1);
+        assert(actual->lost_events == expected->lost_events);
+        assert(actual->tail_fell == expected->tail_fell);
+        assert(actual->final_data_rise_ns == expected->final_data_rise_ns);
+        assert(actual->final_data_fall_ns == expected->final_data_fall_ns);
+        assert(actual->busy_fall_ns == expected->busy_fall_ns);
+        assert((!actual->reason && !expected->reason) ||
+               (actual->reason && expected->reason &&
+                strcmp(actual->reason, expected->reason) == 0));
+        if (actual->kind == XS8_EVENT_GAP) ++gaps;
+        else if (actual->valid) ++valid;
+        else ++invalid;
+    }
+    bool passive_valid = injection == CONTROL || injection == MISSING_TAIL_DENSE;
+    bool accepted = injection == CONTROL;
+    assert(valid == (passive_valid ? 1u : 0u));
+    assert(invalid == (passive_valid ? 0u : injection == EXTRA_BUSY ? 2u : 1u));
+    assert(gaps == (gap ? 1u : 0u));
+    if (passive_valid) assert(records[0].decoded.waveform_lsb == 0x84);
+    enum xs8_observation outcome = xs8_monitor_verify_tx(
+        monitor, checkpoint, 0x84, start, end, 1);
+    assert(outcome == (gap ? XS8_OBS_UNHEALTHY :
+                       accepted ? XS8_OBS_MATCH : XS8_OBS_INVALID));
+    if (gap) assert(xs8_monitor_poll(monitor, 0) == -1);
+    xs8_monitor_stop(monitor);
+    const char *log = teardown();
+    assert(count_of(log, "monitor FAILED") == (gap ? 1 : 0));
+    if (gap) assert(strstr(log, "monitor FAILED reason=SEQUENCE_GAP"));
+    if (injection == GLOBAL_ONLY) assert(strstr(log,
+        "expected_seqno=3 actual_seqno=5 line_seqno=2 event_index=3"));
+
+    printf("fault-injection case=%s batches=%u health=%s failure=%s "
+           "global_breaks=%u line_breaks=%u decoder_active=%u synced=%u "
+           "stage=%u bits=%u valid_frames=%u invalid_frames=%u gap_records=%u "
+           "first_reason=%s verification=%s rejected=%s\n",
+           names[injection], split_batch ? 2 : 1, healthy ? "HEALTHY" : "FAILED",
+           gap ? "SEQUENCE_GAP" : "NONE", global_breaks, line_breaks,
+           decoder.active, decoder.synced, decoder.stage, decoder.bits,
+           valid, invalid, gaps, decoded.records[0].reason ?
+           decoded.records[0].reason : "NONE", gap ? "UNHEALTHY" :
+           accepted ? "MATCH" : "INVALID", accepted ? "no" : "yes");
+}
+
+static void check_tail_trace(const struct gpiod_edge_event *events, size_t count,
+                            uint8_t byte, bool passive_valid, bool local_match,
+                            bool tail_fell)
+{
+    setup(0, 0);
+    struct xs8_monitor *monitor = NULL;
+    assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
+    queue(events, count);
+    assert(xs8_monitor_poll(monitor, 0) == 0);
+    assert(xs8_monitor_healthy(monitor));
+    struct xs8_monitor_record records[2];
+    uint64_t cursor = 0;
+    size_t copied = 0;
+    assert(xs8_monitor_snapshot(monitor, &cursor, records, 2, &copied) == 0);
+    assert(copied == 1);
+    const struct xs8_decoded *frame = &records[0].decoded;
+    assert(frame->valid == passive_valid && frame->bits == 8);
+    assert(frame->waveform_lsb == byte && frame->tail_fell == tail_fell);
+    assert(frame->final_data_rise_ns == events[17].timestamp_ns);
+    assert(frame->final_data_fall_ns == (tail_fell ? events[18].timestamp_ns : 0));
+    assert(frame->busy_fall_ns == events[tail_fell ? 19 : 18].timestamp_ns);
+    assert(xs8_decoded_local_tx_tail_valid(frame) == local_match);
+    assert(xs8_monitor_verify_tx(monitor, 0, byte, events[0].timestamp_ns,
+        events[count - 1].timestamp_ns, 1) ==
+        (local_match ? XS8_OBS_MATCH : XS8_OBS_INVALID));
+    xs8_monitor_stop(monitor);
+    assert(!strstr(teardown(), "monitor FAILED"));
+}
+
+static void test_archived_passive_tails(void)
+{
+    /* Full sampled timings, us relative to the first BUSY rise:
+     * power-off-on.csv lines 3..22 (BUSY-first), 23..42 (DATA-first),
+     * xs-session2.csv lines 3..21 (both falls in the same ADC sample).
+     * A joint sample does not establish electrically simultaneous edges;
+     * replay both possible delivery orders with equal timestamps. */
+    static const unsigned int us[3][20] = {
+        {0,1168,11064,15816,20784,25764,30728,40400,45360,50328,
+         55296,64968,69936,74904,79888,84632,89600,94568,99312,100024},
+        {0,936,10840,20520,25264,34952,39928,49600,54568,59304,
+         64272,69032,74016,78760,83720,93392,98136,103104,107856,108576},
+        {0,1160,11056,16024,20984,25720,30696,40600,45568,50312,
+         55280,60248,65216,69952,74912,79880,84848,94520,99488,99488}
+    };
+    static const uint8_t bytes[] = {0x14, 0x47, 0x84};
+    for (unsigned int variant = 0; variant < 4; ++variant) {
+        unsigned int capture = variant < 3 ? variant : 2;
+        struct gpiod_edge_event events[20];
+        assert(frame_trace(events, bytes[capture]) == 20);
+        bool data_first = variant == 1 || variant == 2;
+        if (!data_first) {
+            struct gpiod_edge_event swap = events[18];
+            events[18] = events[19];
+            events[19] = swap;
+        }
+        for (size_t i = 0; i < 20; ++i)
+            events[i].timestamp_ns = ARMED_NS + 1000000 + (uint64_t)us[capture][i] * 1000;
+        number_trace(events, 20);
+        check_tail_trace(events, 20, bytes[capture], true, variant == 1, data_first);
+    }
+}
+
+static void test_incompatible_local_tail_timing(void)
+{
+    /* HIGH outside the existing 3..7 ms decoder tolerance, absent/reversed
+     * guard (archived tests above), or guard beyond local verification's 2 ms.
+     * Positive guard boundary cases document the verification tolerance. */
+    static const struct { uint64_t high, guard; bool valid, match; } cases[] = {
+        {2999999, 750000, false, false},
+        {7000001, 750000, false, false},
+        {4900000, 0, true, false},
+        {4900000, 2000001, true, false},
+        {4900000, 1, true, true},
+        {4900000, 2000000, true, true}
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        struct gpiod_edge_event events[20];
+        assert(frame_trace(events, 0x84) == 20);
+        events[18].timestamp_ns = events[17].timestamp_ns + cases[i].high;
+        events[19].timestamp_ns = events[18].timestamp_ns + cases[i].guard;
+        check_tail_trace(events, 20, 0x84, cases[i].valid, cases[i].match, true);
+    }
+}
+
 int main(void)
 {
     test_arming_logs_levels_and_clean_events_stay_healthy();
@@ -320,6 +590,12 @@ int main(void)
     test_clean_shutdown_logs_no_fault();
     test_unreadable_data_level_does_not_block_start();
     test_unreadable_busy_level_still_fails_start();
+    test_archived_passive_tails();
+    test_incompatible_local_tail_timing();
+    for (int injection = CONTROL; injection <= MISSING_TAIL_DENSE; ++injection) {
+        test_frame_injection((enum injection)injection, false);
+        test_frame_injection((enum injection)injection, true);
+    }
     puts("xs8_monitor_test: OK");
     return 0;
 }
