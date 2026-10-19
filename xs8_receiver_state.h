@@ -17,6 +17,7 @@ public:
     void apply_query(const Xs8QueryStatus& query, uint64_t now_ns);
     void history_overflow();
     void monitor_failed();
+    void capture_warning();
     // A local source or MONITOR command may change that field: the current
     // value becomes UNKNOWN and frames that began before floor_ns can no longer
     // set it. The cleared observation is kept as last-known, for diagnostics only.

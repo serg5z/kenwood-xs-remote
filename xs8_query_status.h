@@ -22,6 +22,7 @@ public:
     void observe(const xs8_monitor_record *records, size_t count);
     void overflow();
     void monitor_failed();
+    void capture_warning();
     void cancel();
     bool done(uint64_t now_ns) const;
     bool successful(uint64_t now_ns) const;
@@ -33,7 +34,7 @@ private:
     enum class Fault {
         NONE, TX_MISSING, NO_REPLY, PARTIAL, TX_INVALID, TX_MISMATCH, EVENT_GAP,
         HISTORY_OVERFLOW, MONITOR_FAILED, CANCELLED, OVERLAP, INCOMPLETE,
-        EXTRA, OUT_OF_ORDER
+        EXTRA, OUT_OF_ORDER, GLOBAL_GAP_WARNING
     };
     uint64_t tx_start_ns_;
     uint64_t tx_end_ns_;

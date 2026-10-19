@@ -27,6 +27,7 @@ struct xs8_decoded {
      * BUSY-first frame can be valid before its final DATA fall is observed. */
     uint64_t final_data_rise_ns, final_data_fall_ns, busy_fall_ns;
     bool tail_fell;
+    uint64_t global_gap_warnings; /* exempt gaps spanning this frame */
 };
 
 typedef void (*xs8_decode_output)(void *, const struct xs8_decoded *);
@@ -42,6 +43,7 @@ struct xs8_decoder {
     bool synced;
     bool active;
     bool tail_fell;
+    uint64_t global_gap_warnings;
     uint64_t final_data_rise_ns, final_data_fall_ns, busy_fall_ns;
     const char *error;
 };

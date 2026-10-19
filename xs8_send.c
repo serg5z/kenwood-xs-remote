@@ -17,6 +17,7 @@
 #include <string.h>
 #include <time.h>
 
+#define BUSY_RX 26
 #define CAPTURE_NS 1000000000LL
 #define EVENT_BATCH 256
 #define INITIAL_EDGES 4096
@@ -403,7 +404,7 @@ int main(int argc, char **argv)
         }
         cap.capacity = INITIAL_EDGES;
         pthread_mutex_lock(&bus.rx_lock);
-        int initial_busy = gpiod_line_request_get_value(bus.rx_req, 23);
+        int initial_busy = gpiod_line_request_get_value(bus.rx_req, BUSY_RX);
         pthread_mutex_unlock(&bus.rx_lock);
         if (initial_busy < 0) {
             perror("Initial BUSY read");

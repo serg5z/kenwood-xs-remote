@@ -13,8 +13,8 @@
 #include <string.h>
 
 #define EVENT_BATCH 128
-#define BUSY_GPIO 23
-#define DATA_GPIO 27
+#define BUSY_GPIO 26
+#define DATA_GPIO 13
 #define OBS_HISTORY 64
 #define OBS_TAIL_NS 2000000ULL
 
@@ -29,11 +29,15 @@ struct xs8_monitor {
     uint64_t incomplete_gap_frames, dropped_frame_logs;
     unsigned int max_batch;
     pthread_mutex_t observation_lock;
+    pthread_mutex_t processing_lock; /* batch, decoder and diagnostic snapshot */
     pthread_cond_t observation_changed;
     struct xs8_monitor_record observations[OBS_HISTORY];
     uint64_t observation_serial;
     atomic_bool healthy;
     bool threaded;
+    bool warn_global_gaps;
+    uint64_t last_line_sequence[2]; /* BUSY, DATA; independent of global seqno */
+    uint64_t line_gaps, line_missing, line_regressions, global_gap_warnings;
 };
 
 struct decoded_batch {
@@ -125,6 +129,12 @@ static void log_decoded_batch(struct xs8_monitor *monitor,
 static int read_events(struct xs8_monitor *monitor)
 {
     struct decoded_batch decoded = {0};
+    struct {
+        uint64_t expected, actual, line_sequence, timestamp_ns, previous_ns;
+        uint64_t event_index, frame_start_ns;
+        unsigned int gpio, bits, stage;
+    } warnings[EVENT_BATCH];
+    size_t warning_count = 0;
     pthread_mutex_lock(&monitor->bus->rx_lock);
     int count = gpiod_line_request_read_edge_events(
         monitor->bus->rx_req, monitor->buffer, EVENT_BATCH);
@@ -150,17 +160,93 @@ static int read_events(struct xs8_monitor *monitor)
         ++monitor->total_events;
         if (edge.gpio == BUSY_GPIO) ++monitor->busy_edges;
         else if (edge.gpio == DATA_GPIO) ++monitor->data_edges;
-        if (xs8_capture_check(&monitor->capture, edge.gpio, edge.sequence,
-                gpiod_edge_event_get_line_seqno(event), edge.time_ns,
-                monitor->total_events))
+        uint64_t line_sequence = gpiod_edge_event_get_line_seqno(event);
+        int line = edge.gpio == BUSY_GPIO ? 0 : edge.gpio == DATA_GPIO ? 1 : -1;
+        uint64_t expected_line = line < 0 ? 0 : monitor->last_line_sequence[line] + 1;
+        unsigned int line_fault = 0;
+        if (line < 0) line_fault = XS8_CAPTURE_UNEXPECTED_LINE;
+        else {
+            if (line_sequence > expected_line) {
+                line_fault = XS8_CAPTURE_LINE_SEQUENCE_GAP;
+                ++monitor->line_gaps;
+                monitor->line_missing += line_sequence - expected_line;
+            } else if (line_sequence < expected_line) {
+                line_fault = XS8_CAPTURE_LINE_SEQUENCE_REGRESSION;
+                ++monitor->line_regressions;
+            }
+            monitor->last_line_sequence[line] = line_sequence;
+        }
+        const uint64_t expected_global = monitor->capture.last_sequence + 1;
+        const uint64_t previous_ns = monitor->capture.last_timestamp;
+        unsigned int reasons = xs8_capture_check_policy(&monitor->capture,
+            edge.gpio, edge.sequence, line_sequence, edge.time_ns,
+            monitor->total_events, monitor->warn_global_gaps && !line_fault);
+        if (line_fault) {
+            if (!monitor->capture.fault_recorded) {
+                monitor->capture.fault_recorded = true;
+                monitor->capture.first_fault = (struct xs8_capture_fault){
+                    .has_edge = true, .gpio = edge.gpio,
+                    .expected_sequence = expected_global,
+                    .actual_sequence = edge.sequence, .line_sequence = line_sequence,
+                    .previous_timestamp_ns = previous_ns, .timestamp_ns = edge.time_ns,
+                    .event_index = monitor->total_events
+                };
+            }
+            if (monitor->capture.first_fault.event_index == monitor->total_events) {
+                monitor->capture.first_fault.reasons |= line_fault;
+                monitor->capture.first_fault.expected_line_sequence = expected_line;
+            }
+        }
+        if (monitor->warn_global_gaps && !line_fault &&
+            reasons == XS8_CAPTURE_SEQUENCE_GAP) {
+            ++monitor->global_gap_warnings;
+            warnings[warning_count].expected = expected_global;
+            warnings[warning_count].actual = edge.sequence;
+            warnings[warning_count].line_sequence = line_sequence;
+            warnings[warning_count].timestamp_ns = edge.time_ns;
+            warnings[warning_count].previous_ns = previous_ns;
+            warnings[warning_count].event_index = monitor->total_events;
+            warnings[warning_count].frame_start_ns = monitor->decoder.active
+                ? monitor->decoder.frame_start_ns : 0;
+            warnings[warning_count].gpio = edge.gpio;
+            warnings[warning_count].bits = monitor->decoder.bits;
+            warnings[warning_count++].stage = monitor->decoder.stage;
+            /* Explicit experimental exemption from the decoder's global-gap
+             * reset. Keep the raw event/counters untouched; never bypass a
+             * line fault, regression, timestamp fault or waveform check. */
+            monitor->decoder.last_sequence = edge.sequence - 1;
+            ++monitor->decoder.global_gap_warnings;
+        } else if (reasons || line_fault) {
             capture_fault = true;
+        }
         decoded.current_event_ns = edge.time_ns;
         xs8_decoder_edge(&monitor->decoder, &edge,
                          collect_decoded, &decoded);
+        if (monitor->warn_global_gaps && !line_fault &&
+            reasons == XS8_CAPTURE_SEQUENCE_GAP &&
+            edge.gpio == BUSY_GPIO && edge.kind == XS8_RISING && monitor->decoder.active)
+            monitor->decoder.global_gap_warnings = 1;
     }
+    /* No logging in the edge-processing loop; preserve delivery order. */
+    for (size_t i = 0; i < warning_count; ++i)
+        fprintf(stderr, "XS8 OBSERVED_BUS WARNING reason=GLOBAL_ONLY_SEQUENCE_GAP "
+                "policy=warn gpio=%u expected_seqno=%llu actual_seqno=%llu "
+                "line_seqno=%llu event_index=%llu event_mono_ns=%llu "
+                "previous_event_mono_ns=%llu frame_start_ns=%llu bits=%u stage=%u\n",
+                warnings[i].gpio, (unsigned long long)warnings[i].expected,
+                (unsigned long long)warnings[i].actual,
+                (unsigned long long)warnings[i].line_sequence,
+                (unsigned long long)warnings[i].event_index,
+                (unsigned long long)warnings[i].timestamp_ns,
+                (unsigned long long)warnings[i].previous_ns,
+                (unsigned long long)warnings[i].frame_start_ns,
+                warnings[i].bits, warnings[i].stage);
     log_decoded_batch(monitor, &decoded);
     if (capture_fault) monitor_failed(monitor);
     log_capture_fault(monitor);
+    pthread_mutex_lock(&monitor->observation_lock);
+    pthread_cond_broadcast(&monitor->observation_changed);
+    pthread_mutex_unlock(&monitor->observation_lock);
     return 0;
 }
 
@@ -188,9 +274,12 @@ int xs8_monitor_poll(struct xs8_monitor *monitor, int timeout_ms)
         errno = EIO;
         return -1;
     }
-    if (read_events(monitor) < 0) {
+    pthread_mutex_lock(&monitor->processing_lock);
+    int read_result = read_events(monitor);
+    if (read_result < 0) monitor_failed(monitor);
+    pthread_mutex_unlock(&monitor->processing_lock);
+    if (read_result < 0) {
         fprintf(stderr, "XS8 OBSERVED_BUS event read failed: %d\n", errno);
-        monitor_failed(monitor);
         return -1;
     }
     return 0;
@@ -219,6 +308,14 @@ static void finish_monitor(struct xs8_monitor *monitor)
             monitor->max_batch,
             (unsigned long long)monitor->incomplete_gap_frames,
             (unsigned long long)monitor->dropped_frame_logs);
+    fprintf(stderr, "XS8 OBSERVED_BUS integrity policy=%s global_gap_warnings=%llu "
+                    "line_sequence_gaps=%llu line_missing_events=%llu "
+                    "line_sequence_regressions=%llu\n",
+            monitor->warn_global_gaps ? "warn" : "strict",
+            (unsigned long long)monitor->global_gap_warnings,
+            (unsigned long long)monitor->line_gaps,
+            (unsigned long long)monitor->line_missing,
+            (unsigned long long)monitor->line_regressions);
 }
 
 static void *monitor_events(void *argument)
@@ -249,17 +346,31 @@ static int start_monitor(struct xs8_gpio *bus, struct xs8_monitor **out,
 {
     if (!bus || !bus->rx_req || !out) { errno = EINVAL; return -1; }
     *out = NULL;
+    const char *policy = getenv("XS8_GLOBAL_GAP_POLICY");
+    if (policy && strcmp(policy, "strict") && strcmp(policy, "warn")) {
+        fprintf(stderr, "XS8 invalid XS8_GLOBAL_GAP_POLICY (expected strict|warn)\n");
+        errno = EINVAL;
+        return -1;
+    }
     struct xs8_monitor *monitor = calloc(1, sizeof(*monitor));
     if (!monitor) return -1;
     monitor->bus = bus;
     monitor->threaded = threaded;
+    monitor->warn_global_gaps = policy && !strcmp(policy, "warn");
+    if (pthread_mutex_init(&monitor->processing_lock, NULL) != 0) {
+        free(monitor);
+        errno = EIO;
+        return -1;
+    }
     if (pthread_mutex_init(&monitor->observation_lock, NULL) != 0) {
+        pthread_mutex_destroy(&monitor->processing_lock);
         free(monitor);
         errno = EIO;
         return -1;
     }
     pthread_condattr_t condition_attr;
     if (pthread_condattr_init(&condition_attr) != 0) {
+        pthread_mutex_destroy(&monitor->processing_lock);
         pthread_mutex_destroy(&monitor->observation_lock);
         free(monitor);
         errno = EIO;
@@ -275,6 +386,7 @@ static int start_monitor(struct xs8_gpio *bus, struct xs8_monitor **out,
                                             &condition_attr);
     pthread_condattr_destroy(&condition_attr);
     if (condition_error) {
+        pthread_mutex_destroy(&monitor->processing_lock);
         pthread_mutex_destroy(&monitor->observation_lock);
         free(monitor);
         errno = condition_error;
@@ -303,6 +415,9 @@ static int start_monitor(struct xs8_gpio *bus, struct xs8_monitor **out,
         fprintf(stderr, "%s\n", armed);
     atomic_init(&monitor->stop, false);
     atomic_init(&monitor->healthy, true);
+    fprintf(stderr, "XS8 OBSERVED_BUS global_gap_policy=%s%s\n",
+            monitor->warn_global_gaps ? "warn" : "strict",
+            monitor->warn_global_gaps ? " EXPERIMENTAL: global gaps do not prove edge completeness" : "");
     int error = 0;
     if (threaded) {
         error = pthread_create(&monitor->thread, NULL, monitor_events, monitor);
@@ -318,6 +433,7 @@ start_fail:
     if (monitor->buffer) gpiod_edge_event_buffer_free(monitor->buffer);
     pthread_cond_destroy(&monitor->observation_changed);
     pthread_mutex_destroy(&monitor->observation_lock);
+    pthread_mutex_destroy(&monitor->processing_lock);
     free(monitor);
     errno = error;
     return -1;
@@ -353,12 +469,24 @@ void xs8_monitor_stop(struct xs8_monitor *monitor)
     gpiod_edge_event_buffer_free(monitor->buffer);
     pthread_cond_destroy(&monitor->observation_changed);
     pthread_mutex_destroy(&monitor->observation_lock);
+    pthread_mutex_destroy(&monitor->processing_lock);
     free(monitor);
 }
 
 bool xs8_monitor_healthy(struct xs8_monitor *monitor)
 {
     return monitor && atomic_load(&monitor->healthy);
+}
+
+bool xs8_monitor_get_diagnostics(struct xs8_monitor *monitor,
+                                struct xs8_monitor_diagnostics *out)
+{
+    if (!monitor || !out) return false;
+    pthread_mutex_lock(&monitor->processing_lock);
+    *out = (struct xs8_monitor_diagnostics){monitor->warn_global_gaps,
+        atomic_load(&monitor->healthy), monitor->global_gap_warnings};
+    pthread_mutex_unlock(&monitor->processing_lock);
+    return true;
 }
 
 uint64_t xs8_monitor_checkpoint(struct xs8_monitor *monitor)
@@ -416,7 +544,8 @@ bool xs8_monitor_partial(struct xs8_monitor *monitor, uint64_t now_ns,
             .legacy_msb_short1 = monitor->decoder.legacy_msb_short1,
             .bits = monitor->decoder.bits,
             .reason = monitor->decoder.error
-                ? monitor->decoder.error : "CAPTURE_WINDOW_ENDED"
+                ? monitor->decoder.error : "CAPTURE_WINDOW_ENDED",
+            .global_gap_warnings = monitor->decoder.global_gap_warnings
         }
     };
     return true;
@@ -441,68 +570,78 @@ enum xs8_observation xs8_monitor_verify_tx(struct xs8_monitor *monitor,
         ++deadline.tv_sec;
         deadline.tv_nsec -= 1000000000L;
     }
-    pthread_mutex_lock(&monitor->observation_lock);
-    uint64_t next = checkpoint + 1;
     for (;;) {
-        if (!atomic_load(&monitor->healthy) ||
-            monitor->observation_serial - checkpoint >= OBS_HISTORY) {
-            pthread_mutex_unlock(&monitor->observation_lock);
-            return XS8_OBS_UNHEALTHY;
+        /* Service/manual mode has one reader. Drain currently readable batches,
+         * without waiting for future traffic or extending the timeout. */
+        if (!monitor->threaded) {
+            for (unsigned int drains = 0;; ++drains) {
+                struct pollfd fd = {gpiod_line_request_get_fd(monitor->bus->rx_req), POLLIN, 0};
+                int ready = poll(&fd, 1, 0);
+                if (ready < 0) return XS8_OBS_UNHEALTHY;
+                if (!ready) break;
+                if (drains == 32) return XS8_OBS_INVALID;
+                if (xs8_monitor_poll(monitor, 0) < 0) return XS8_OBS_UNHEALTHY;
+            }
         }
-        while (next <= monitor->observation_serial) {
-            struct xs8_monitor_record record =
-                monitor->observations[next % OBS_HISTORY];
-            ++next;
-            if (record.serial != next - 1 ||
-                record.decoded.kind == XS8_EVENT_GAP) {
-                pthread_mutex_unlock(&monitor->observation_lock);
-                return XS8_OBS_INVALID;
-            }
-            if (record.decoded.time_ns < start_ns) {
-                if (record.end_ns > start_ns) {
-                    pthread_mutex_unlock(&monitor->observation_lock);
-                    return XS8_OBS_INVALID;
+        /* Batch publication, health, and partial decoder state are one snapshot.
+         * Lock order matches the event reader: processing, then observation. */
+        pthread_mutex_lock(&monitor->processing_lock);
+        pthread_mutex_lock(&monitor->observation_lock);
+        enum xs8_observation result = XS8_OBS_MISSING;
+        unsigned int candidates = 0;
+        if (!atomic_load(&monitor->healthy) || checkpoint > monitor->observation_serial ||
+            monitor->observation_serial - checkpoint >= OBS_HISTORY) {
+            result = XS8_OBS_UNHEALTHY;
+        } else {
+            for (uint64_t next = checkpoint + 1; next <= monitor->observation_serial; ++next) {
+                struct xs8_monitor_record record = monitor->observations[next % OBS_HISTORY];
+                if (record.serial != next || record.decoded.kind == XS8_EVENT_GAP) {
+                    result = XS8_OBS_INVALID;
+                    break;
                 }
-                continue;
+                if (record.decoded.time_ns < start_ns) {
+                    if (record.end_ns > start_ns) { result = XS8_OBS_INVALID; break; }
+                    continue;
+                }
+                if (record.decoded.time_ns > end_ns) continue;
+                if (++candidates > 1 || record.end_ns > end_ns + OBS_TAIL_NS ||
+                    !xs8_decoded_local_tx_tail_valid(&record.decoded)) {
+                    result = XS8_OBS_INVALID;
+                    break;
+                }
+                result = record.decoded.waveform_lsb == byte ? XS8_OBS_MATCH : XS8_OBS_MISMATCH;
             }
-            if (record.decoded.time_ns > end_ns) continue;
-            if (record.end_ns > end_ns + OBS_TAIL_NS) {
-                pthread_mutex_unlock(&monitor->observation_lock);
-                return XS8_OBS_INVALID;
-            }
-            enum xs8_observation result =
-                !xs8_decoded_local_tx_tail_valid(&record.decoded)
-                ? XS8_OBS_INVALID
-                : record.decoded.waveform_lsb == byte
-                    ? XS8_OBS_MATCH : XS8_OBS_MISMATCH;
+            if (monitor->decoder.active && monitor->decoder.frame_start_ns <= end_ns &&
+                (candidates || monitor->decoder.frame_start_ns < start_ns))
+                result = XS8_OBS_INVALID;
+        }
+        struct pollfd fd = {gpiod_line_request_get_fd(monitor->bus->rx_req), POLLIN, 0};
+        int pending = poll(&fd, 1, 0);
+        if (pending < 0) result = XS8_OBS_UNHEALTHY;
+        bool wait = result == XS8_OBS_MISSING ||
+            (pending > 0 && (result == XS8_OBS_MATCH || result == XS8_OBS_MISMATCH));
+        pthread_mutex_unlock(&monitor->processing_lock);
+        if (!wait) {
             pthread_mutex_unlock(&monitor->observation_lock);
             return result;
         }
         if (!monitor->threaded) {
             pthread_mutex_unlock(&monitor->observation_lock);
             struct timespec current;
-            if (clock_gettime(wait_clock, &current) < 0)
-                return XS8_OBS_UNHEALTHY;
+            if (clock_gettime(wait_clock, &current) < 0) return XS8_OBS_UNHEALTHY;
             int64_t remaining_ns =
                 (int64_t)(deadline.tv_sec - current.tv_sec) * 1000000000LL +
                 deadline.tv_nsec - current.tv_nsec;
             if (remaining_ns <= 0) return XS8_OBS_MISSING;
-            int wait_ms = (int)((remaining_ns + 999999) / 1000000);
+            int wait_ms = pending > 0 ? 0 : (int)((remaining_ns + 999999) / 1000000);
             if (wait_ms > 20) wait_ms = 20;
-            if (xs8_monitor_poll(monitor, wait_ms) < 0)
-                return XS8_OBS_UNHEALTHY;
-            pthread_mutex_lock(&monitor->observation_lock);
-            continue;
-        }
-        int rc = pthread_cond_timedwait(&monitor->observation_changed,
-                                       &monitor->observation_lock, &deadline);
-        if (rc == ETIMEDOUT) {
+            if (xs8_monitor_poll(monitor, wait_ms) < 0) return XS8_OBS_UNHEALTHY;
+        } else {
+            int rc = pthread_cond_timedwait(&monitor->observation_changed,
+                                           &monitor->observation_lock, &deadline);
             pthread_mutex_unlock(&monitor->observation_lock);
-            return XS8_OBS_MISSING;
-        }
-        if (rc) {
-            pthread_mutex_unlock(&monitor->observation_lock);
-            return XS8_OBS_UNHEALTHY;
+            if (rc == ETIMEDOUT) return XS8_OBS_MISSING;
+            if (rc) return XS8_OBS_UNHEALTHY;
         }
     }
 }

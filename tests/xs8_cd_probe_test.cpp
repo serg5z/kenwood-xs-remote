@@ -132,6 +132,13 @@ int main()
                    "reason=EVENT_GAP"));
         assert(has(run({gap(), echo(), frame(kEnd + 3 * kMs, 0x94)}).response(kDeadline),
                    "reason=EVENT_GAP"));
+        auto warned = echo();
+        warned.decoded.global_gap_warnings = 1;
+        assert(has(run({warned, frame(kEnd + 3 * kMs, 0x94)}).response(kDeadline),
+                   "reason=GLOBAL_GAP_WARNING"));
+        Xs8CdProbe between = run({echo(), frame(kEnd + 3 * kMs, 0x94)});
+        between.capture_warning();
+        assert(has(between.response(kDeadline), "reason=GLOBAL_GAP_WARNING"));
         Xs8CdProbe overflow = run({echo(), frame(kEnd + 3 * kMs, 0x94)});
         overflow.overflow();
         assert(has(overflow.response(kDeadline), "reason=HISTORY_OVERFLOW"));

@@ -219,6 +219,17 @@ static void test_failures_and_unknown()
     Xs8QueryStatus cancelled = query();
     cancelled.cancel();
     assert_contains(cancelled.response(3000), "reason=CANCELLED");
+    Xs8QueryStatus between = query();
+    between.capture_warning();
+    assert_contains(between.response(between.deadline_ns()), "reason=GLOBAL_GAP_WARNING");
+    Xs8QueryStatus warned = query();
+    auto warned_tx = tx;
+    warned_tx.decoded.global_gap_warnings = 1;
+    const xs8_monitor_record warned_pair[] = {warned_tx, source, monitor};
+    warned.observe(warned_pair, 3);
+    assert(!warned.successful(warned.deadline_ns()));
+    assert_contains(warned.response(warned.deadline_ns()), "reason=GLOBAL_GAP_WARNING");
+    assert_contains(warned.response(warned.deadline_ns()), "source_inferred=UNKNOWN");
 }
 
 int main()

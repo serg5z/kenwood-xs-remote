@@ -115,6 +115,12 @@ int xs8_monitor_start_manual(xs8_gpio *, xs8_monitor **monitor)
 int xs8_monitor_poll(xs8_monitor *, int) { return 0; }
 void xs8_monitor_stop(xs8_monitor *monitor) { delete monitor; }
 bool xs8_monitor_healthy(xs8_monitor *) { return true; }
+bool xs8_monitor_get_diagnostics(xs8_monitor *, xs8_monitor_diagnostics *out)
+{
+    *out = {};
+    out->healthy = true;
+    return true;
+}
 uint64_t xs8_monitor_checkpoint(xs8_monitor *) { return ended(fake_now()); }
 int xs8_monitor_snapshot(xs8_monitor *, uint64_t *cursor, xs8_monitor_record *records,
                          size_t capacity, size_t *count)

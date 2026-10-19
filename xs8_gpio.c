@@ -10,10 +10,10 @@
 #include <unistd.h>
 
 #define CHIP "/dev/gpiochip0"
-#define DATA_TX 4
-#define BUSY_TX 22
-#define BUSY_RX 23
-#define DATA_RX 27
+#define DATA_TX 6
+#define BUSY_TX 19
+#define BUSY_RX 26
+#define DATA_RX 13
 
 /* Values retained from the validated standalone transmitter. */
 #define LEAD_US 1150

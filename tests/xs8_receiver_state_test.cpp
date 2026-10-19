@@ -189,6 +189,17 @@ int main()
     selected.observe(frame(7100, 0x14), false);
     has(selected.status_fields(), "receiver_monitor=ON");
     Xs8ReceiverState restarted;
+    Xs8ReceiverState warned;
+    warned.observe(frame(100, 0x7D), false);
+    auto bad_integrity = frame(200, 0x7B);
+    bad_integrity.decoded.global_gap_warnings = 1;
+    warned.observe(bad_integrity, false);
+    has(warned.status_fields(), "receiver_source=CD");
+    has(warned.status_fields(), "receiver_integrity=UNCERTAIN");
+    warned.apply_query(after, after.deadline_ns());
+    has(warned.status_fields(), "receiver_integrity=HEALTHY");
+    warned.capture_warning();
+    has(warned.status_fields(), "receiver_integrity=UNCERTAIN");
     has(restarted.status_fields(), "receiver_source=UNKNOWN");
     has(restarted.status_fields(), "receiver_monitor=UNKNOWN");
     std::cout << "XS8 receiver state offline tests passed\n";

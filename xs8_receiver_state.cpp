@@ -71,7 +71,7 @@ void Xs8ReceiverState::update_monitor(uint8_t legacy, uint64_t time_ns,
 void Xs8ReceiverState::observe(const xs8_monitor_record& record,
                                bool query_pending)
 {
-    if (record.decoded.kind == XS8_EVENT_GAP) {
+    if (record.decoded.kind == XS8_EVENT_GAP || record.decoded.global_gap_warnings) {
         integrity_ = false;
         return;
     }
@@ -126,6 +126,7 @@ void Xs8ReceiverState::forget_monitor(uint64_t floor_ns)
 }
 
 void Xs8ReceiverState::history_overflow() { integrity_ = false; }
+void Xs8ReceiverState::capture_warning() { integrity_ = false; }
 void Xs8ReceiverState::monitor_failed()
 {
     integrity_ = false;

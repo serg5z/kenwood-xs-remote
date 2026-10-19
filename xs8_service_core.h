@@ -16,6 +16,8 @@ struct ServiceTxEvidence {
     bool gpio_completed = false;
     WaveformEvidence waveform = WaveformEvidence::NOT_OBSERVED;
     ReceiverEvidence receiver = ReceiverEvidence::UNVERIFIED;
+    uint64_t global_gap_warnings = 0;
+    bool capture_failed = false;
 };
 
 class ServiceTransmitter : public VolumeTransmitter {
@@ -24,6 +26,7 @@ public:
     virtual ServiceTxEvidence last_evidence() const = 0;
     virtual ServiceTxEvidence last_stop_evidence() const = 0;
     virtual VolumeControl::Time last_tx_end_time() const = 0;
+    virtual std::string monitor_status_fields() const { return {}; }
 };
 
 class Xs8ServiceCore {

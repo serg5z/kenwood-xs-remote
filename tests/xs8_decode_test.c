@@ -38,16 +38,16 @@ static void edge(struct fixture *fixture, unsigned int gpio,
 
 static void begin(struct fixture *fixture)
 {
-    edge(fixture, 23, XS8_RISING, 1000000);
-    edge(fixture, 27, XS8_RISING, 1150000);
-    edge(fixture, 27, XS8_FALLING, 9800000);
+    edge(fixture, 26, XS8_RISING, 1000000);
+    edge(fixture, 13, XS8_RISING, 1150000);
+    edge(fixture, 13, XS8_FALLING, 9800000);
 }
 
 static void bit(struct fixture *fixture, bool one, bool last)
 {
-    edge(fixture, 27, XS8_RISING, one ? 9800000 : 4900000);
-    edge(fixture, 27, XS8_FALLING, 4900000);
-    if (last) edge(fixture, 23, XS8_FALLING, 750000);
+    edge(fixture, 13, XS8_RISING, one ? 9800000 : 4900000);
+    edge(fixture, 13, XS8_FALLING, 4900000);
+    if (last) edge(fixture, 26, XS8_FALLING, 750000);
 }
 
 static void frame(struct fixture *fixture, uint8_t value)
@@ -75,15 +75,15 @@ static void captured_edge(struct capture_fixture *fixture, unsigned int gpio,
 
 static void captured_frame(struct capture_fixture *fixture, uint8_t value)
 {
-    captured_edge(fixture, 23, XS8_RISING, 1000000);
-    captured_edge(fixture, 27, XS8_RISING, 1150000);
-    captured_edge(fixture, 27, XS8_FALLING, 9800000);
+    captured_edge(fixture, 26, XS8_RISING, 1000000);
+    captured_edge(fixture, 13, XS8_RISING, 1150000);
+    captured_edge(fixture, 13, XS8_FALLING, 9800000);
     for (unsigned int i = 0; i < 8; ++i) {
-        captured_edge(fixture, 27, XS8_RISING,
+        captured_edge(fixture, 13, XS8_RISING,
                       (value & (1u << i)) ? 9800000 : 4900000);
-        captured_edge(fixture, 27, XS8_FALLING, 4900000);
+        captured_edge(fixture, 13, XS8_FALLING, 4900000);
     }
-    captured_edge(fixture, 23, XS8_FALLING, 750000);
+    captured_edge(fixture, 26, XS8_FALLING, 750000);
 }
 
 static struct capture_fixture new_capture(void)
@@ -125,10 +125,10 @@ static void test_self_capture(void)
     assert(result.capture == CAPTURE_INVALID && result.match == MATCH_UNKNOWN);
 
     struct capture_fixture truncated = new_capture();
-    captured_edge(&truncated, 23, XS8_RISING, 1000000);
-    captured_edge(&truncated, 27, XS8_RISING, 1150000);
-    captured_edge(&truncated, 27, XS8_FALLING, 9800000);
-    captured_edge(&truncated, 27, XS8_RISING, 4900000);
+    captured_edge(&truncated, 26, XS8_RISING, 1000000);
+    captured_edge(&truncated, 13, XS8_RISING, 1150000);
+    captured_edge(&truncated, 13, XS8_FALLING, 9800000);
+    captured_edge(&truncated, 13, XS8_RISING, 4900000);
     truncated.capture.edges = truncated.edges;
     result = verify_self_capture(&truncated.capture, 0x09, true,
                                  500000, 150000000, false);
@@ -167,8 +167,8 @@ static void test_self_capture(void)
 
     struct capture_fixture incomplete_response = new_capture();
     captured_frame(&incomplete_response, 0x13);
-    captured_edge(&incomplete_response, 23, XS8_RISING, 1000000);
-    captured_edge(&incomplete_response, 27, XS8_RISING, 1150000);
+    captured_edge(&incomplete_response, 26, XS8_RISING, 1000000);
+    captured_edge(&incomplete_response, 13, XS8_RISING, 1150000);
     incomplete_response.capture.edges = incomplete_response.edges;
     result = verify_self_capture(&incomplete_response.capture, 0x13, true,
                                  500000, 150000000, false);
@@ -198,8 +198,8 @@ static void test_self_capture_rejects_incompatible_tail(void)
             --fixture.capture.count;
         } else if (variant == 1) {
             /* BUSY-first: same bit value, different tail ordering. */
-            fixture.edges[18].gpio = 23;
-            fixture.edges[19].gpio = 27;
+            fixture.edges[18].gpio = 26;
+            fixture.edges[19].gpio = 13;
         } else if (variant == 2) {
             fixture.edges[19].timestamp_ns = fixture.edges[18].timestamp_ns;
         } else {
@@ -230,7 +230,7 @@ int main(void)
 
     begin(&fixture);
     for (unsigned int i = 0; i < 3; ++i) bit(&fixture, false, false);
-    edge(&fixture, 23, XS8_FALLING, 750000);
+    edge(&fixture, 26, XS8_FALLING, 750000);
     assert(fixture.count == 3);
     assert(!fixture.results[2].valid && fixture.results[2].bits == 3);
 
@@ -238,7 +238,7 @@ int main(void)
     bit(&fixture, true, false);
     ++fixture.sequence; /* A kernel global sequence-number gap. */
     bit(&fixture, false, false);
-    edge(&fixture, 23, XS8_FALLING, 750000);
+    edge(&fixture, 26, XS8_FALLING, 750000);
     assert(fixture.count == 5);
     assert(!fixture.results[3].valid);
     assert(strcmp(fixture.results[3].reason, "EVENT_GAP") == 0);
@@ -260,9 +260,9 @@ int main(void)
     xs8_decoder_init(&bad_tail.decoder, true);
     begin(&bad_tail);
     for (unsigned int i = 0; i < 7; ++i) bit(&bad_tail, false, false);
-    edge(&bad_tail, 27, XS8_RISING, 4900000);
-    edge(&bad_tail, 27, XS8_FALLING, 1000000);
-    edge(&bad_tail, 23, XS8_FALLING, 750000);
+    edge(&bad_tail, 13, XS8_RISING, 4900000);
+    edge(&bad_tail, 13, XS8_FALLING, 1000000);
+    edge(&bad_tail, 26, XS8_FALLING, 750000);
     assert(bad_tail.count == 1 && !bad_tail.results[0].valid);
     assert(strcmp(bad_tail.results[0].reason, "TAIL_TIMING") == 0);
 

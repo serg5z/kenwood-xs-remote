@@ -37,6 +37,9 @@ void append_record(std::string& out, const char *name,
         (unsigned long long)record.end_ns,
         record.decoded.valid ? "VALID" : "INCOMPLETE");
     out += field;
+    if (record.decoded.global_gap_warnings) {
+        out += ":global_gap_warnings=" + std::to_string(record.decoded.global_gap_warnings);
+    }
     if (!record.decoded.valid && record.decoded.reason) {
         out += ":";
         out += record.decoded.reason;
@@ -55,6 +58,11 @@ void Xs8QueryStatus::observe(const xs8_monitor_record *records, size_t count)
 {
     for (size_t i = 0; i < count; ++i) {
         const xs8_monitor_record& record = records[i];
+        if (record.decoded.global_gap_warnings) {
+            if (count_ < observed_.size()) observed_[count_++] = record;
+            fault_ = Fault::GLOBAL_GAP_WARNING;
+            continue;
+        }
         if (record.decoded.kind == XS8_EVENT_GAP) {
             gap_events_ += record.decoded.lost_events;
             gap_time_ns_ = record.decoded.time_ns;
@@ -106,6 +114,9 @@ void Xs8QueryStatus::observe(const xs8_monitor_record *records, size_t count)
     }
 }
 
+void Xs8QueryStatus::capture_warning()
+{ if (fault_ == Fault::NONE) fault_ = Fault::GLOBAL_GAP_WARNING; }
+
 void Xs8QueryStatus::overflow() { fault_ = Fault::HISTORY_OVERFLOW; }
 void Xs8QueryStatus::monitor_failed()
 {
@@ -152,6 +163,7 @@ std::string Xs8QueryStatus::response(uint64_t now_ns) const
     case Fault::INCOMPLETE: reason = "INCOMPLETE"; break;
     case Fault::EXTRA: reason = "EXTRA"; break;
     case Fault::OUT_OF_ORDER: reason = "OUT_OF_ORDER"; break;
+    case Fault::GLOBAL_GAP_WARNING: reason = "GLOBAL_GAP_WARNING"; break;
     }
     std::string out = success ? "OK QUERY_STATUS" : "ERR QUERY_STATUS";
     out += " reason=";

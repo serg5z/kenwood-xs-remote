@@ -7,6 +7,14 @@ unsigned int xs8_capture_check(struct xs8_capture_state *state,
     unsigned int gpio, uint64_t sequence, uint64_t line_sequence,
     uint64_t timestamp_ns, uint64_t event_index)
 {
+    return xs8_capture_check_policy(state, gpio, sequence, line_sequence,
+                                    timestamp_ns, event_index, false);
+}
+
+unsigned int xs8_capture_check_policy(struct xs8_capture_state *state,
+    unsigned int gpio, uint64_t sequence, uint64_t line_sequence,
+    uint64_t timestamp_ns, uint64_t event_index, bool warn_global_only)
+{
     unsigned int reasons = 0;
     const uint64_t expected = state->last_sequence + 1;
     if (sequence > expected) {
@@ -23,7 +31,8 @@ unsigned int xs8_capture_check(struct xs8_capture_state *state,
         reasons |= XS8_CAPTURE_TIMESTAMP_REGRESSION;
         ++state->timestamp_regressions;
     }
-    if (reasons && !state->fault_recorded) {
+    if (reasons && !state->fault_recorded &&
+        !(warn_global_only && reasons == XS8_CAPTURE_SEQUENCE_GAP)) {
         state->fault_recorded = true;
         state->first_fault = (struct xs8_capture_fault){
             .reasons = reasons,
@@ -79,12 +88,15 @@ int xs8_capture_format_fault(const struct xs8_capture_state *state,
 {
     if (!state->fault_recorded) return -1;
     const struct xs8_capture_fault *fault = &state->first_fault;
-    char reasons[96] = "";
+    char reasons[192] = "";
     static const struct { unsigned int bit; const char *name; } names[] = {
         {XS8_CAPTURE_SEQUENCE_GAP, "SEQUENCE_GAP"},
         {XS8_CAPTURE_SEQUENCE_REGRESSION, "SEQUENCE_REGRESSION"},
         {XS8_CAPTURE_TIMESTAMP_REGRESSION, "TIMESTAMP_REGRESSION"},
-        {XS8_CAPTURE_DECODED_OVERFLOW, "DECODED_OVERFLOW"}
+        {XS8_CAPTURE_DECODED_OVERFLOW, "DECODED_OVERFLOW"},
+        {XS8_CAPTURE_LINE_SEQUENCE_GAP, "LINE_SEQUENCE_GAP"},
+        {XS8_CAPTURE_LINE_SEQUENCE_REGRESSION, "LINE_SEQUENCE_REGRESSION"},
+        {XS8_CAPTURE_UNEXPECTED_LINE, "UNEXPECTED_LINE"}
     };
     size_t used = 0;
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
@@ -103,17 +115,22 @@ int xs8_capture_format_fault(const struct xs8_capture_state *state,
     if (fault->previous_timestamp_ns)
         snprintf(previous, sizeof(previous), "%" PRIu64,
                  fault->previous_timestamp_ns / 1000);
+    char line_expected[64] = "";
+    if (fault->reasons & (XS8_CAPTURE_LINE_SEQUENCE_GAP |
+                          XS8_CAPTURE_LINE_SEQUENCE_REGRESSION))
+        snprintf(line_expected, sizeof(line_expected),
+                 " expected_line_seqno=%" PRIu64, fault->expected_line_sequence);
     return snprintf(out, size,
         "XS8 OBSERVED_BUS monitor FAILED reason=%s gpio=%u line=%s "
         "expected_seqno=%" PRIu64 " actual_seqno=%" PRIu64
         " line_seqno=%" PRIu64 " event_index=%" PRIu64
         " event_mono_us=%" PRIu64 " previous_event_mono_us=%s"
-        " since_arm_us=%lld",
+        " since_arm_us=%lld%s",
         reasons, fault->gpio, line_name(fault->gpio, busy_gpio, data_gpio),
         fault->expected_sequence, fault->actual_sequence,
         fault->line_sequence, fault->event_index,
         fault->timestamp_ns / 1000, previous,
-        since_arm_us(state, fault->timestamp_ns));
+        since_arm_us(state, fault->timestamp_ns), line_expected);
 }
 
 int xs8_capture_format_armed(uint64_t armed_ns, int busy_level, int data_level,

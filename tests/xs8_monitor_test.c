@@ -4,13 +4,14 @@
 #include "xs8_monitor.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-#define BUSY 23
-#define DATA 27
+#define BUSY 26
+#define DATA 13
 #define ARMED_NS 7000000000ULL
 
 struct gpiod_edge_event {
@@ -31,6 +32,7 @@ static struct {
     size_t queued, next;
     int pipe[2];
     int levels[64];
+    bool read_error;
 } fake;
 
 int64_t xs8_gpio_now_ns(void) { return (int64_t)ARMED_NS; }
@@ -55,6 +57,7 @@ int gpiod_line_request_read_edge_events(struct gpiod_line_request *request,
                                         size_t max_events)
 {
     (void)request;
+    if (fake.read_error) { errno = EIO; return -1; }
     assert(fake.next < fake.queued);
     char byte;
     assert(read(fake.pipe[0], &byte, 1) == 1);
@@ -106,6 +109,7 @@ static int saved_stderr = -1;
 
 static void setup(int busy_level, int data_level)
 {
+    assert(unsetenv("XS8_GLOBAL_GAP_POLICY") == 0);
     memset(&fake, 0, sizeof(fake));
     assert(pipe(fake.pipe) == 0);
     fake.levels[BUSY] = busy_level;
@@ -219,7 +223,7 @@ static void test_cold_boot_gap_fails_closed_and_logs_once(void)
     char *log = teardown();
     assert(count_of(log, "monitor FAILED") == 1);
     assert(strstr(log,
-        "XS8 OBSERVED_BUS monitor FAILED reason=SEQUENCE_GAP gpio=27 line=DATA "
+        "XS8 OBSERVED_BUS monitor FAILED reason=SEQUENCE_GAP gpio=13 line=DATA "
         "expected_seqno=1 actual_seqno=3 line_seqno=1 event_index=1 "
         "event_mono_us=7000120 previous_event_mono_us=NONE since_arm_us=120\n"));
     assert(strstr(log, "total_events=3 busy_edges=0 data_edges=3 "
@@ -249,7 +253,7 @@ static void test_sequence_regression_across_batches(void)
     assert(!xs8_monitor_healthy(monitor));
     xs8_monitor_stop(monitor);
     char *log = teardown();
-    assert(strstr(log, "reason=SEQUENCE_REGRESSION gpio=23 line=BUSY "
+    assert(strstr(log, "reason=SEQUENCE_REGRESSION gpio=26 line=BUSY "
                        "expected_seqno=3 actual_seqno=2 line_seqno=3 event_index=3 "
                        "event_mono_us=7000003 previous_event_mono_us=7000002 "
                        "since_arm_us=3\n"));
@@ -272,7 +276,7 @@ static void test_timestamp_regression(void)
     xs8_monitor_stop(monitor);
     char *log = teardown();
     assert(count_of(log, "monitor FAILED") == 1);
-    assert(strstr(log, "reason=TIMESTAMP_REGRESSION gpio=27 line=DATA "));
+    assert(strstr(log, "reason=TIMESTAMP_REGRESSION gpio=13 line=DATA "));
     assert(strstr(log, "sequence_regressions=0 timestamp_regressions=1 "));
 }
 
@@ -361,7 +365,7 @@ static void save_decoded(void *user, const struct xs8_decoded *record)
 enum injection { CONTROL, GLOBAL_ONLY, MISSING_DATA_GAP, MISSING_DATA_DENSE,
                  EXTRA_BUSY, MISSING_TAIL_GAP, MISSING_TAIL_DENSE };
 
-static void test_frame_injection(enum injection injection, bool split_batch)
+static void test_frame_injection(enum injection injection, bool split_batch, bool warn)
 {
     static const char *names[] = {"control", "global-only-2-to-5",
         "missing-data-retained-counters", "missing-data-dense-counters",
@@ -402,6 +406,7 @@ static void test_frame_injection(enum injection injection, bool split_batch)
     }
     bool gap = injection == GLOBAL_ONLY || injection == MISSING_DATA_GAP ||
                injection == MISSING_TAIL_GAP;
+    bool fatal_gap = gap && (!warn || injection == MISSING_DATA_GAP);
     assert(global_breaks == (gap ? 1u : 0u));
     /* A missing final DATA event has no later DATA counter to expose its loss. */
     assert(line_breaks == (injection == MISSING_DATA_GAP ? 1u : 0u));
@@ -415,6 +420,8 @@ static void test_frame_injection(enum injection injection, bool split_batch)
         struct xs8_edge e = {events[i].timestamp_ns, events[i].global_seqno,
             events[i].offset, events[i].type == GPIOD_EDGE_EVENT_RISING_EDGE
                 ? XS8_RISING : XS8_FALLING};
+        if (warn && gap && !fatal_gap && e.sequence > decoder.last_sequence + 1)
+            decoder.last_sequence = e.sequence - 1;
         xs8_decoder_edge(&decoder, &e, save_decoded, &decoded);
     }
     assert(!decoder.active && decoder.synced);
@@ -423,13 +430,16 @@ static void test_frame_injection(enum injection injection, bool split_batch)
     static const unsigned int expected_stage[] = {4, 1, 2, 2, 2, 4, 4};
     static const char *first_reason[] = {NULL, "EVENT_GAP", "EVENT_GAP",
         "UNEXPECTED_DATA_EDGE", "NEW_BUSY_RISE", "EVENT_GAP", NULL};
-    assert(decoder.bits == expected_bits[injection]);
-    assert(decoder.stage == expected_stage[injection]);
-    assert(first_reason[injection] ? decoded.records[0].reason &&
-        strcmp(decoded.records[0].reason, first_reason[injection]) == 0 :
+    bool bridged = warn && gap && !fatal_gap;
+    const char *reason = bridged ? NULL : first_reason[injection];
+    assert(decoder.bits == (bridged ? 8u : expected_bits[injection]));
+    assert(decoder.stage == (bridged ? 4u : expected_stage[injection]));
+    assert(reason ? decoded.records[0].reason &&
+        strcmp(decoded.records[0].reason, reason) == 0 :
         decoded.records[0].reason == NULL);
 
     setup(0, 0);
+    if (warn) assert(setenv("XS8_GLOBAL_GAP_POLICY", "warn", 1) == 0);
     struct xs8_monitor *monitor = NULL;
     assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
     uint64_t checkpoint = xs8_monitor_checkpoint(monitor);
@@ -441,7 +451,7 @@ static void test_frame_injection(enum injection injection, bool split_batch)
     queue(events + (split_batch ? 2 : 0), n - (split_batch ? 2 : 0));
     assert(xs8_monitor_poll(monitor, 0) == 0);
     bool healthy = xs8_monitor_healthy(monitor);
-    assert(healthy == !gap);
+    assert(healthy == !fatal_gap);
     struct xs8_monitor_record records[8];
     size_t count = 0;
     uint64_t cursor = checkpoint;
@@ -456,6 +466,8 @@ static void test_frame_injection(enum injection injection, bool split_batch)
         assert(actual->waveform_lsb == expected->waveform_lsb);
         assert(actual->legacy_msb_short1 == expected->legacy_msb_short1);
         assert(actual->lost_events == expected->lost_events);
+        if (actual->kind == XS8_FRAME && bridged)
+            assert(actual->global_gap_warnings == 1);
         assert(actual->tail_fell == expected->tail_fell);
         assert(actual->final_data_rise_ns == expected->final_data_rise_ns);
         assert(actual->final_data_fall_ns == expected->final_data_fall_ns);
@@ -467,41 +479,49 @@ static void test_frame_injection(enum injection injection, bool split_batch)
         else if (actual->valid) ++valid;
         else ++invalid;
     }
-    bool passive_valid = injection == CONTROL || injection == MISSING_TAIL_DENSE;
-    bool accepted = injection == CONTROL;
+    bool passive_valid = injection == CONTROL || injection == MISSING_TAIL_DENSE || bridged;
+    bool accepted = injection == CONTROL || (warn && injection == GLOBAL_ONLY);
     assert(valid == (passive_valid ? 1u : 0u));
     assert(invalid == (passive_valid ? 0u : injection == EXTRA_BUSY ? 2u : 1u));
-    assert(gaps == (gap ? 1u : 0u));
+    assert(gaps == (fatal_gap ? 1u : 0u));
     if (passive_valid) assert(records[0].decoded.waveform_lsb == 0x84);
     enum xs8_observation outcome = xs8_monitor_verify_tx(
         monitor, checkpoint, 0x84, start, end, 1);
-    assert(outcome == (gap ? XS8_OBS_UNHEALTHY :
+    assert(outcome == (fatal_gap ? XS8_OBS_UNHEALTHY :
                        accepted ? XS8_OBS_MATCH : XS8_OBS_INVALID));
-    if (gap) assert(xs8_monitor_poll(monitor, 0) == -1);
+    if (fatal_gap) assert(xs8_monitor_poll(monitor, 0) == -1);
     xs8_monitor_stop(monitor);
     const char *log = teardown();
-    assert(count_of(log, "monitor FAILED") == (gap ? 1 : 0));
-    if (gap) assert(strstr(log, "monitor FAILED reason=SEQUENCE_GAP"));
-    if (injection == GLOBAL_ONLY) assert(strstr(log,
+    assert(count_of(log, "monitor FAILED") == (fatal_gap ? 1 : 0));
+    if (fatal_gap) assert(strstr(log, "monitor FAILED reason=SEQUENCE_GAP"));
+    assert(count_of(log, "WARNING reason=GLOBAL_ONLY_SEQUENCE_GAP") == (bridged ? 1 : 0));
+    if (injection == GLOBAL_ONLY && !warn) assert(strstr(log,
         "expected_seqno=3 actual_seqno=5 line_seqno=2 event_index=3"));
 
-    printf("fault-injection case=%s batches=%u health=%s failure=%s "
+    printf("fault-injection case=%s policy=%s batches=%u health=%s failure=%s "
            "global_breaks=%u line_breaks=%u decoder_active=%u synced=%u "
            "stage=%u bits=%u valid_frames=%u invalid_frames=%u gap_records=%u "
            "first_reason=%s verification=%s rejected=%s\n",
-           names[injection], split_batch ? 2 : 1, healthy ? "HEALTHY" : "FAILED",
-           gap ? "SEQUENCE_GAP" : "NONE", global_breaks, line_breaks,
+           names[injection], warn ? "warn" : "strict", split_batch ? 2 : 1,
+           healthy ? "HEALTHY" : "FAILED",
+           fatal_gap ? "SEQUENCE_GAP" : "NONE", global_breaks, line_breaks,
            decoder.active, decoder.synced, decoder.stage, decoder.bits,
            valid, invalid, gaps, decoded.records[0].reason ?
-           decoded.records[0].reason : "NONE", gap ? "UNHEALTHY" :
+           decoded.records[0].reason : "NONE", fatal_gap ? "UNHEALTHY" :
            accepted ? "MATCH" : "INVALID", accepted ? "no" : "yes");
 }
 
-static void check_tail_trace(const struct gpiod_edge_event *events, size_t count,
+static void check_tail_trace(const struct gpiod_edge_event *input, size_t count,
                             uint8_t byte, bool passive_valid, bool local_match,
-                            bool tail_fell)
+                            bool tail_fell, bool warn, bool global_gap)
 {
+    struct gpiod_edge_event events[20];
+    assert(count <= 20);
+    memcpy(events, input, count * sizeof(events[0]));
+    if (global_gap)
+        for (size_t i = 2; i < count; ++i) events[i].global_seqno += 2;
     setup(0, 0);
+    if (warn) assert(setenv("XS8_GLOBAL_GAP_POLICY", "warn", 1) == 0);
     struct xs8_monitor *monitor = NULL;
     assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
     queue(events, count);
@@ -555,7 +575,9 @@ static void test_archived_passive_tails(void)
         for (size_t i = 0; i < 20; ++i)
             events[i].timestamp_ns = ARMED_NS + 1000000 + (uint64_t)us[capture][i] * 1000;
         number_trace(events, 20);
-        check_tail_trace(events, 20, bytes[capture], true, variant == 1, data_first);
+        check_tail_trace(events, 20, bytes[capture], true, variant == 1, data_first, false, false);
+        check_tail_trace(events, 20, bytes[capture], true, variant == 1, data_first, true, false);
+        check_tail_trace(events, 20, bytes[capture], true, variant == 1, data_first, true, true);
     }
 }
 
@@ -577,7 +599,147 @@ static void test_incompatible_local_tail_timing(void)
         assert(frame_trace(events, 0x84) == 20);
         events[18].timestamp_ns = events[17].timestamp_ns + cases[i].high;
         events[19].timestamp_ns = events[18].timestamp_ns + cases[i].guard;
-        check_tail_trace(events, 20, 0x84, cases[i].valid, cases[i].match, true);
+        check_tail_trace(events, 20, 0x84, cases[i].valid, cases[i].match, true, false, false);
+        check_tail_trace(events, 20, 0x84, cases[i].valid, cases[i].match, true, true, false);
+        check_tail_trace(events, 20, 0x84, cases[i].valid, cases[i].match, true, true, true);
+    }
+}
+
+static void test_integrity_failures_in_both_policies(void)
+{
+    static const char *reason[] = {"LINE_SEQUENCE_GAP", "LINE_SEQUENCE_GAP",
+        "LINE_SEQUENCE_REGRESSION", "SEQUENCE_REGRESSION", "TIMESTAMP_REGRESSION",
+        "SEQUENCE_GAP+TIMESTAMP_REGRESSION", "event read failed", "UNEXPECTED_LINE"};
+    for (unsigned int warn = 0; warn < 2; ++warn) {
+        for (unsigned int fault = 0; fault < 8; ++fault) {
+            struct gpiod_edge_event events[20];
+            assert(frame_trace(events, 0x84) == 20);
+            if (fault == 0) {
+                for (size_t i = 2; i < 20; ++i)
+                    if (events[i].offset == DATA) ++events[i].line_seqno;
+            } else if (fault == 1) ++events[19].line_seqno;
+            else if (fault == 2) {
+                for (size_t i = 2; i < 20; ++i)
+                    if (events[i].offset == DATA) --events[i].line_seqno;
+            } else if (fault == 3) {
+                for (size_t i = 2; i < 20; ++i) --events[i].global_seqno;
+            } else if (fault == 4 || fault == 5) {
+                events[2].timestamp_ns = events[1].timestamp_ns - 1;
+                if (fault == 5)
+                    for (size_t i = 2; i < 20; ++i) events[i].global_seqno += 2;
+            } else if (fault == 7) events[2].offset = 99;
+            setup(0, 0);
+            if (warn) assert(setenv("XS8_GLOBAL_GAP_POLICY", "warn", 1) == 0);
+            struct xs8_monitor *monitor = NULL;
+            assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
+            queue(events, 20);
+            if (fault == 6) fake.read_error = true;
+            assert(xs8_monitor_poll(monitor, 0) == (fault == 6 ? -1 : 0));
+            assert(!xs8_monitor_healthy(monitor));
+            assert(xs8_monitor_verify_tx(monitor, 0, 0x84,
+                events[0].timestamp_ns, events[19].timestamp_ns, 1) == XS8_OBS_UNHEALTHY);
+            xs8_monitor_stop(monitor);
+            const char *log = teardown();
+            assert(strstr(log, reason[fault]));
+            assert(!strstr(log, "WARNING reason=GLOBAL_ONLY_SEQUENCE_GAP"));
+            if (fault <= 2) assert(strstr(log, "expected_line_seqno="));
+        }
+    }
+}
+
+static void test_policy_configuration(void)
+{
+    setup(0, 0);
+    assert(setenv("XS8_GLOBAL_GAP_POLICY", "strict", 1) == 0);
+    struct xs8_monitor *monitor = NULL;
+    assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
+    assert(xs8_monitor_healthy(monitor));
+    xs8_monitor_stop(monitor);
+    assert(strstr(teardown(), "global_gap_policy=strict\n"));
+    setup(0, 0);
+    assert(setenv("XS8_GLOBAL_GAP_POLICY", "WARN", 1) == 0);
+    monitor = NULL;
+    assert(xs8_monitor_start_manual(&bus, &monitor) == -1 && errno == EINVAL);
+    assert(monitor == NULL);
+    assert(strstr(teardown(), "invalid XS8_GLOBAL_GAP_POLICY"));
+}
+
+static void test_warn_gap_does_not_hide_malformed_or_later_fault(void)
+{
+    for (unsigned int variant = 0; variant < 4; ++variant) {
+        struct gpiod_edge_event events[21];
+        size_t count = frame_trace(events, 0x84);
+        if (variant == 0) {
+            memmove(events + 3, events + 4, (count - 4) * sizeof(events[0]));
+            number_trace(events, --count); /* Missing DATA edge before numbering. */
+        } else if (variant == 1) {
+            memmove(events + 5, events + 4, (count - 4) * sizeof(events[0]));
+            events[4] = edge(BUSY, 0, 0, events[3].timestamp_ns - ARMED_NS + 1000000,
+                             GPIOD_EDGE_EVENT_RISING_EDGE);
+            number_trace(events, ++count);
+        } else if (variant == 2) count = 10; /* No frame end. */
+        else ++events[18].line_seqno; /* Later per-line failure after a warning. */
+        for (size_t i = 2; i < count; ++i) events[i].global_seqno += 2;
+        setup(0, 0);
+        assert(setenv("XS8_GLOBAL_GAP_POLICY", "warn", 1) == 0);
+        struct xs8_monitor *monitor = NULL;
+        assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
+        queue(events, count);
+        assert(xs8_monitor_poll(monitor, 0) == 0);
+        assert(xs8_monitor_healthy(monitor) == (variant != 3));
+        enum xs8_observation result = xs8_monitor_verify_tx(monitor, 0, 0x84,
+            events[0].timestamp_ns, events[count - 1].timestamp_ns, 1);
+        assert(result == (variant == 2 ? XS8_OBS_MISSING :
+                          variant == 3 ? XS8_OBS_UNHEALTHY : XS8_OBS_INVALID));
+        xs8_monitor_stop(monitor);
+        const char *log = teardown();
+        assert(count_of(log, "WARNING reason=GLOBAL_ONLY_SEQUENCE_GAP") == 1);
+        assert(strstr(log, "global_gap_warnings=1"));
+        assert(strstr(log, "global_sequence_gaps=1 missing_events=2"));
+        assert(strstr(log, "frame_start_ns=7001000000 bits=0 stage=1"));
+        assert(count_of(log, "monitor FAILED") == (variant == 3 ? 1 : 0));
+        if (variant == 3) assert(strstr(log, "reason=LINE_SEQUENCE_GAP"));
+    }
+}
+
+static void test_tx_attribution_snapshot(void)
+{
+    /* Split batches are deliberately queued before verify: a MATCH in the first
+     * batch must not hide a second relevant frame/partial in the next batch. */
+    for (unsigned int warn = 0; warn < 2; ++warn) {
+        for (unsigned int variant = 0; variant < 8; ++variant) {
+            struct gpiod_edge_event events[40];
+            assert(frame_trace(events, 0x84) == 20);
+            uint64_t end = events[19].timestamp_ns;
+            assert(frame_trace(events + 20, 0x84) == 20);
+            uint64_t shift = end - ARMED_NS + 2000000;
+            for (size_t i = 20; i < 40; ++i) events[i].timestamp_ns += shift;
+            if (variant == 2 || variant == 5)
+                events[38].timestamp_ns = events[37].timestamp_ns + 1000000;
+            size_t count = (variant == 3 || variant == 6) ? 21 :
+                           variant == 0 || variant == 7 ? 20 : 40;
+            if (variant >= 1 && variant <= 3) end = events[count - 1].timestamp_ns;
+            else end += 1000000; /* Second frame, if any, begins outside TX. */
+            number_trace(events, count);
+            if (warn)
+                for (size_t i = 2; i < count; ++i) events[i].global_seqno += 2;
+            setup(0, 0);
+            if (warn) assert(setenv("XS8_GLOBAL_GAP_POLICY", "warn", 1) == 0);
+            struct xs8_monitor *monitor = NULL;
+            assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
+            queue(events, 20);
+            if (count > 20) queue(events + 20, count - 20);
+            enum xs8_observation expected = variant >= 1 && variant <= 3
+                ? XS8_OBS_INVALID : variant == 7 ? XS8_OBS_MISMATCH : XS8_OBS_MATCH;
+            assert(xs8_monitor_verify_tx(monitor, 0, variant == 7 ? 0x82 : 0x84,
+                events[0].timestamp_ns, end, 1) == expected);
+            struct xs8_monitor_diagnostics info;
+            assert(xs8_monitor_get_diagnostics(monitor, &info));
+            assert(info.healthy && info.warn_global_gaps == (warn != 0));
+            assert(info.global_gap_warnings == warn);
+            xs8_monitor_stop(monitor);
+            assert(!strstr(teardown(), "monitor FAILED"));
+        }
     }
 }
 
@@ -592,9 +754,15 @@ int main(void)
     test_unreadable_busy_level_still_fails_start();
     test_archived_passive_tails();
     test_incompatible_local_tail_timing();
+    test_integrity_failures_in_both_policies();
+    test_policy_configuration();
+    test_warn_gap_does_not_hide_malformed_or_later_fault();
+    test_tx_attribution_snapshot();
     for (int injection = CONTROL; injection <= MISSING_TAIL_DENSE; ++injection) {
-        test_frame_injection((enum injection)injection, false);
-        test_frame_injection((enum injection)injection, true);
+        test_frame_injection((enum injection)injection, false, false);
+        test_frame_injection((enum injection)injection, true, false);
+        test_frame_injection((enum injection)injection, false, true);
+        test_frame_injection((enum injection)injection, true, true);
     }
     puts("xs8_monitor_test: OK");
     return 0;

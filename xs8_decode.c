@@ -1,8 +1,8 @@
 #include "xs8_decode.h"
 #include <string.h>
 
-#define BUSY_GPIO 23
-#define DATA_GPIO 27
+#define BUSY_GPIO 26
+#define DATA_GPIO 13
 #define SHORT_LONG_SPLIT_NS 7350000ULL
 
 static bool within(uint64_t duration, uint64_t low, uint64_t high)
@@ -26,7 +26,8 @@ static void emit_frame(struct xs8_decoder *decoder, const char *reason,
         .final_data_rise_ns = decoder->final_data_rise_ns,
         .final_data_fall_ns = decoder->final_data_fall_ns,
         .busy_fall_ns = decoder->busy_fall_ns,
-        .tail_fell = decoder->tail_fell
+        .tail_fell = decoder->tail_fell,
+        .global_gap_warnings = decoder->global_gap_warnings
     };
     if (!result.valid && !result.reason) result.reason = "TRUNCATED";
     output(user, &result);
@@ -75,6 +76,7 @@ void xs8_decoder_edge(struct xs8_decoder *decoder, const struct xs8_edge *edge,
             decoder->bits = 0;
             decoder->stage = 0;
             decoder->tail_fell = false;
+            decoder->global_gap_warnings = 0;
             decoder->final_data_rise_ns = 0;
             decoder->final_data_fall_ns = 0;
             decoder->busy_fall_ns = 0;

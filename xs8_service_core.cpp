@@ -134,7 +134,7 @@ std::string Xs8ServiceCore::status() const
         " cd_release_owed=" + (cd_release_owed_ ? "1" : "0") +
         " cd_lease_expired=" + (cd_lease_expired_ ? "1" : "0") +
         " cd_last_result=" + cd_last_result_ +
-        receiver_status_ + "\n";
+        receiver_status_ + tx_.monitor_status_fields() + "\n";
 }
 
 bool Xs8ServiceCore::attempt_cd_release()

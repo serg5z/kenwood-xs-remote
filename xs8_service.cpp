@@ -53,6 +53,20 @@ public:
     }
     ServiceTxEvidence last_evidence() const override { return last_; }
     ServiceTxEvidence last_stop_evidence() const override { return last_stop_; }
+    std::string monitor_status_fields() const override {
+        xs8_monitor_diagnostics info{};
+        if (!xs8_monitor_get_diagnostics(&monitor_, &info)) return " capture_integrity=UNKNOWN";
+        return std::string(" global_gap_policy=") + (info.warn_global_gaps ? "warn" : "strict") +
+            " global_gap_warnings=" + std::to_string(info.global_gap_warnings) +
+            " capture_integrity=" + (!info.healthy ? "FAILED" :
+                info.global_gap_warnings ? "WARN_GLOBAL_GAP" : "NO_KNOWN_GAPS") +
+            " last_tx_global_gap_warnings=" + std::to_string(last_.global_gap_warnings) +
+            " last_tx_capture_integrity=" + (!last_.attempted ? "NOT_OBSERVED" :
+                last_.capture_failed ? "FAILED" :
+                last_.global_gap_warnings ? "WARN_GLOBAL_GAP" :
+                last_.waveform == WaveformEvidence::MATCH || last_.waveform == WaveformEvidence::MISMATCH
+                    ? "NO_KNOWN_GAPS" : "NOT_ESTABLISHED");
+    }
     VolumeControl::Time last_tx_end_time() const override {
         return last_end_time_;
     }
@@ -79,6 +93,8 @@ private:
         last_.attempted = true;
         last_.byte = byte;
         uint64_t checkpoint = xs8_monitor_checkpoint(&monitor_);
+        xs8_monitor_diagnostics before{};
+        xs8_monitor_get_diagnostics(&monitor_, &before);
         int64_t start = 0;
         last_.gpio_completed = xs8_gpio_send(&bus_, byte, &start) == 0;
         last_end_time_ = VolumeControl::Clock::now();
@@ -101,6 +117,11 @@ private:
                 break;
             }
         }
+        xs8_monitor_diagnostics after{};
+        xs8_monitor_get_diagnostics(&monitor_, &after);
+        last_.global_gap_warnings = after.global_gap_warnings - before.global_gap_warnings;
+        last_.capture_failed = !after.healthy;
+        if (last_.global_gap_warnings) receiver_.capture_warning();
         if (byte == 0x09) {
             last_stop_ = last_;
             std::fprintf(stderr, "XS8 STOP evidence gpio_tx=%s waveform=%s "
@@ -359,6 +380,7 @@ int main(int argc, char **argv)
     // End of the latest bus frame seen, for the probe's quiet-bus guard.
     uint64_t last_rx_end_ns = 0;
     uint64_t state_cursor = xs8_monitor_checkpoint(monitor);
+    uint64_t state_warning_cursor = 0;
     // The single QUERY_STATUS transmission, now or at the end of a settle. Empty
     // when the query is pending; otherwise the refusal or TX-uncertain reply.
     auto start_query = [&](int client) -> std::string {
@@ -373,6 +395,7 @@ int main(int argc, char **argv)
             transmitter.last_end_ns() < transmitter.last_start_ns())
             return "ERR QUERY_STATUS reason=TX_TIME_UNAVAILABLE\n";
         query.emplace(transmitter.last_start_ns(), transmitter.last_end_ns());
+        if (transmitter.last_evidence().global_gap_warnings) query->capture_warning();
         query_client = client;
         return {};
     };
@@ -387,6 +410,14 @@ int main(int argc, char **argv)
     };
     while (!stopping) {
         xs8_monitor_poll(monitor, 0);
+        xs8_monitor_diagnostics monitor_info{};
+        if (xs8_monitor_get_diagnostics(monitor, &monitor_info) &&
+            monitor_info.global_gap_warnings != state_warning_cursor) {
+            receiver.capture_warning();
+            if (query) query->capture_warning();
+            if (probe) probe->capture_warning();
+            state_warning_cursor = monitor_info.global_gap_warnings;
+        }
         const int64_t preparation_now = xs8_gpio_now_ns();
         const bool preparation_was_active = context_preparation.active();
         context_preparation.tick(preparation_now > 0 ? preparation_now : 0);
@@ -1082,6 +1113,8 @@ int main(int argc, char **argv)
                         }
                         probe.emplace(transmitter.last_start_ns(),
                                       transmitter.last_end_ns());
+                        if (transmitter.last_evidence().global_gap_warnings)
+                            probe->capture_warning();
                         query_client = client;
                         break;
                     }

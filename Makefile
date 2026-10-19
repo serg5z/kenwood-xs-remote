@@ -40,7 +40,7 @@ $(BUILD_DIR)/xs8-service: xs8_service.cpp xs8_service_core.cpp xs8_service_core.
 $(BUILD_DIR)/volume_control_test: volume_control.cpp volume_control.h tests/volume_control_test.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -Werror -I. volume_control.cpp tests/volume_control_test.cpp -o $@
 
-test: $(BUILD_DIR)/volume_control_test $(BUILD_DIR)/xs8_decode_test $(BUILD_DIR)/xs8_monitor_fault_test $(BUILD_DIR)/xs8_monitor_test $(BUILD_DIR)/xs8_rt_test $(BUILD_DIR)/xs8_service_core_test $(BUILD_DIR)/xs8_query_status_test $(BUILD_DIR)/xs8_cd_probe_test $(BUILD_DIR)/xs8_receiver_state_test $(BUILD_DIR)/xs8_research_test $(BUILD_DIR)/cec_client_core_test $(BUILD_DIR)/cec_service_socket_test $(BUILD_DIR)/xs8_service_socket_test
+test: $(BUILD_DIR)/xs8_service_monitor_test $(BUILD_DIR)/volume_control_test $(BUILD_DIR)/xs8_decode_test $(BUILD_DIR)/xs8_monitor_fault_test $(BUILD_DIR)/xs8_monitor_test $(BUILD_DIR)/xs8_rt_test $(BUILD_DIR)/xs8_service_core_test $(BUILD_DIR)/xs8_query_status_test $(BUILD_DIR)/xs8_cd_probe_test $(BUILD_DIR)/xs8_receiver_state_test $(BUILD_DIR)/xs8_research_test $(BUILD_DIR)/cec_client_core_test $(BUILD_DIR)/cec_service_socket_test $(BUILD_DIR)/xs8_service_socket_test
 	./$(BUILD_DIR)/volume_control_test
 	./$(BUILD_DIR)/xs8_decode_test
 	./$(BUILD_DIR)/xs8_monitor_fault_test
@@ -55,6 +55,7 @@ test: $(BUILD_DIR)/volume_control_test $(BUILD_DIR)/xs8_decode_test $(BUILD_DIR)
 	./$(BUILD_DIR)/cec_service_socket_test
 	python3 -m unittest tests/test_xs8_repl.py
 	python3 -m unittest tests/test_xs8_service_socket.py
+	python3 -m unittest tests/test_xs8_service_monitor.py
 
 $(BUILD_DIR)/xs8_decode_test: xs8_decode.c xs8_decode.h tests/xs8_decode_test.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -std=c11 -Werror -I. xs8_decode.c tests/xs8_decode_test.c -o $@
@@ -96,3 +97,11 @@ $(BUILD_DIR)/xs8_service_socket_test: xs8_service.cpp xs8_service_core.cpp xs8_s
 .PHONY: pi-build
 pi-build:
 	sh deploy/pi-build/build.sh
+
+# Real service and RX stack; only libgpiod and TX are synthetic.
+$(BUILD_DIR)/xs8_service_monitor_test: xs8_service.cpp xs8_service_core.cpp xs8_service_core.h xs8_cd_probe.cpp xs8_cd_probe.h xs8_query_status.cpp xs8_query_status.h xs8_receiver_state.cpp xs8_receiver_state.h xs8_research.cpp xs8_research.h volume_control.cpp volume_control.h xs8_gpio.h xs8_monitor.c xs8_monitor.h xs8_monitor_fault.c xs8_monitor_fault.h xs8_decode.c xs8_decode.h tests/stubs/monitor/gpiod.h tests/xs8_service_monitor_backend.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -std=c11 -Werror -pthread -Itests/stubs/monitor -I. -c xs8_monitor.c -o $(BUILD_DIR)/service_monitor.o
+	$(CC) $(CFLAGS) -std=c11 -Werror -Itests/stubs/monitor -I. -c xs8_monitor_fault.c -o $(BUILD_DIR)/service_monitor_fault.o
+	$(CC) $(CFLAGS) -std=c11 -Werror -Itests/stubs/monitor -I. -c xs8_decode.c -o $(BUILD_DIR)/service_decode.o
+	$(CC) $(CFLAGS) -std=c11 -Werror -pthread -Itests/stubs/monitor -I. -c tests/xs8_service_monitor_backend.c -o $(BUILD_DIR)/service_monitor_backend.o
+	$(CXX) $(CXXFLAGS) -Werror -Itests/stubs/monitor -I. xs8_service.cpp xs8_service_core.cpp xs8_cd_probe.cpp xs8_query_status.cpp xs8_receiver_state.cpp xs8_research.cpp volume_control.cpp $(BUILD_DIR)/service_monitor.o $(BUILD_DIR)/service_monitor_fault.o $(BUILD_DIR)/service_decode.o $(BUILD_DIR)/service_monitor_backend.o -o $@ -pthread

@@ -909,6 +909,23 @@ class CdPresenceStatusTest(GatewayTest):
             self.read(line)
         self.assertEqual(str(raised.exception), "Invalid XS8 service STATUS reply")
 
+    def test_capture_diagnostics_are_optional_and_validated(self):
+        suffix = (b" global_gap_policy=warn global_gap_warnings=2"
+                  b" capture_integrity=WARN_GLOBAL_GAP last_tx_global_gap_warnings=1"
+                  b" last_tx_capture_integrity=WARN_GLOBAL_GAP\n")
+        line = RECEIVER_STATUS.rstrip(b"\n") + suffix
+        fields = self.read(line)
+        self.assertEqual(fields["global_gap_warnings"], "2")
+        self.assertEqual(fields["monitor"], "HEALTHY")
+        for old, new in ((b"policy=warn", b"policy=other"),
+                         (b"warnings=2", b"warnings=-1"),
+                         (b"warnings=2", b"warnings=02"),
+                         (b"warnings=2", b"warnings=18446744073709551616"),
+                         (b"integrity=WARN_GLOBAL_GAP", b"integrity=VERIFIED")):
+            with self.subTest(new=new):
+                self.assert_rejected(line.replace(old, new, 1))
+        self.assert_rejected(line.replace(b" last_tx_global_gap_warnings=1", b""))
+
     def test_old_status_without_presence_is_accepted(self):
         for line in (STATUS, RECEIVER_STATUS, CD_IDLE_STATUS, RECEIVER_CD_STATUS):
             with self.subTest(line=line):

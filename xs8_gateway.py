@@ -39,7 +39,10 @@ CD_FIELDS = {"cd_state", "cd_action", "cd_release_owed",
 CD_PRESENCE_FIELDS = {"cd_changer", "cd_changer_ns", "cd_changer_last_probe"}
 CD_PRESENCE_VALUES = ("PRESENT", "NOT_DETECTED", "UNKNOWN")
 CD_PROBE_RESULTS = ("NONE", "RESPONSE", "NO_RESPONSE", "AMBIGUOUS", "FAILED")
-OPTIONAL_STATUS_GROUPS = (RECEIVER_FIELDS, CD_FIELDS, CD_PRESENCE_FIELDS)
+# Optional RX-integrity diagnostics; operational health remains `monitor`.
+CAPTURE_FIELDS = {"global_gap_policy", "global_gap_warnings", "capture_integrity",
+                  "last_tx_global_gap_warnings", "last_tx_capture_integrity"}
+OPTIONAL_STATUS_GROUPS = (RECEIVER_FIELDS, CD_FIELDS, CD_PRESENCE_FIELDS, CAPTURE_FIELDS)
 SOURCES = ("CD", "TUNER", "PHONO", "VIDEO1", "VIDEO2", "TAPE1", "TAPE2")
 # VIDEO1/VIDEO2 are atomic service CONTEXT sequences (0x17 -> 0x78/0x88 -> 0x07),
 # physically validated 2026-10-12. TAPE2 (MONITOR) is not a source selection.
@@ -694,6 +697,17 @@ def read_status(socket_path, timeout=1.0):
                 any(group & set(fields) not in (set(), group)
                     for group in OPTIONAL_STATUS_GROUPS)):
             raise ValueError("incomplete STATUS reply")
+        if CAPTURE_FIELDS <= set(fields):
+            if (fields["global_gap_policy"] not in ("strict", "warn") or
+                    fields["capture_integrity"] not in
+                    ("FAILED", "WARN_GLOBAL_GAP", "NO_KNOWN_GAPS") or
+                    fields["last_tx_capture_integrity"] not in
+                    ("NOT_OBSERVED", "FAILED", "WARN_GLOBAL_GAP", "NO_KNOWN_GAPS", "NOT_ESTABLISHED")):
+                raise ValueError("invalid capture diagnostics")
+            for key in ("global_gap_warnings", "last_tx_global_gap_warnings"):
+                value = fields[key]
+                if (not value.isdecimal() or value != str(int(value)) or int(value) >= 1 << 64):
+                    raise ValueError("invalid capture counter")
         if CD_FIELDS <= set(fields) and (
                 fields["cd_state"] not in ("IDLE", "ACTIVE", "HOLDING", "FAULT_LATCHED") or
                 fields["cd_release_owed"] not in ("0", "1") or

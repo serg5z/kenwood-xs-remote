@@ -16,7 +16,10 @@ enum {
     XS8_CAPTURE_SEQUENCE_GAP = 1u << 0,
     XS8_CAPTURE_SEQUENCE_REGRESSION = 1u << 1,
     XS8_CAPTURE_TIMESTAMP_REGRESSION = 1u << 2,
-    XS8_CAPTURE_DECODED_OVERFLOW = 1u << 3
+    XS8_CAPTURE_DECODED_OVERFLOW = 1u << 3,
+    XS8_CAPTURE_LINE_SEQUENCE_GAP = 1u << 4,
+    XS8_CAPTURE_LINE_SEQUENCE_REGRESSION = 1u << 5,
+    XS8_CAPTURE_UNEXPECTED_LINE = 1u << 6
 };
 
 struct xs8_capture_fault {
@@ -26,6 +29,7 @@ struct xs8_capture_fault {
     uint64_t expected_sequence;     /* previous global sequence + 1 */
     uint64_t actual_sequence;
     uint64_t line_sequence;
+    uint64_t expected_line_sequence;
     uint64_t previous_timestamp_ns; /* 0 when no earlier event */
     uint64_t timestamp_ns;
     uint64_t event_index;           /* 1-based count of events seen */
@@ -47,6 +51,12 @@ struct xs8_capture_state {
 unsigned int xs8_capture_check(struct xs8_capture_state *state,
     unsigned int gpio, uint64_t sequence, uint64_t line_sequence,
     uint64_t timestamp_ns, uint64_t event_index);
+/* Still counts every raw global discontinuity; only a forward global gap
+ * without any other integrity error may be excluded from first-fault storage.
+ * The caller must check independent per-line continuity before opting in. */
+unsigned int xs8_capture_check_policy(struct xs8_capture_state *state,
+    unsigned int gpio, uint64_t sequence, uint64_t line_sequence,
+    uint64_t timestamp_ns, uint64_t event_index, bool warn_global_only);
 /* Records a decoded-batch overflow as the first fault if none is recorded. */
 void xs8_capture_note_overflow(struct xs8_capture_state *state,
     uint64_t dropped, uint64_t timestamp_ns);

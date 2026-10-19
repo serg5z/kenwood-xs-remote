@@ -29,6 +29,10 @@ void Xs8CdProbe::observe(const xs8_monitor_record *records, size_t count)
 {
     for (size_t i = 0; i < count; ++i) {
         const xs8_monitor_record& record = records[i];
+        if (record.decoded.global_gap_warnings) {
+            fault_ = Fault::GLOBAL_GAP_WARNING;
+            continue;
+        }
         if (record.decoded.kind == XS8_EVENT_GAP) {
             fault_ = Fault::EVENT_GAP;
             continue;
@@ -74,6 +78,9 @@ void Xs8CdProbe::observe(const xs8_monitor_record *records, size_t count)
             ambiguous_ = true;  // Early, late, unexpected or a second frame.
     }
 }
+
+void Xs8CdProbe::capture_warning()
+{ if (fault_ == Fault::NONE) fault_ = Fault::GLOBAL_GAP_WARNING; }
 
 void Xs8CdProbe::overflow() { fault_ = Fault::HISTORY_OVERFLOW; }
 void Xs8CdProbe::monitor_failed()
@@ -135,6 +142,7 @@ std::string Xs8CdProbe::response(uint64_t now_ns) const
     case Fault::HISTORY_OVERFLOW: reason = "HISTORY_OVERFLOW"; break;
     case Fault::MONITOR_FAILED: reason = "MONITOR_FAILED"; break;
     case Fault::CANCELLED: reason = "CANCELLED"; break;
+    case Fault::GLOBAL_GAP_WARNING: reason = "GLOBAL_GAP_WARNING"; break;
     }
     return std::string("ERR CD_PROBE reason=") + reason + " rx=" + rx +
         " receiver_execution=UNVERIFIED\n";

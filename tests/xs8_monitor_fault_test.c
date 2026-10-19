@@ -205,6 +205,22 @@ static void test_armed_line(void)
                         "busy=HIGH data=UNKNOWN") == 0);
 }
 
+static void test_warning_does_not_hide_later_integrity_fault(void)
+{
+    struct xs8_capture_state state = armed_state();
+    xs8_capture_check_policy(&state, DATA, 1, 1, ARMED_NS + 1000, 1, true);
+    assert(xs8_capture_check_policy(&state, DATA, 4, 2,
+        ARMED_NS + 2000, 2, true) == XS8_CAPTURE_SEQUENCE_GAP);
+    assert(!state.fault_recorded && state.sequence_gaps == 1 && state.missing_events == 2);
+    xs8_capture_note_overflow(&state, 3, ARMED_NS + 3000);
+    assert(state.fault_recorded && state.first_fault.reasons == XS8_CAPTURE_DECODED_OVERFLOW);
+    struct xs8_capture_state mixed = armed_state();
+    xs8_capture_check_policy(&mixed, DATA, 1, 1, ARMED_NS + 2000, 1, true);
+    assert(xs8_capture_check_policy(&mixed, DATA, 3, 2, ARMED_NS + 1000, 2, true) ==
+        (XS8_CAPTURE_SEQUENCE_GAP | XS8_CAPTURE_TIMESTAMP_REGRESSION));
+    assert(mixed.fault_recorded);
+}
+
 int main(void)
 {
     test_in_order_events_record_nothing();
@@ -217,6 +233,7 @@ int main(void)
     test_event_before_arming_is_negative();
     test_counters_match_original_algorithm();
     test_armed_line();
+    test_warning_does_not_hide_later_integrity_fault();
     puts("xs8_monitor_fault_test: OK");
     return 0;
 }
