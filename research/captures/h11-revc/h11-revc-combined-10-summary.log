@@ -1,0 +1,3 @@
+ORDER_SUMMARY events=1600 gaps=1 initially_missing=1 late_arrivals=0 unresolved_at_end=1 regressions_or_duplicates=0 timestamp_regressions=0
+UNRESOLVED_SEQUENCE_RANGE=880-880 (not observed before capture ended; cause unknown)
+CAPTURE_START_NS=81739972055076 batches=1598 first_gap_read_ns=81756114860597 buffer_dropped=0 collection_complete=yes stop_reason=FIRST_GAP_WINDOW

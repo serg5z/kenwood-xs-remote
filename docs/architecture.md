@@ -11,8 +11,8 @@ flowchart LR
     N -->|/run/kenwood-gateway.sock| G[xs8_gateway.py<br/>+ web/ UI]
     C -->|/tmp/kenwood-xs8.sock| S[xs8-service<br/>sole GPIO owner]
     G -->|/tmp/kenwood-xs8.sock| S
-    S -->|GPIO4 DATA / GPIO22 BUSY TX| K[Kenwood KR-V6070]
-    K -.->|GPIO27 / GPIO23 RX sense<br/>bus monitor| S
+    S -->|GPIO6 DATA / GPIO19 BUSY TX| K[Kenwood KR-V6070]
+    K -.->|GPIO13 / GPIO26 RX sense<br/>bus monitor| S
     K <-->|SYSTEM CONTROL| D[CD changer]
 ```
 

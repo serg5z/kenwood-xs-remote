@@ -1,0 +1,11 @@
+ORDER_SUMMARY events=320 gaps=9 initially_missing=9 late_arrivals=0 unresolved_at_end=9 regressions_or_duplicates=0 timestamp_regressions=0
+UNRESOLVED_SEQUENCE_RANGE=22-22 (not observed before capture ended; cause unknown)
+UNRESOLVED_SEQUENCE_RANGE=25-25 (not observed before capture ended; cause unknown)
+UNRESOLVED_SEQUENCE_RANGE=46-46 (not observed before capture ended; cause unknown)
+UNRESOLVED_SEQUENCE_RANGE=63-63 (not observed before capture ended; cause unknown)
+UNRESOLVED_SEQUENCE_RANGE=66-66 (not observed before capture ended; cause unknown)
+UNRESOLVED_SEQUENCE_RANGE=187-187 (not observed before capture ended; cause unknown)
+UNRESOLVED_SEQUENCE_RANGE=212-212 (not observed before capture ended; cause unknown)
+UNRESOLVED_SEQUENCE_RANGE=217-217 (not observed before capture ended; cause unknown)
+UNRESOLVED_SEQUENCE_RANGE=236-236 (not observed before capture ended; cause unknown)
+CAPTURE_START_NS=22168944113270 batches=320 first_gap_read_ns=22171862135922 buffer_dropped=0 collection_complete=yes stop_reason=FIRST_GAP_WINDOW

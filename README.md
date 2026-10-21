@@ -21,7 +21,7 @@ Panasonic TV / Apple TV remote            iPhone Safari
         └───────────► /tmp/kenwood-xs8.sock ◄───┘
                                │
                        xs8-service (sole GPIO owner)
-                               │ GPIO4/22 TX, GPIO27/23 RX sense
+                               │ GPIO6/19 TX, GPIO13/26 RX sense
                                ▼
                  XS8 SYSTEM CONTROL → KR-V6070 ↔ CD changer
 ```

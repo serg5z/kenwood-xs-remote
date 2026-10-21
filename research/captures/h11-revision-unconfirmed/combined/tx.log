@@ -1,0 +1,2 @@
+DISCONNECTED-FIXTURE ONLY: operator acknowledged physical Kenwood disconnection. Pattern=00,FF,55,AA frames=16 gap_ms=100. No RX sensing, bus arbitration or RT scheduling.
+STIMULUS completed=16 attempted=16 cleanup=LOW_WRITES_OK result=TX_OK

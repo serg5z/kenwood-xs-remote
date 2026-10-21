@@ -1,0 +1,3 @@
+DISCONNECTED-FIXTURE ONLY: operator acknowledged physical Kenwood disconnection. line=data transitions=320 interval_us=5000 inactive TX held LOW. No RX sensing or RT scheduling.
+SINGLE_LINE requested=320 attempted=320 written=320 run_complete=yes max_late_ns=1525202 over_500us=14 over_1000us=6 samples=320
+STIMULUS transitions_written=320 cleanup=LOW_WRITES_OK result=TX_OK

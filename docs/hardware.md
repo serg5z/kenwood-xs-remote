@@ -2,7 +2,7 @@
 
 This document describes two **experimentally validated hardware interfaces** for the Kenwood KR-V6070: the original Arduino Micro bridge and the Raspberry Pi B+ GPIO interface. Neither is a certified interface for other Kenwood SYSTEM CONTROL devices. The [XS8 protocol reference](xs8-protocol.md) covers frame encoding and commands, and the [architecture](architecture.md) covers the software path.
 
-**Integration status:** The **Raspberry Pi GPIO interface is the production path.** `xs8-service` owns GPIO4/22 (TX) and GPIO27/23 (RX sense) and serves both the CEC client and the Web Remote ([project status](project-status.md)). The Raspberry Pi → USB → Arduino Micro bridge was the original CEC path. It is now legacy and kept for reference only.
+**Integration status:** The **Raspberry Pi GPIO interface is the production path.** The H11 production-code mapping uses GPIO6/19 (DATA/BUSY TX) and GPIO13/26 (DATA/BUSY RX sense) in `xs8-service` (`kenwood-xs8.service` on the Pi), serving the CEC client and Web Remote ([project status](project-status.md)). The Raspberry Pi → USB → Arduino Micro bridge was the original CEC path. It is now legacy and kept for reference only.
 
 ## Components and connections
 
@@ -40,9 +40,53 @@ Raspberry Pi B+ ── USB ── Arduino Micro
 
 The 2.2 kΩ resistors are **in the TX paths**. A0 and A5 sense the XS-side nodes; they do not replace the series resistors. This Arduino configuration does **not** use Pi GPIO-to-XS wiring. The separate Pi GPIO interface is described below. [Arduino pin declarations](../xs8-bridge/xs8-bridge.ino), [physical mapping](../research/notes/kenwood-xs-reverse-engineering-reviewed.md)
 
-## Raspberry Pi B+ GPIO XS8 interface (production)
+## H11 perfboard GPIO mapping (2026-10-18)
 
-A second implementation was tested on the **Kenwood KR-V6070** using a **Raspberry Pi Model B+ Rev 1.2** and external transistor-based 5 V TX stages. The program [`xs8_send.c`](../xs8_send.c) uses `libgpiod` to generate XS8 timing directly on the Pi. The same GPIO interface is now driven by `xs8-service`, the production path for the CEC client and the Web Remote. `xs8_send` remains a standalone command-line transmitter.
+| Signal | Pi BCM GPIO | Physical header pin |
+|---|---:|---:|
+| DATA_TX | 6 | 31 |
+| DATA_RX | 13 | 33 |
+| BUSY_TX | 19 | 35 |
+| BUSY_RX | 26 | 37 |
+
+The operator reports two H11 GPIO loopback stress tests: **240 samples total,
+zero errors**. At that initial mapping-validation boundary the H11 adapter
+was disconnected from the receiver.
+These results do not establish live XS8 receiver compatibility or timing after
+the wiring change. The production-code migration changes only GPIO mapping;
+it preserves existing line polarity, frame timing and safety behavior. The
+electrical details and validation results below describe the previous adapter,
+not an independently validated H11 schematic or receiver-connected test.
+
+## Later H11 Rev.C / H12 investigation record (2026-10-21)
+
+The earlier disconnected status above is historical. Later attended H11 Rev.C
+TUNER, Volume DOWN/UP and MUTE ON/OFF trials were independently operator-observed;
+subsequent CEC integration encountered an uncertain STOP and conservatively
+latched a fault. See the [dated RC reconciliation](xs8-h11-warn-rc.md).
+This is not approval for unattended motor control.
+
+The operator confirmed [Rev.C captures](../research/captures/h11-revc/README.md)
+were taken after adding 100 nF supply decoupling. [Earlier captures](../research/captures/h11-revision-unconfirmed/README.md)
+have uncertain revision provenance. They do not establish physical edge loss
+from global sequence holes alone.
+
+For H12 the operator reported a 33 kΩ upper / 47 kΩ lower RX divider at 4.78 V:
+GPIO26 HIGH measured 2.01 V before manual no-pull configuration and 2.81 V
+afterward, including with the sniffer running. This supports pull-loading as
+an explanation; the prior pull source, GPIO13 measurement and effect on event
+gaps remain unverified. The [explicit RX bias change](xs8-rx-bias.md) requires
+separate electrical validation of the newly built binaries. The [H12 replay](../tests/fixtures/README.md)
+preserves the observed UP sequence, not physical STOP acknowledgment.
+
+The [H12 Fritzing snapshot](../hardware/h12/README.md) is not an as-built-certified
+schematic. The [final ADC recorder](../research/sketches/h12-adc-edge-recorder/README.md)
+uses A0=BUSY, A1=DATA; its sequential sampling cannot establish simultaneous
+edges or exclude faster electrical disturbances.
+
+## Previous Raspberry Pi B+ GPIO XS8 interface (historical wiring)
+
+A second implementation was tested on the **Kenwood KR-V6070** using a **Raspberry Pi Model B+ Rev 1.2** and external transistor-based 5 V TX stages. The program [`xs8_send.c`](../xs8_send.c) uses `libgpiod` to generate XS8 timing directly on the Pi. This earlier interface was later driven by `xs8-service` for the CEC client and Web Remote. `xs8_send` remains a standalone command-line transmitter; the H11 mapping above supersedes this section's pin assignments.
 
 | Pi BCM GPIO | Direction / function | Electrical connection |
 |---|---|---|
@@ -108,7 +152,7 @@ The earlier `xs-amplitude.ino` also describes a 10 kΩ/10 kΩ divider and an ass
 
 The archived [pin-mapper sketch](../research/sketches/xs-pin-mapper.ino) deliberately drives a line HIGH for two seconds; it is an **active** bench experiment, not a passive continuity test. Likewise, `xs-lo2.ino` was a **no-Kenwood-connected** bench test with reversed A0/A5 labels and does not supersede the live wiring above. [Bench test header](../research/sketches/xs-lo2.ino)
 
-### Raspberry Pi GPIO configuration
+### Previous Raspberry Pi GPIO configuration (historical wiring)
 
 1. With power disconnected, verify the TRS contact mapping and common ground. Trace GPIO4 to the **DATA** TX stage and ring, GPIO22 to the **BUSY** TX stage and tip, GPIO27 to the **DATA** divider, and GPIO23 to the **BUSY** divider.
 2. Confirm that each TX stage has its own **2.2 kΩ output series resistor**, that the Pi GPIO pins are isolated from the 5 V bus by the external circuitry, and that both RX paths use voltage dividers. Check for unintended shorts or cross-coupling between the two TX stages.

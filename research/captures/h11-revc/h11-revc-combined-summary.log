@@ -1,0 +1,2 @@
+ORDER_SUMMARY events=320 gaps=0 initially_missing=0 late_arrivals=0 unresolved_at_end=0 regressions_or_duplicates=0 timestamp_regressions=0
+CAPTURE_START_NS=81638225809864 batches=320 first_gap_read_ns=0 buffer_dropped=0 collection_complete=yes stop_reason=DURATION
