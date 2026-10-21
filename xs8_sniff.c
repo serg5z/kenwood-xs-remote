@@ -193,6 +193,8 @@ int main(int argc, char **argv)
 
     if (gpiod_line_settings_set_direction(
             settings, GPIOD_LINE_DIRECTION_INPUT) < 0 ||
+        /* Do not inherit a pull that loads the external RX voltage divider. */
+        gpiod_line_settings_set_bias(settings, GPIOD_LINE_BIAS_DISABLED) < 0 ||
         gpiod_line_settings_set_edge_detection(
             settings, GPIOD_LINE_EDGE_BOTH) < 0 ||
         gpiod_line_settings_set_event_clock(

@@ -97,8 +97,12 @@ static int open_gpio(struct xs8_gpio *bus, bool capture, bool tx_only)
     unsigned int outputs[] = {DATA_TX, BUSY_TX};
     unsigned int inputs[] = {BUSY_RX, DATA_RX};
     if (gpiod_line_settings_set_direction(out, GPIOD_LINE_DIRECTION_OUTPUT) < 0 ||
-        gpiod_line_settings_set_output_value(out, GPIOD_LINE_VALUE_INACTIVE) < 0 ||
-        (!tx_only && gpiod_line_settings_set_direction(in, GPIOD_LINE_DIRECTION_INPUT) < 0))
+        gpiod_line_settings_set_output_value(out, GPIOD_LINE_VALUE_INACTIVE) < 0)
+        goto fail;
+    /* AS_IS retains inherited pulls, which can load the external RX divider. */
+    if (!tx_only &&
+        (gpiod_line_settings_set_direction(in, GPIOD_LINE_DIRECTION_INPUT) < 0 ||
+         gpiod_line_settings_set_bias(in, GPIOD_LINE_BIAS_DISABLED) < 0))
         goto fail;
     if (capture &&
         (gpiod_line_settings_set_edge_detection(in, GPIOD_LINE_EDGE_BOTH) < 0 ||

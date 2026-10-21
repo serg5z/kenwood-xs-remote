@@ -85,11 +85,12 @@ Native Pi with libgpiod 2.2.1:
 make .build/xs8_tx_replay CFLAGS='-O2 -Wall -Wextra -Werror'
 ```
 
-Host-only sequence tests use fake clock and replay operations:
+Host-only tests use stub GPIO, clock, RT and replay operations:
 
 ```sh
-make .build/xs8_tx_replay_test
+make .build/xs8_tx_replay_test .build/xs8_gpio_tx_only_test
 ./.build/xs8_tx_replay_test
+./.build/xs8_gpio_tx_only_test
 make test
 ```
 
@@ -106,9 +107,9 @@ docker run --rm --platform linux/arm/v6 --network none \
   kenwood-xs-pi-build:trixie-armv6 sh -eu -c '
     make -B BUILD_DIR=/out \
       CFLAGS="-O2 -Wall -Wextra -Werror -march=armv6 -mfpu=vfp -mfloat-abi=hard -marm" \
-      /out/xs8_tx_replay /out/xs8_sniff /out/xs8_tx_replay_test
+      /out/xs8_tx_replay /out/xs8_sniff /out/xs8_tx_replay_test /out/xs8_gpio_tx_only_test
     /out/xs8_tx_replay_test
-
+    /out/xs8_gpio_tx_only_test
     /out/xs8_tx_replay --dry-run
     file /out/xs8_tx_replay
     readelf -h -A -l -d /out/xs8_tx_replay
