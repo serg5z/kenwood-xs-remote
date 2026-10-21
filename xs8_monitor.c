@@ -5,6 +5,7 @@
 #include "xs8_monitor_fault.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <poll.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -17,6 +18,29 @@
 #define DATA_GPIO 13
 #define OBS_HISTORY 64
 #define OBS_TAIL_NS 2000000ULL
+
+/* Opt-in, fixed storage only. No formatting, allocation or output on failure.
+ * Full retained delivery history includes pre/post TX context, not sorted edges. */
+#define FAILURE_RAW_EVENTS 2048
+#define FAILURE_SNAPSHOTS 16
+struct failure_edge {
+    uint64_t serial, timestamp_ns, global, line, batch;
+    unsigned int gpio, index, batch_size, stage, bits;
+    bool rising, active, tail_fell;
+    int64_t interval_ns;
+    const char *error, *emitted;
+};
+struct failure_snapshot {
+    uint64_t id, checkpoint, start_ns, end_ns, decision_event;
+    uint8_t byte;
+    const char *rejection;
+};
+struct failure_history {
+    struct failure_edge edges[FAILURE_RAW_EVENTS];
+    struct failure_snapshot failures[FAILURE_SNAPSHOTS];
+    uint64_t events, batches, failures_seen;
+    bool initial_busy_low;
+};
 
 struct xs8_monitor {
     struct xs8_gpio *bus;
@@ -35,6 +59,7 @@ struct xs8_monitor {
     uint64_t observation_serial;
     atomic_bool healthy;
     bool threaded;
+    struct failure_history *failure_history;
     bool warn_global_gaps;
     uint64_t last_line_sequence[2]; /* BUSY, DATA; independent of global seqno */
     uint64_t line_gaps, line_missing, line_regressions, global_gap_warnings;
@@ -49,6 +74,75 @@ struct decoded_batch {
     uint64_t dropped;
     uint64_t current_event_ns;
 };
+
+/* Called under processing_lock (and, in verify, observation_lock).
+ * A descriptor references the ring: even repeated STOP failures do not copy
+ * arrays or perform I/O. Overwrites are explicitly reported at shutdown. */
+static void remember_failure(struct xs8_monitor *m, uint64_t checkpoint,
+    uint8_t byte, uint64_t start, uint64_t end, const char *rejection)
+{
+    struct failure_history *h = m->failure_history;
+    if (!h) return;
+    uint64_t id = ++h->failures_seen;
+    h->failures[(id - 1) % FAILURE_SNAPSHOTS] =
+        (struct failure_snapshot){id, checkpoint, start, end, h->events, byte, rejection};
+}
+
+/* Only called after the reader has stopped, never by TX verification/cleanup. */
+static void dump_failures(struct xs8_monitor *m)
+{
+    struct failure_history *h = m->failure_history;
+    if (!h || !h->failures_seen) return;
+    uint64_t first = h->events > FAILURE_RAW_EVENTS ? h->events - FAILURE_RAW_EVENTS + 1 : 1;
+    uint64_t first_failure = h->failures_seen > FAILURE_SNAPSHOTS
+        ? h->failures_seen - FAILURE_SNAPSHOTS + 1 : 1;
+    fprintf(stderr, "XS8_FAILURE_STORAGE bytes=%zu events=%" PRIu64
+            " overwritten_events=%" PRIu64 " overwritten_snapshots=%" PRIu64 "\n",
+            sizeof(*h), h->events, first - 1, first_failure - 1);
+    for (uint64_t id = first_failure; id <= h->failures_seen; ++id) {
+        const struct failure_snapshot *f = &h->failures[(id - 1) % FAILURE_SNAPSHOTS];
+        fprintf(stderr, "XS8_FAILURE_BEGIN id=%" PRIu64 " byte=0x%02X start_ns=%" PRIu64
+                " end_ns=%" PRIu64 " checkpoint=%" PRIu64 " decision_event=%" PRIu64
+                " rejection=%s raw_first=%" PRIu64 " raw_last=%" PRIu64
+                " initial_busy_low=%u policy=%s post_margin_reached=%u\n",
+                id, f->byte, f->start_ns, f->end_ns,
+                f->checkpoint, f->decision_event, f->rejection, first, h->events,
+                h->initial_busy_low, m->warn_global_gaps ? "warn" : "strict",
+                h->events && h->edges[(h->events - 1) % FAILURE_RAW_EVENTS].timestamp_ns
+                    >= f->end_ns &&
+                h->edges[(h->events - 1) % FAILURE_RAW_EVENTS].timestamp_ns - f->end_ns >= 5000000);
+        fprintf(stderr, "XS8_RAW_HEADER serial,timestamp_ns,gpio,edge,global_seqno,line_seqno,"
+                "batch,batch_index,batch_size,stage,bits,active,interval_ns,"
+                "expected_min_ns,expected_max_ns,error,emitted_reason,tail_fell\n");
+        for (uint64_t serial = first; serial <= h->events; ++serial) {
+            const struct failure_edge *e = &h->edges[(serial - 1) % FAILURE_RAW_EVENTS];
+            /* Retain every event through the decision, plus available post-TX
+             * context (5 ms). Never wait for future edges to fill a margin. */
+            if (serial > f->decision_event && e->timestamp_ns > f->end_ns &&
+                e->timestamp_ns - f->end_ns > 5000000) continue;
+            uint64_t low = 0, high = 0;
+            if (e->active && e->gpio == DATA_GPIO) {
+                if (e->rising && e->stage == 0) { low = 300000; high = 5000000; }
+                else if (e->rising && e->stage == 2) { low = 3000000; high = 12000000; }
+                else if (!e->rising && e->stage == 1) { low = 7000000; high = 13000000; }
+                else if (!e->rising && (e->stage == 3 || e->stage == 4)) {
+                    low = 3000000; high = 7000000;
+                }
+            } else if (e->active && e->gpio == BUSY_GPIO && !e->rising &&
+                       e->stage == 4 && e->tail_fell) {
+                low = 1; high = OBS_TAIL_NS; /* strict local-TX guard, not passive validity */
+            }
+            fprintf(stderr, "XS8_RAW,%" PRIu64 ",%" PRIu64 ",%u,%s,%" PRIu64
+                    ",%" PRIu64 ",%" PRIu64 ",%u,%u,%u,%u,%u,%" PRId64
+                    ",%" PRIu64 ",%" PRIu64 ",%s,%s,%u\n", e->serial,
+                    e->timestamp_ns, e->gpio, e->rising ? "rising" : "falling",
+                    e->global, e->line, e->batch, e->index, e->batch_size,
+                    e->stage, e->bits, e->active, e->interval_ns, low, high,
+                    e->error ? e->error : "NONE", e->emitted ? e->emitted : "NONE", e->tail_fell);
+        }
+        fprintf(stderr, "XS8_FAILURE_END id=%" PRIu64 "\n", id);
+    }
+}
 
 static void collect_decoded(void *user, const struct xs8_decoded *result)
 {
@@ -147,6 +241,7 @@ static int read_events(struct xs8_monitor *monitor)
     if ((unsigned int)count > monitor->max_batch)
         monitor->max_batch = (unsigned int)count;
     bool capture_fault = false;
+    if (monitor->failure_history) ++monitor->failure_history->batches;
     for (int i = 0; i < count; ++i) {
         struct gpiod_edge_event *event =
             gpiod_edge_event_buffer_get_event(monitor->buffer, i);
@@ -219,9 +314,31 @@ static int read_events(struct xs8_monitor *monitor)
         } else if (reasons || line_fault) {
             capture_fault = true;
         }
+        struct failure_edge *raw = NULL;
+        size_t decoded_before = decoded.count;
+        if (monitor->failure_history) {
+            struct failure_history *h = monitor->failure_history;
+            uint64_t serial = ++h->events;
+            raw = &h->edges[(serial - 1) % FAILURE_RAW_EVENTS];
+            *raw = (struct failure_edge){
+                .serial = serial, .timestamp_ns = edge.time_ns,
+                .global = edge.sequence, .line = line_sequence, .batch = h->batches,
+                .gpio = edge.gpio, .index = (unsigned int)i, .batch_size = (unsigned int)count,
+                .stage = monitor->decoder.stage, .bits = monitor->decoder.bits,
+                .rising = edge.kind == XS8_RISING, .active = monitor->decoder.active,
+                .tail_fell = monitor->decoder.tail_fell,
+                .interval_ns = monitor->decoder.active
+                    ? (int64_t)edge.time_ns - (int64_t)monitor->decoder.phase_start_ns : 0
+            };
+        }
         decoded.current_event_ns = edge.time_ns;
         xs8_decoder_edge(&monitor->decoder, &edge,
                          collect_decoded, &decoded);
+        if (raw) {
+            raw->error = monitor->decoder.error;
+            if (decoded.count > decoded_before)
+                raw->emitted = decoded.results[decoded.count - 1].decoded.reason;
+        }
         if (monitor->warn_global_gaps && !line_fault &&
             reasons == XS8_CAPTURE_SEQUENCE_GAP &&
             edge.gpio == BUSY_GPIO && edge.kind == XS8_RISING && monitor->decoder.active)
@@ -407,6 +524,22 @@ static int start_monitor(struct xs8_gpio *bus, struct xs8_monitor **out,
         goto start_fail;
     }
     xs8_decoder_init(&monitor->decoder, busy == 0);
+    const char *snapshots = getenv("XS8_FAILURE_SNAPSHOTS");
+    if (snapshots && !strcmp(snapshots, "1")) {
+        monitor->failure_history = calloc(1, sizeof(*monitor->failure_history));
+        if (monitor->failure_history) {
+            /* Touch storage before accepting commands, not on a STOP retry.
+             * This is not mlock or a hard real-time scheduling guarantee. */
+            volatile unsigned char *pages = (volatile unsigned char *)monitor->failure_history;
+            for (size_t i = 0; i < sizeof(*monitor->failure_history); i += 4096) pages[i] = 0;
+            pages[sizeof(*monitor->failure_history) - 1] = 0;
+            monitor->failure_history->initial_busy_low = busy == 0;
+            fprintf(stderr, "XS8 failure snapshots enabled bytes=%zu raw_capacity=%u "
+                    "snapshot_capacity=%u output=MONITOR_SHUTDOWN_ONLY\n",
+                    sizeof(*monitor->failure_history), FAILURE_RAW_EVENTS, FAILURE_SNAPSHOTS);
+        } else fprintf(stderr, "XS8 failure snapshots unavailable: allocation failed; "
+                       "verification unchanged\n");
+    }
     int64_t armed_ns = xs8_gpio_now_ns();
     monitor->capture.armed_ns = armed_ns > 0 ? (uint64_t)armed_ns : 0;
     char armed[128];
@@ -430,6 +563,7 @@ static int start_monitor(struct xs8_gpio *bus, struct xs8_monitor **out,
     return 0;
 start_fail:
     error = errno;
+    free(monitor->failure_history);
     if (monitor->buffer) gpiod_edge_event_buffer_free(monitor->buffer);
     pthread_cond_destroy(&monitor->observation_changed);
     pthread_mutex_destroy(&monitor->observation_lock);
@@ -466,6 +600,8 @@ void xs8_monitor_stop(struct xs8_monitor *monitor)
         }
         finish_monitor(monitor);
     }
+    dump_failures(monitor);
+    free(monitor->failure_history);
     gpiod_edge_event_buffer_free(monitor->buffer);
     pthread_cond_destroy(&monitor->observation_changed);
     pthread_mutex_destroy(&monitor->observation_lock);
@@ -579,7 +715,12 @@ enum xs8_observation xs8_monitor_verify_tx(struct xs8_monitor *monitor,
                 int ready = poll(&fd, 1, 0);
                 if (ready < 0) return XS8_OBS_UNHEALTHY;
                 if (!ready) break;
-                if (drains == 32) return XS8_OBS_INVALID;
+                if (drains == 32) {
+                    pthread_mutex_lock(&monitor->processing_lock);
+                    remember_failure(monitor, checkpoint, byte, start_ns, end_ns, "DRAIN_LIMIT");
+                    pthread_mutex_unlock(&monitor->processing_lock);
+                    return XS8_OBS_INVALID;
+                }
                 if (xs8_monitor_poll(monitor, 0) < 0) return XS8_OBS_UNHEALTHY;
             }
         }
@@ -589,6 +730,7 @@ enum xs8_observation xs8_monitor_verify_tx(struct xs8_monitor *monitor,
         pthread_mutex_lock(&monitor->observation_lock);
         enum xs8_observation result = XS8_OBS_MISSING;
         unsigned int candidates = 0;
+        const char *rejection = NULL;
         if (!atomic_load(&monitor->healthy) || checkpoint > monitor->observation_serial ||
             monitor->observation_serial - checkpoint >= OBS_HISTORY) {
             result = XS8_OBS_UNHEALTHY;
@@ -596,30 +738,41 @@ enum xs8_observation xs8_monitor_verify_tx(struct xs8_monitor *monitor,
             for (uint64_t next = checkpoint + 1; next <= monitor->observation_serial; ++next) {
                 struct xs8_monitor_record record = monitor->observations[next % OBS_HISTORY];
                 if (record.serial != next || record.decoded.kind == XS8_EVENT_GAP) {
+                    rejection = record.serial != next ? "OBSERVATION_SERIAL" : "EVENT_GAP_RECORD";
                     result = XS8_OBS_INVALID;
                     break;
                 }
                 if (record.decoded.time_ns < start_ns) {
-                    if (record.end_ns > start_ns) { result = XS8_OBS_INVALID; break; }
+                    if (record.end_ns > start_ns) {
+                        rejection = "PRE_TX_OVERLAP";
+                        result = XS8_OBS_INVALID; break;
+                    }
                     continue;
                 }
                 if (record.decoded.time_ns > end_ns) continue;
                 if (++candidates > 1 || record.end_ns > end_ns + OBS_TAIL_NS ||
                     !xs8_decoded_local_tx_tail_valid(&record.decoded)) {
+                    rejection = candidates > 1 ? "MULTIPLE_CANDIDATES" :
+                        record.end_ns > end_ns + OBS_TAIL_NS ? "END_OUTSIDE_WINDOW" :
+                        !record.decoded.valid ? "DECODE_INVALID" : "LOCAL_TAIL_INVALID";
                     result = XS8_OBS_INVALID;
                     break;
                 }
                 result = record.decoded.waveform_lsb == byte ? XS8_OBS_MATCH : XS8_OBS_MISMATCH;
             }
             if (monitor->decoder.active && monitor->decoder.frame_start_ns <= end_ns &&
-                (candidates || monitor->decoder.frame_start_ns < start_ns))
+                (candidates || monitor->decoder.frame_start_ns < start_ns)) {
+                rejection = "ACTIVE_FRAME_OVERLAP";
                 result = XS8_OBS_INVALID;
+            }
         }
         struct pollfd fd = {gpiod_line_request_get_fd(monitor->bus->rx_req), POLLIN, 0};
         int pending = poll(&fd, 1, 0);
         if (pending < 0) result = XS8_OBS_UNHEALTHY;
         bool wait = result == XS8_OBS_MISSING ||
             (pending > 0 && (result == XS8_OBS_MATCH || result == XS8_OBS_MISMATCH));
+        if (!wait && result == XS8_OBS_INVALID)
+            remember_failure(monitor, checkpoint, byte, start_ns, end_ns, rejection);
         pthread_mutex_unlock(&monitor->processing_lock);
         if (!wait) {
             pthread_mutex_unlock(&monitor->observation_lock);

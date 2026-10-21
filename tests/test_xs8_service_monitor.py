@@ -13,12 +13,13 @@ import xs8_gateway
 
 
 class RealMonitorServiceTest(unittest.TestCase):
-    def run_trace(self, trace, policy="strict", second=False, command="SELECT_SOURCE CD"):
+    def run_trace(self, trace, policy="strict", second=False, command="SELECT_SOURCE CD", snapshots=False):
         with tempfile.TemporaryDirectory(prefix="xs8-real-monitor-", dir="/tmp") as tmp:
             path = str(pathlib.Path(tmp) / "service.sock")
             log_path = pathlib.Path(tmp) / "service.log"
             env = dict(os.environ, XS8_GLOBAL_GAP_POLICY=policy,
-                       XS8_MONITOR_TEST_TRACE=trace)
+                       XS8_MONITOR_TEST_TRACE=trace,
+                       XS8_FAILURE_SNAPSHOTS="1" if snapshots else "0")
             with log_path.open("w") as log:
                 process = subprocess.Popen([
                     ".build/xs8_service_monitor_test", "--socket", path,
@@ -56,6 +57,34 @@ class RealMonitorServiceTest(unittest.TestCase):
                         process.terminate()
                     process.wait(timeout=3)
             return reply, dict(field.split("=", 1) for field in status.split()[1:]), again, log_path.read_text()
+
+    def test_invalid_stop_snapshot_does_not_change_retry_or_latched_fault(self):
+        for enabled in (False, True):
+            with self.subTest(snapshots=enabled):
+                reply, status, again, log = self.run_trace(
+                    "volume_low_stop", command="VOLUME_STEP DOWN",
+                    second="VOLUME_STEP UP", snapshots=enabled)
+                self.assertIn("state=FAULT_LATCHED stop_owed=0 context_may_be_open=0", reply)
+                self.assertTrue(again.startswith("ERR"))
+                self.assertEqual(status["monitor"], "HEALTHY")
+                self.assertEqual(status["state"], "FAULT_LATCHED")
+                self.assertEqual(status["stop_owed"], "0")
+                self.assertEqual(status["last_stop_waveform"], "MATCH")
+                self.assertEqual(status["global_gap_warnings"], "0")
+                self.assertEqual(re.findall(r"FAKE_TX (0x[0-9A-F]{2})", log),
+                                 ["0x17", "0xE9", "0x09", "0x09", "0x07"])
+                self.assertIn("gpio_tx=TX_OK waveform=INVALID", log)
+                self.assertIn("reason=LOW_TIMING", log)
+                self.assertIn("XS8 STOP reason=STEP result=TX_OK retries=1", log)
+                if enabled:
+                    self.assertIn("rejection=DECODE_INVALID", log)
+                    self.assertIn("XS8_RAW,", log)
+                    self.assertGreater(log.index("XS8_FAILURE_BEGIN"),
+                                       log.index("XS8 ROOT result=TX_OK"))
+                    self.assertGreater(log.index("XS8_FAILURE_BEGIN"),
+                                       log.index("state=FAULT_LATCHED"))
+                else:
+                    self.assertNotIn("XS8_FAILURE_BEGIN", log)
 
     def test_one_valid_frame_and_warning_visibility(self):
         for policy, trace, count in (("strict", "valid", "0"), ("warn", "warn_valid", "1")):

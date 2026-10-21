@@ -113,8 +113,10 @@ int xs8_gpio_send(struct xs8_gpio *bus, uint8_t byte, int64_t *start)
             !strcmp(mode, "volume_warn_both");
         const bool fatal_stop = !strcmp(mode, "volume_fatal_stop") &&
             byte == 0x09 && !volume_fault_injected;
-        if (fatal_stop) volume_fault_injected = true;
-        mode = fatal_stop ? "line_fault" :
+        const bool low_stop = !strcmp(mode, "volume_low_stop") &&
+            byte == 0x09 && !volume_fault_injected;
+        if (fatal_stop || low_stop) volume_fault_injected = true;
+        mode = low_stop ? "low_timing" : fatal_stop ? "line_fault" :
             (((byte == 0xE9 || byte == 0xF9) && warn_start) || (byte == 0x09 && warn_stop))
                 ? "warn_valid" : "valid";
     }
@@ -122,6 +124,11 @@ int xs8_gpio_send(struct xs8_gpio *bus, uint8_t byte, int64_t *start)
     if (now < floor_ns) { clock_advance += floor_ns - now; now = floor_ns; }
     *start = (int64_t)now;
     uint64_t end = frame(now, byte);
+    if (!strcmp(mode, "low_timing")) {
+        uint64_t shift = pending[first + 3].timestamp - pending[first + 2].timestamp - 2000000;
+        for (size_t i = first + 3; i < queued; ++i) pending[i].timestamp -= shift;
+        end -= shift;
+    }
     bool outside = strstr(mode, "outside") != NULL;
     if (strstr(mode, "two") || strstr(mode, "malformed") || outside)
         end = frame(end + 3000000, outside ? 0x41 : byte);

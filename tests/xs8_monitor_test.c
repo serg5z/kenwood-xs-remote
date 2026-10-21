@@ -112,6 +112,7 @@ static int saved_stderr = -1;
 static void setup(int busy_level, int data_level)
 {
     assert(unsetenv("XS8_GLOBAL_GAP_POLICY") == 0);
+    assert(unsetenv("XS8_FAILURE_SNAPSHOTS") == 0);
     memset(&fake, 0, sizeof(fake));
     assert(pipe(fake.pipe) == 0);
     fake.levels[BUSY] = busy_level;
@@ -132,7 +133,7 @@ static char *teardown(void)
     fflush(stderr);
     assert(dup2(saved_stderr, STDERR_FILENO) >= 0);
     close(saved_stderr);
-    static char text[8192];
+    static char text[65536];
     rewind(log_file);
     size_t n = fread(text, 1, sizeof(text) - 1, log_file);
     text[n] = '\0';
@@ -146,7 +147,7 @@ static char *teardown(void)
 /* What has been logged so far, read without moving the shared file offset. */
 static const char *logged_so_far(void)
 {
-    static char text[8192];
+    static char text[65536];
     fflush(stderr);
     ssize_t n = pread(fileno(log_file), text, sizeof(text) - 1, 0);
     assert(n >= 0);
@@ -897,8 +898,287 @@ static void test_csv_replay(const char *path, bool warn)
     assert(sequence_matches);
 }
 
+/* Replay the first shutdown failure block. Never reconstruct lost history or
+ * renumber captured events. --split changes read batches only, not edge order.
+ * Records after decision_event are diagnostic context, not inputs to that
+ * original verification decision. */
+static int replay_failure_log(const char *path, unsigned int split)
+{
+    FILE *input = fopen(path, "r");
+    if (!input) { perror(path); return 2; }
+    char text[1024], rejection[64];
+    uint64_t id, start, end, checkpoint, decision, first, last;
+    unsigned int byte, busy_low;
+    bool warn = false;
+    bool found = false;
+    struct csv_edge rows[2048];
+    size_t count = 0;
+    while (fgets(text, sizeof(text), input)) {
+        if (!found) {
+            if (strncmp(text, "XS8_FAILURE_BEGIN ", 18)) continue;
+            if (sscanf(text, "XS8_FAILURE_BEGIN id=%" SCNu64 " byte=0x%x start_ns=%" SCNu64
+                       " end_ns=%" SCNu64 " checkpoint=%" SCNu64 " decision_event=%" SCNu64
+                       " rejection=%63s raw_first=%" SCNu64 " raw_last=%" SCNu64
+                       " initial_busy_low=%u", &id, &byte, &start, &end, &checkpoint,
+                       &decision, rejection, &first, &last, &busy_low) != 10 ||
+                first != 1 || last < decision || decision > 2048 || byte > 255 || busy_low > 1) {
+                fprintf(stderr, "Failure replay requires complete history from monitor start; "
+                        "overwritten/invalid metadata cannot be reconstructed.\n");
+                fclose(input); return 2;
+            }
+            if (!strstr(text, " policy=strict ") && !strstr(text, " policy=warn ")) {
+                fclose(input); return 2;
+            }
+            warn = strstr(text, " policy=warn ") != NULL;
+            found = true;
+            continue;
+        }
+        if (!strncmp(text, "XS8_FAILURE_END ", 16)) break;
+        if (strncmp(text, "XS8_RAW,", 8)) continue;
+        uint64_t serial;
+        struct csv_edge r = {0};
+        char polarity[8];
+        if (sscanf(text, "XS8_RAW,%" SCNu64 ",%" SCNu64 ",%u,%7[^,],%lu,%lu,%" SCNu64
+                   ",%u,%u,", &serial, &r.event.timestamp_ns, &r.event.offset, polarity,
+                   &r.event.global_seqno, &r.event.line_seqno, &r.batch,
+                   &r.batch_index, &r.batch_size) != 9) {
+            fclose(input); return 2;
+        }
+        if (serial > decision) continue;
+        if (serial != count + 1 || count == 2048 || !r.batch_size || r.batch_size > 128 ||
+            r.batch_index >= r.batch_size ||
+            (strcmp(polarity, "rising") && strcmp(polarity, "falling"))) {
+            fclose(input); return 2;
+        }
+        r.event.type = !strcmp(polarity, "rising") ? GPIOD_EDGE_EVENT_RISING_EDGE
+                                                  : GPIOD_EDGE_EVENT_FALLING_EDGE;
+        rows[count++] = r;
+    }
+    fclose(input);
+    if (!found || !count || count != decision) return 2;
+    setup(!busy_low, 0);
+    if (warn) assert(setenv("XS8_GLOBAL_GAP_POLICY", "warn", 1) == 0);
+    assert(setenv("XS8_FAILURE_SNAPSHOTS", "1", 1) == 0);
+    struct xs8_monitor *monitor = NULL;
+    assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
+    for (size_t i = 0; i < count;) {
+        size_t n = split ? split : rows[i].batch_size;
+        if (n > count - i) n = count - i;
+        struct gpiod_edge_event events[128];
+        if (!split && (rows[i].batch_index || n != rows[i].batch_size)) {
+            xs8_monitor_stop(monitor); teardown(); return 2;
+        }
+        for (size_t j = 0; j < n; ++j) {
+            if (!split && (rows[i+j].batch != rows[i].batch || rows[i+j].batch_index != j ||
+                            rows[i+j].batch_size != n)) {
+                xs8_monitor_stop(monitor); teardown(); return 2;
+            }
+            events[j] = rows[i+j].event;
+        }
+        queue(events, n);
+        assert(xs8_monitor_poll(monitor, 0) == 0);
+        i += n;
+    }
+    enum xs8_observation result = xs8_monitor_verify_tx(monitor, checkpoint,
+                                                       (uint8_t)byte, start, end, 1);
+    xs8_monitor_stop(monitor);
+    const char *log = teardown();
+    char expected[96];
+    snprintf(expected, sizeof(expected), "rejection=%s ", rejection);
+    bool reproduced = result == XS8_OBS_INVALID && strstr(log, expected);
+    printf("failure_replay byte=0x%02X events=%zu split=%u rejection=%s result=%s\n",
+           byte, count, split, rejection, reproduced ? "REPRODUCED" : "DIFFERENT");
+    return reproduced ? 0 : 1;
+}
+
+static void test_failure_snapshots(void)
+{
+    const char *reasons[] = {"LOW_TIMING", "TRUNCATED", "NONE", "NONE"};
+    const char *rejects[] = {"DECODE_INVALID", "DECODE_INVALID", "MULTIPLE_CANDIDATES",
+                             "LOCAL_TAIL_INVALID"};
+    for (unsigned int variant = 0; variant < 4; ++variant) {
+        for (unsigned int enabled = 0; enabled < 2; ++enabled) {
+            struct gpiod_edge_event events[40];
+            size_t n = frame_trace(events, 0x09);
+            if (variant == 0) {
+                uint64_t shift = events[3].timestamp_ns - events[2].timestamp_ns - 2000000;
+                for (size_t i = 3; i < n; ++i) events[i].timestamp_ns -= shift;
+            } else if (variant == 1) {
+                /* Remove final bit's DATA rise and final DATA fall; BUSY closes
+                 * an otherwise error-free 7-bit frame. Dense counters. */
+                events[17] = events[19]; n = 18;
+            } else if (variant == 3) {
+                events[19].timestamp_ns = events[18].timestamp_ns + 2500000;
+            } else {
+                assert(frame_trace(events + 20, 0x09) == 20);
+                uint64_t shift = events[19].timestamp_ns - events[20].timestamp_ns + 2000000;
+                for (size_t i = 20; i < 40; ++i) events[i].timestamp_ns += shift;
+                n = 40;
+            }
+            number_trace(events, n);
+            setup(0, 0);
+            if (enabled) assert(setenv("XS8_FAILURE_SNAPSHOTS", "1", 1) == 0);
+            if (variant == 0) {
+                assert(setenv("XS8_GLOBAL_GAP_POLICY", "warn", 1) == 0);
+                for (size_t i = 2; i < n; ++i) events[i].global_seqno += 1;
+            }
+            struct xs8_monitor *monitor = NULL;
+            assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
+            queue(events, n);
+            enum xs8_observation result = xs8_monitor_verify_tx(monitor, 0, 0x09,
+                events[0].timestamp_ns, events[n - 1].timestamp_ns, 1);
+            assert(result == XS8_OBS_INVALID && xs8_monitor_healthy(monitor));
+            assert(!strstr(logged_so_far(), "XS8_FAILURE_BEGIN")); /* No failure-path I/O. */
+            xs8_monitor_stop(monitor);
+            const char *log = teardown();
+            if (!enabled) { assert(!strstr(log, "XS8_RAW,")); continue; }
+            assert(strstr(log, rejects[variant]) && strstr(log, reasons[variant]));
+            if (variant == 0) assert(strstr(log, ",2000000,3000000,12000000,LOW_TIMING,"));
+            if (variant == 1) assert(strstr(log, ",NONE,TRUNCATED"));
+            if (variant == 3) assert(strstr(log, ",2500000,1,2000000,NONE,NONE,1"));
+            assert(count_of(log, "XS8_RAW,") == (int)n);
+            assert(strstr(log, "overwritten_events=0 overwritten_snapshots=0"));
+            char name[] = "/tmp/xs8-failure-replay-XXXXXX";
+            int fd = mkstemp(name);
+            assert(fd >= 0);
+            FILE *output = fdopen(fd, "w");
+            assert(output && fputs(log, output) >= 0 && fclose(output) == 0);
+            const unsigned int splits[] = {0, 1, 7, 128};
+            for (size_t i = 0; i < sizeof(splits)/sizeof(splits[0]); ++i)
+                assert(replay_failure_log(name, splits[i]) == 0);
+            assert(unlink(name) == 0);
+        }
+    }
+}
+
+static void test_failure_retained_after_match(void)
+{
+    struct gpiod_edge_event events[40];
+    assert(frame_trace(events, 0x09) == 20);
+    uint64_t shift = events[3].timestamp_ns - events[2].timestamp_ns - 2000000;
+    for (size_t i = 3; i < 20; ++i) events[i].timestamp_ns -= shift;
+    assert(frame_trace(events + 20, 0x09) == 20);
+    shift = events[19].timestamp_ns - events[20].timestamp_ns + 2000000;
+    for (size_t i = 20; i < 40; ++i) events[i].timestamp_ns += shift;
+    number_trace(events, 40);
+    setup(0, 0);
+    assert(setenv("XS8_FAILURE_SNAPSHOTS", "1", 1) == 0);
+    struct xs8_monitor *monitor = NULL;
+    assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
+    queue(events, 20);
+    assert(xs8_monitor_verify_tx(monitor, 0, 0x09, events[0].timestamp_ns,
+                                events[19].timestamp_ns, 1) == XS8_OBS_INVALID);
+    uint64_t checkpoint = xs8_monitor_checkpoint(monitor);
+    queue(events + 20, 20);
+    assert(xs8_monitor_verify_tx(monitor, checkpoint, 0x09, events[20].timestamp_ns,
+                                events[39].timestamp_ns, 1) == XS8_OBS_MATCH);
+    assert(!strstr(logged_so_far(), "XS8_FAILURE_BEGIN"));
+    xs8_monitor_stop(monitor);
+    const char *log = teardown();
+    assert(count_of(log, "XS8_FAILURE_BEGIN") == 1);
+    assert(strstr(log, "rejection=DECODE_INVALID"));
+    assert(strstr(log, "decision_event=20") && strstr(log, "raw_last=40"));
+    assert(strstr(log, "post_margin_reached=1"));
+}
+
+static void test_failure_history_bounds(void)
+{
+    setup(0, 0);
+    assert(setenv("XS8_FAILURE_SNAPSHOTS", "1", 1) == 0);
+    struct xs8_monitor *monitor = NULL;
+    assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
+    for (unsigned int i = 0; i < 110; ++i) {
+        struct gpiod_edge_event events[20];
+        assert(frame_trace(events, 0x09) == 20);
+        uint64_t shift = events[3].timestamp_ns - events[2].timestamp_ns - 2000000;
+        for (size_t j = 3; j < 20; ++j) events[j].timestamp_ns -= shift;
+        for (size_t j = 0; j < 20; ++j) {
+            events[j].timestamp_ns += (uint64_t)i * 200000000;
+            events[j].global_seqno += i * 20;
+            events[j].line_seqno += i * (events[j].offset == BUSY ? 2 : 18);
+        }
+        uint64_t checkpoint = xs8_monitor_checkpoint(monitor);
+        queue(events, 20);
+        assert(xs8_monitor_verify_tx(monitor, checkpoint, 0x09, events[0].timestamp_ns,
+                                    events[19].timestamp_ns, 1) == XS8_OBS_INVALID);
+    }
+    assert(xs8_monitor_healthy(monitor));
+    assert(!strstr(logged_so_far(), "XS8_FAILURE_BEGIN"));
+    xs8_monitor_stop(monitor);
+    const char *log = teardown();
+    assert(strstr(log, "overwritten_events=152 overwritten_snapshots=94"));
+    assert(strstr(log, "raw_first=153"));
+    char name[] = "/tmp/xs8-truncated-history-XXXXXX";
+    int fd = mkstemp(name);
+    FILE *output = fdopen(fd, "w");
+    assert(output && fputs(log, output) >= 0 && fclose(output) == 0);
+    assert(replay_failure_log(name, 0) == 2);
+    assert(unlink(name) == 0);
+}
+
+static int benchmark_snapshots(void)
+{
+    for (unsigned int enabled = 0; enabled < 2; ++enabled) {
+        setup(0, 0);
+        if (enabled) assert(setenv("XS8_FAILURE_SNAPSHOTS", "1", 1) == 0);
+        struct xs8_monitor *monitor = NULL;
+        assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
+        struct timespec begin, finish;
+        assert(clock_gettime(CLOCK_MONOTONIC, &begin) == 0);
+        for (unsigned int i = 0; i < 10000; ++i) {
+            struct gpiod_edge_event events[20];
+            assert(frame_trace(events, 0x09) == 20);
+            for (size_t j = 0; j < 20; ++j) {
+                events[j].timestamp_ns += (uint64_t)i * 200000000;
+                events[j].global_seqno += i * 20;
+                events[j].line_seqno += i * (events[j].offset == BUSY ? 2 : 18);
+            }
+            queue(events, 20);
+            assert(xs8_monitor_poll(monitor, 0) == 0);
+        }
+        assert(clock_gettime(CLOCK_MONOTONIC, &finish) == 0);
+        int64_t ns = (finish.tv_sec - begin.tv_sec) * 1000000000LL +
+                     finish.tv_nsec - begin.tv_nsec;
+        xs8_monitor_stop(monitor);
+        const char *log = teardown();
+        printf("snapshot_benchmark enabled=%u events=200000 elapsed_ns=%" PRId64
+               " ns_per_event=%.2f\n", enabled, ns, (double)ns / 200000);
+        const char *memory = strstr(log, "XS8 failure snapshots enabled");
+        if (memory) printf("%.*s\n", (int)strcspn(memory, "\n"), memory);
+    }
+    return 0;
+}
+
+static int example_failure(void)
+{
+    struct gpiod_edge_event events[20];
+    assert(frame_trace(events, 0x09) == 20);
+    uint64_t shift = events[3].timestamp_ns - events[2].timestamp_ns - 2000000;
+    for (size_t i = 3; i < 20; ++i) events[i].timestamp_ns -= shift;
+    setup(0, 0);
+    assert(setenv("XS8_FAILURE_SNAPSHOTS", "1", 1) == 0);
+    struct xs8_monitor *monitor = NULL;
+    assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
+    queue(events, 20);
+    assert(xs8_monitor_verify_tx(monitor, 0, 0x09, events[0].timestamp_ns,
+                                events[19].timestamp_ns, 1) == XS8_OBS_INVALID);
+    xs8_monitor_stop(monitor);
+    puts(teardown());
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--example-failure")) return example_failure();
+    if (argc == 2 && !strcmp(argv[1], "--benchmark-snapshots")) return benchmark_snapshots();
+    if (argc == 3 && !strcmp(argv[1], "--replay-failure"))
+        return replay_failure_log(argv[2], 0);
+    if (argc == 5 && !strcmp(argv[1], "--replay-failure") && !strcmp(argv[3], "--split")) {
+        char *end;
+        unsigned long split = strtoul(argv[4], &end, 10);
+        if (!*argv[4] || *end || split < 1 || split > 128) return 2;
+        return replay_failure_log(argv[2], (unsigned int)split);
+    }
     if (argc != 1) {
         if (argc != 5 || strcmp(argv[1], "--replay-csv") || strcmp(argv[3], "--policy") ||
             (strcmp(argv[4], "strict") && strcmp(argv[4], "warn"))) {
@@ -908,6 +1188,9 @@ int main(int argc, char **argv)
         test_csv_replay(argv[2], !strcmp(argv[4], "warn"));
         return 0;
     }
+    test_failure_snapshots();
+    test_failure_retained_after_match();
+    test_failure_history_bounds();
     test_arming_logs_levels_and_clean_events_stay_healthy();
     test_cold_boot_gap_fails_closed_and_logs_once();
     test_sequence_regression_across_batches();

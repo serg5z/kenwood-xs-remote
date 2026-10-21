@@ -50,3 +50,10 @@ The default monitor test and `make test` include both H12 policy checks.
 Four correctly decoded observed frames, valid tails and HEALTHY capture do not
 constitute receiver acknowledgments, actual service-window attribution or STOP
 execution confirmation. No transmitter start/end log was supplied to this test.
+
+## Failure snapshot replay
+
+The same offline monitor harness also accepts diagnostic failure logs and can
+vary read-batch splits without renumbering edges. See
+[waveform failure snapshots](../../docs/xs8-failure-snapshots.md#offline-replay-and-tests).
+This does not change the H12 fixture or its expected UP sequence.
