@@ -18,12 +18,15 @@ struct gpiod_edge_event {
     enum gpiod_edge_event_type edge;
 };
 struct gpiod_edge_event_buffer { struct gpiod_edge_event events[128]; size_t count; };
-static struct gpiod_edge_event pending[80];
+/* A failed monitor stops draining, but owed STOP cleanup must still be able
+ * to transmit. Retain its unread synthetic edges, like the kernel FIFO. */
+static struct gpiod_edge_event pending[256];
 static size_t queued, consumed;
 static int fds[2];
 static uint64_t global, lines[2], floor_ns;
 static int64_t clock_advance;
 static unsigned int attempts;
+static bool volume_fault_injected;
 static char request;
 
 int64_t xs8_gpio_now_ns(void)
@@ -77,7 +80,7 @@ int gpiod_line_request_read_edge_events(struct gpiod_line_request *r,
 }
 static void append(uint64_t t, unsigned int gpio, bool high)
 {
-    assert(queued < 80);
+    assert(queued < sizeof(pending) / sizeof(pending[0]));
     pending[queued++] = (struct gpiod_edge_event){.timestamp = t, .gpio = gpio,
         .edge = high ? GPIOD_EDGE_EVENT_RISING_EDGE : GPIOD_EDGE_EVENT_FALLING_EDGE};
 }
@@ -96,11 +99,25 @@ static uint64_t frame(uint64_t t, uint8_t byte)
 int xs8_gpio_send(struct xs8_gpio *bus, uint8_t byte, int64_t *start)
 {
     (void)bus;
-    assert(consumed == queued);
-    queued = consumed = 0;
+    memmove(pending, pending + consumed, (queued - consumed) * sizeof(pending[0]));
+    queued -= consumed;
+    consumed = 0;
+    const size_t first = queued;
     const char *mode = getenv("XS8_MONITOR_TEST_TRACE");
     if (!mode) mode = "valid";
     if (++attempts > 1 && !strcmp(mode, "warn_once")) mode = "valid";
+    if (!strncmp(mode, "volume_", 7)) {
+        const bool warn_start = !strcmp(mode, "volume_warn_start") ||
+            !strcmp(mode, "volume_warn_both") || !strcmp(mode, "volume_fatal_stop");
+        const bool warn_stop = !strcmp(mode, "volume_warn_stop") ||
+            !strcmp(mode, "volume_warn_both");
+        const bool fatal_stop = !strcmp(mode, "volume_fatal_stop") &&
+            byte == 0x09 && !volume_fault_injected;
+        if (fatal_stop) volume_fault_injected = true;
+        mode = fatal_stop ? "line_fault" :
+            (((byte == 0xE9 || byte == 0xF9) && warn_start) || (byte == 0x09 && warn_stop))
+                ? "warn_valid" : "valid";
+    }
     uint64_t now = (uint64_t)xs8_gpio_now_ns();
     if (now < floor_ns) { clock_advance += floor_ns - now; now = floor_ns; }
     *start = (int64_t)now;
@@ -116,17 +133,18 @@ int xs8_gpio_send(struct xs8_gpio *bus, uint8_t byte, int64_t *start)
     if (strstr(mode, "malformed")) pending[38].timestamp = pending[37].timestamp + 1000000;
     if (strstr(mode, "missing_tail")) { pending[18] = pending[19]; --queued; }
     uint64_t completion = outside ? pending[19].timestamp + 1 : end + 1;
-    for (size_t i = 0; i < queued; ++i) {
-        if ((!strncmp(mode, "warn_", 5) && i == 2) ||
-            (strstr(mode, "outside_warning") && i == 22)) global += 2;
+    for (size_t i = first; i < queued; ++i) {
+        if ((!strncmp(mode, "warn_", 5) && i == first + 2) ||
+            (strstr(mode, "outside_warning") && i == first + 22)) global += 2;
         unsigned int line = pending[i].gpio == BUSY ? 0 : 1;
-        if (strstr(mode, "line_fault") && i == 18) ++lines[line];
+        if (strstr(mode, "line_fault") && i == first + 18) ++lines[line];
         pending[i].global = ++global;
         pending[i].line = ++lines[line];
     }
     floor_ns = pending[queued - 1].timestamp + 1000000;
     clock_advance += completion - now;
-    for (size_t i = 0; i < (queued + 19) / 20; ++i) assert(write(fds[1], "x", 1) == 1);
+    for (size_t i = 0; i < (queued - first + 19) / 20; ++i)
+        assert(write(fds[1], "x", 1) == 1);
     fprintf(stderr, "FAKE_TX 0x%02X trace=%s\n", byte, mode);
     return 0;
 }

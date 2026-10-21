@@ -1,6 +1,8 @@
 """Real service/monitor/decoder/verifier with synthetic GPIO, never hardware."""
+from itertools import product
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import tempfile
@@ -11,7 +13,7 @@ import xs8_gateway
 
 
 class RealMonitorServiceTest(unittest.TestCase):
-    def run_trace(self, trace, policy="strict", second=False):
+    def run_trace(self, trace, policy="strict", second=False, command="SELECT_SOURCE CD"):
         with tempfile.TemporaryDirectory(prefix="xs8-real-monitor-", dir="/tmp") as tmp:
             path = str(pathlib.Path(tmp) / "service.sock")
             log_path = pathlib.Path(tmp) / "service.log"
@@ -41,11 +43,12 @@ class RealMonitorServiceTest(unittest.TestCase):
                                 result += data
                             return result.decode().strip()
 
-                    reply = request("SELECT_SOURCE CD")
+                    reply = request(command)
                     status = request("STATUS")
                     parsed = xs8_gateway.read_status(path)
                     self.assertIn("global_gap_policy", parsed)
-                    again = request("SELECT_SOURCE TUNER") if second else None
+                    again = request(second if isinstance(second, str) else
+                                    "SELECT_SOURCE TUNER") if second else None
                     if second and again.startswith("OK"):
                         status = request("STATUS")
                 finally:
@@ -116,6 +119,100 @@ class RealMonitorServiceTest(unittest.TestCase):
         reply, status, _, _ = self.run_trace("warn_valid")
         self.assertIn("waveform=NOT_OBSERVED", reply)
         self.assertEqual(status["monitor"], "FAILED")
+
+    def test_mute_transaction_and_warning_confidence(self):
+        for trace, policy, warnings in (("valid", "strict", 0),
+                                        ("warn_once", "warn", 1),
+                                        ("warn_valid", "warn", 3)):
+            with self.subTest(trace=trace, policy=policy):
+                reply, status, _, log = self.run_trace(trace, policy, command="MUTE")
+                self.assertEqual(reply, "OK MUTE_TX")
+                self.assertEqual(re.findall(r"FAKE_TX (0x[0-9A-F]{2})", log),
+                                 ["0x17", "0xD8", "0x07"])
+                for key, value in {"state": "IDLE", "monitor": "HEALTHY",
+                                   "stop_owed": "0", "context_may_be_open": "0",
+                                   "last_byte": "0x07", "last_gpio_tx": "TX_OK",
+                                   "last_waveform": "MATCH",
+                                   "global_gap_warnings": str(warnings),
+                                   "capture_integrity": "WARN_GLOBAL_GAP" if warnings else "NO_KNOWN_GAPS",
+                                   "receiver_integrity": "UNCERTAIN" if warnings else "HEALTHY",
+                                   "receiver_execution": "UNVERIFIED"}.items():
+                    self.assertEqual(status[key], value, key)
+                self.assertIn("XS8 ROOT result=TX_OK retries=0", log)
+                self.assertNotIn("state=FAULT_LATCHED", log)
+
+    def test_volume_start_and_stop_global_only_warnings(self):
+        for (direction, start), (trace, warnings) in product(
+                (("DOWN", "E9"), ("UP", "F9")),
+                (("volume_control", 0), ("volume_warn_start", 1),
+                 ("volume_warn_stop", 1), ("volume_warn_both", 2))):
+            with self.subTest(direction=direction, trace=trace):
+                reply, status, _, log = self.run_trace(
+                    trace, "warn", command=f"VOLUME_STEP {direction}")
+                self.assertEqual(reply, f"OK VOLUME_STEP_TX direction={direction} state=IDLE "
+                                 "stop_owed=0 context_may_be_open=0 "
+                                 "receiver_execution=UNVERIFIED")
+                self.assertEqual(re.findall(r"FAKE_TX (0x[0-9A-F]{2})", log),
+                                 ["0x17", f"0x{start}", "0x09", "0x07"])
+                self.assertIn(f"XS8 START direction={direction} result=TX_OK", log)
+                self.assertIn("XS8 STOP evidence gpio_tx=TX_OK waveform=MATCH", log)
+                self.assertIn("XS8 STOP reason=STEP result=TX_OK retries=0", log)
+                self.assertIn("XS8 ROOT result=TX_OK retries=0", log)
+                self.assertNotIn("state=FAULT_LATCHED", log)
+                for key, value in {"state": "IDLE", "stop_owed": "0",
+                                   "context_may_be_open": "0", "monitor": "HEALTHY",
+                                   "last_byte": "0x07", "last_waveform": "MATCH",
+                                   "last_stop_waveform": "MATCH",
+                                   "global_gap_warnings": str(warnings),
+                                   "last_tx_global_gap_warnings": "0",
+                                   "last_tx_capture_integrity": "NO_KNOWN_GAPS",
+                                   "receiver_execution": "UNVERIFIED"}.items():
+                    self.assertEqual(status[key], value, key)
+                self.assertEqual(status["capture_integrity"],
+                                 "WARN_GLOBAL_GAP" if warnings else "NO_KNOWN_GAPS")
+                self.assertEqual(status["receiver_integrity"],
+                                 "UNCERTAIN" if warnings else "HEALTHY")
+                self.assertEqual(log.count("WARNING reason=GLOBAL_ONLY_SEQUENCE_GAP"), warnings)
+                for byte, warned in ((start, "start" in trace or "both" in trace),
+                                     ("09", "stop" in trace or "both" in trace)):
+                    self.assertIn(f"FAKE_TX 0x{byte} trace=" +
+                                  ("warn_valid" if warned else "valid"), log)
+
+    def test_fatal_capture_fault_during_stop_after_verified_volume_start(self):
+        # Entry and START match (START has an exempt warning). A per-line fault
+        # in STOP fails the real monitor. Future GPIO sends still complete, but
+        # cannot be waveform-verified; STOP debt must survive, and ROOT is owed.
+        for (direction, start), command in product(
+                (("DOWN", "E9"), ("UP", "F9")),
+                ("VOLUME_STEP DOWN", "VOLUME_STEP UP", "MUTE", "SELECT_SOURCE TUNER")):
+            with self.subTest(direction=direction, subsequent=command):
+                reply, status, again, log = self.run_trace(
+                    "volume_fatal_stop", "warn", second=command,
+                    command=f"VOLUME_STEP {direction}")
+                self.assertEqual(reply, f"ERR VOLUME_STEP_UNCERTAIN direction={direction} "
+                                 "state=FAULT_LATCHED stop_owed=1 context_may_be_open=1 "
+                                 "receiver_execution=UNVERIFIED")
+                self.assertEqual(again, "ERR MONITOR_FAILED")
+                for key, value in {"state": "FAULT_LATCHED", "monitor": "FAILED",
+                                   "stop_owed": "1", "context_may_be_open": "1",
+                                   "last_stop_waveform": "NOT_OBSERVED",
+                                   "last_gpio_tx": "TX_OK",
+                                   "capture_integrity": "FAILED",
+                                   "last_tx_capture_integrity": "FAILED",
+                                   "global_gap_warnings": "1",
+                                   "receiver_integrity": "UNCERTAIN",
+                                   "receiver_execution": "UNVERIFIED"}.items():
+                    self.assertEqual(status[key], value, key)
+                self.assertIn(f"XS8 START direction={direction} result=TX_OK", log)
+                self.assertIn("monitor FAILED reason=LINE_SEQUENCE_GAP", log)
+                self.assertIn("XS8 STOP reason=STEP result=TX_FAIL retries=2", log)
+                self.assertIn("XS8 STOP evidence gpio_tx=TX_OK waveform=NOT_OBSERVED", log)
+                # Three STOPs in step cleanup, three in the one-shot monitor
+                # fault handler, then three at final orderly shutdown. STATUS
+                # and the rejected request must not create an unbounded retry.
+                self.assertEqual(re.findall(r"FAKE_TX (0x[0-9A-F]{2})", log),
+                                 ["0x17", f"0x{start}"] + ["0x09"] * 9)
+                self.assertNotIn("XS8 ROOT result=", log)
 
 
 if __name__ == "__main__":

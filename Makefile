@@ -87,6 +87,7 @@ test: $(BUILD_DIR)/xs8_sniff_gpio_test $(BUILD_DIR)/xs8_tx_replay_test $(BUILD_D
 	python3 -m unittest tests/test_xs8_repl.py
 	python3 -m unittest tests/test_xs8_service_socket.py
 	python3 -m unittest tests/test_xs8_service_monitor.py
+	python3 -m unittest tests/test_xs8_mute_validation_client.py
 
 $(BUILD_DIR)/xs8_decode_test: xs8_decode.c xs8_decode.h tests/xs8_decode_test.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -std=c11 -Werror -I. xs8_decode.c tests/xs8_decode_test.c -o $@
