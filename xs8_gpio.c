@@ -73,7 +73,7 @@ void xs8_gpio_close(struct xs8_gpio *bus)
     memset(bus, 0, sizeof(*bus));
 }
 
-int xs8_gpio_open(struct xs8_gpio *bus, bool capture)
+static int open_gpio(struct xs8_gpio *bus, bool capture, bool tx_only)
 {
     if (!bus) { errno = EINVAL; return -1; }
     memset(bus, 0, sizeof(*bus));
@@ -87,38 +87,41 @@ int xs8_gpio_open(struct xs8_gpio *bus, bool capture)
     bus->lock_ready = true;
     bus->chip = gpiod_chip_open(CHIP);
     out = gpiod_line_settings_new();
-    in = gpiod_line_settings_new();
+    if (!tx_only) in = gpiod_line_settings_new();
     tx_cfg = gpiod_line_config_new();
-    rx_cfg = gpiod_line_config_new();
+    if (!tx_only) rx_cfg = gpiod_line_config_new();
     if (capture) rx_req_cfg = gpiod_request_config_new();
-    if (!bus->chip || !out || !in || !tx_cfg || !rx_cfg ||
+    if (!bus->chip || !out || !tx_cfg || (!tx_only && (!in || !rx_cfg)) ||
         (capture && !rx_req_cfg)) goto fail;
 
     unsigned int outputs[] = {DATA_TX, BUSY_TX};
     unsigned int inputs[] = {BUSY_RX, DATA_RX};
     if (gpiod_line_settings_set_direction(out, GPIOD_LINE_DIRECTION_OUTPUT) < 0 ||
         gpiod_line_settings_set_output_value(out, GPIOD_LINE_VALUE_INACTIVE) < 0 ||
-        gpiod_line_settings_set_direction(in, GPIOD_LINE_DIRECTION_INPUT) < 0)
+        (!tx_only && gpiod_line_settings_set_direction(in, GPIOD_LINE_DIRECTION_INPUT) < 0))
         goto fail;
     if (capture &&
         (gpiod_line_settings_set_edge_detection(in, GPIOD_LINE_EDGE_BOTH) < 0 ||
          gpiod_line_settings_set_event_clock(in, GPIOD_LINE_CLOCK_MONOTONIC) < 0))
         goto fail;
     if (gpiod_line_config_add_line_settings(tx_cfg, outputs, 2, out) < 0 ||
-        gpiod_line_config_add_line_settings(rx_cfg, inputs,
-                                            capture ? 2 : 1, in) < 0)
+        (!tx_only && gpiod_line_config_add_line_settings(rx_cfg, inputs,
+                                            capture ? 2 : 1, in) < 0))
         goto fail;
     if (capture)
         gpiod_request_config_set_event_buffer_size(rx_req_cfg, 4096);
     bus->tx_req = gpiod_chip_request_lines(bus->chip, NULL, tx_cfg);
     if (!bus->tx_req) goto fail;
-    bus->rx_req = gpiod_chip_request_lines(bus->chip, rx_req_cfg, rx_cfg);
-    if (!bus->rx_req) goto fail;
+    if (!tx_only) {
+        bus->rx_req = gpiod_chip_request_lines(bus->chip, rx_req_cfg, rx_cfg);
+        if (!bus->rx_req) goto fail;
+    }
+    bus->tx_only = tx_only;
 
     if (rx_req_cfg) gpiod_request_config_free(rx_req_cfg);
-    gpiod_line_config_free(rx_cfg);
+    if (rx_cfg) gpiod_line_config_free(rx_cfg);
     gpiod_line_config_free(tx_cfg);
-    gpiod_line_settings_free(in);
+    if (in) gpiod_line_settings_free(in);
     gpiod_line_settings_free(out);
     bus->rt_priority = xs8_rt_parse_priority(getenv("XS8_RT_PRIORITY"));
     if (bus->rt_priority < 0) {
@@ -138,6 +141,27 @@ fail:
     xs8_gpio_close(bus);
     errno = saved_error;
     return -1;
+}
+
+int xs8_gpio_open(struct xs8_gpio *bus, bool capture)
+{
+    return open_gpio(bus, capture, false);
+}
+
+int xs8_gpio_open_tx_only(struct xs8_gpio *bus)
+{
+    return open_gpio(bus, false, true);
+}
+
+/* In diagnostic TX-only mode, retain a settling interval without claiming
+ * BUSY was sensed. Production paths always use wait_bus_free(). */
+static int wait_tx_only_settle(void)
+{
+    int64_t now = xs8_gpio_now_ns();
+    if (now < 0) return -1;
+    int error = xs8_gpio_wait_until(now + BUS_FREE_GUARD_US * 1000LL);
+    if (error) { errno = error; return -1; }
+    return 0;
 }
 
 static int wait_bus_free(struct xs8_gpio *bus)
@@ -194,9 +218,13 @@ int xs8_gpio_send(struct xs8_gpio *bus, uint8_t value, int64_t *tx_start_ns)
     bool frame_started = false;
     bool rt_enabled = false;
     struct xs8_rt_guard rt = {0};
-    if (!bus || !bus->tx_req || !bus->rx_req) { errno = EINVAL; return -1; }
+    if (!bus || !bus->tx_req || (!bus->rx_req && !bus->tx_only)) {
+        errno = EINVAL; return -1;
+    }
     if (tx_start_ns) *tx_start_ns = 0;
-    if (xs8_gpio_release(bus) < 0 || wait_bus_free(bus) < 0) goto fail;
+    if (xs8_gpio_release(bus) < 0 ||
+        (bus->tx_only ? wait_tx_only_settle() : wait_bus_free(bus)) < 0)
+        goto fail;
     int rt_result = xs8_rt_begin(&rt, bus->rt_priority, NULL);
     if (rt_result < 0)
         fprintf(stderr, "XS8 RT enable failed: %s; using normal "

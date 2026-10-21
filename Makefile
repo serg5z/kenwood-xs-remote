@@ -40,6 +40,13 @@ $(BUILD_DIR)/xs8_sniff: xs8_sniff.c xs8_sniff_diag.h | $(BUILD_DIR)
 $(BUILD_DIR)/xs8_sniff_test: tests/xs8_sniff_test.c xs8_sniff_diag.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -std=c11 -Werror -I. tests/xs8_sniff_test.c -o $@
 
+# Explicit diagnostic target; not part of the production all target.
+$(BUILD_DIR)/xs8_tx_replay: xs8_tx_replay.c xs8_tx_replay_core.h xs8_gpio.h $(BUILD_DIR)/xs8_gpio.o $(BUILD_DIR)/xs8_rt.o
+	$(CC) $(CFLAGS) -std=c11 -Werror xs8_tx_replay.c $(BUILD_DIR)/xs8_gpio.o $(BUILD_DIR)/xs8_rt.o -o $@ -pthread -lgpiod
+
+$(BUILD_DIR)/xs8_tx_replay_test: tests/xs8_tx_replay_test.c xs8_tx_replay_core.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -std=c11 -Werror -I. tests/xs8_tx_replay_test.c -o $@
+
 $(BUILD_DIR)/xs8_stimulus: xs8_stimulus.c xs8_stimulus_core.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -std=c11 xs8_stimulus.c -o $@ -lgpiod
 
@@ -52,7 +59,8 @@ $(BUILD_DIR)/xs8-service: xs8_service.cpp xs8_service_core.cpp xs8_service_core.
 $(BUILD_DIR)/volume_control_test: volume_control.cpp volume_control.h tests/volume_control_test.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -Werror -I. volume_control.cpp tests/volume_control_test.cpp -o $@
 
-test: $(BUILD_DIR)/xs8_service_monitor_test $(BUILD_DIR)/xs8_stimulus_test $(BUILD_DIR)/xs8_sniff_test $(BUILD_DIR)/volume_control_test $(BUILD_DIR)/xs8_decode_test $(BUILD_DIR)/xs8_monitor_fault_test $(BUILD_DIR)/xs8_monitor_test $(BUILD_DIR)/xs8_rt_test $(BUILD_DIR)/xs8_service_core_test $(BUILD_DIR)/xs8_query_status_test $(BUILD_DIR)/xs8_cd_probe_test $(BUILD_DIR)/xs8_receiver_state_test $(BUILD_DIR)/xs8_research_test $(BUILD_DIR)/cec_client_core_test $(BUILD_DIR)/cec_service_socket_test $(BUILD_DIR)/xs8_service_socket_test
+test: $(BUILD_DIR)/xs8_tx_replay_test $(BUILD_DIR)/xs8_service_monitor_test $(BUILD_DIR)/xs8_stimulus_test $(BUILD_DIR)/xs8_sniff_test $(BUILD_DIR)/volume_control_test $(BUILD_DIR)/xs8_decode_test $(BUILD_DIR)/xs8_monitor_fault_test $(BUILD_DIR)/xs8_monitor_test $(BUILD_DIR)/xs8_rt_test $(BUILD_DIR)/xs8_service_core_test $(BUILD_DIR)/xs8_query_status_test $(BUILD_DIR)/xs8_cd_probe_test $(BUILD_DIR)/xs8_receiver_state_test $(BUILD_DIR)/xs8_research_test $(BUILD_DIR)/cec_client_core_test $(BUILD_DIR)/cec_service_socket_test $(BUILD_DIR)/xs8_service_socket_test
+	./$(BUILD_DIR)/xs8_tx_replay_test
 	./$(BUILD_DIR)/xs8_sniff_test
 	./$(BUILD_DIR)/xs8_stimulus_test
 	./$(BUILD_DIR)/volume_control_test
