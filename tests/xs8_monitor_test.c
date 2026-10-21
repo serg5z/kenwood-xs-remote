@@ -5,6 +5,8 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -154,6 +156,8 @@ static const char *logged_so_far(void)
 
 static void queue(const struct gpiod_edge_event *events, size_t count)
 {
+    /* Streaming CSV replay drains one original batch before queuing the next. */
+    if (fake.next == fake.queued) fake.next = fake.queued = 0;
     assert(fake.queued < 8 && count <= 128);
     memcpy(fake.batches[fake.queued], events, count * sizeof(events[0]));
     fake.sizes[fake.queued++] = count;
@@ -743,8 +747,167 @@ static void test_tx_attribution_snapshot(void)
     }
 }
 
-int main(void)
+/* Real event-order capture replay, not synthesized timings or renumbered edges.
+ * Only this offline backend supplies levels: initial BUSY/DATA LOW is assumed
+ * for the idle disconnected fixture, not recorded as an electrical measurement.
+ * read_ns is retained as metadata; wall-clock scheduling is not reproduced. */
+struct csv_edge {
+    struct gpiod_edge_event event;
+    uint64_t batch, read_ns;
+    unsigned int batch_index, batch_size;
+};
+
+static void test_csv_replay(const char *path, bool warn)
 {
+    FILE *input = fopen(path, "r");
+    assert(input);
+    char line[512];
+    assert(fgets(line, sizeof(line), input));
+    assert(!strcmp(line, "timestamp_ns,gpio,edge,global_seqno,line_seqno,batch,"
+                         "batch_index,batch_size,read_ns,sequence_status\n"));
+    struct csv_edge rows[1024];
+    size_t count = 0, first_gap = SIZE_MAX;
+    unsigned int gaps = 0;
+    uint64_t previous_global = 0, previous_line[64] = {0};
+    while (fgets(line, sizeof(line), input)) {
+        assert(count < sizeof(rows) / sizeof(rows[0]));
+        struct csv_edge *r = &rows[count];
+        char polarity[8], annotation[32];
+        int used = 0;
+        assert(sscanf(line, "%" SCNu64 ",%u,%7[^,],%lu,%lu,%" SCNu64
+                           ",%u,%u,%" SCNu64 ",%31[^\r\n]%n",
+            &r->event.timestamp_ns, &r->event.offset, polarity,
+            &r->event.global_seqno, &r->event.line_seqno, &r->batch,
+            &r->batch_index, &r->batch_size, &r->read_ns, annotation, &used) == 10);
+        assert(strspn(line + used, "\r\n") == strlen(line + used));
+        assert(!strcmp(polarity, "rising") || !strcmp(polarity, "falling"));
+        r->event.type = !strcmp(polarity, "rising")
+            ? GPIOD_EDGE_EVENT_RISING_EDGE : GPIOD_EDGE_EVENT_FALLING_EDGE;
+        assert(r->event.offset == BUSY || r->event.offset == DATA);
+        assert(r->event.timestamp_ns <= INT64_MAX && r->read_ns >= r->event.timestamp_ns);
+        assert(r->event.global_seqno <= UINT32_MAX && r->event.line_seqno <= UINT32_MAX);
+        assert(r->event.global_seqno > previous_global);
+        if (r->event.global_seqno != previous_global + 1) {
+            if (first_gap == SIZE_MAX) first_gap = count;
+            ++gaps;
+        }
+        assert(r->event.line_seqno == previous_line[r->event.offset] + 1);
+        previous_line[r->event.offset] = r->event.line_seqno;
+        previous_global = r->event.global_seqno;
+        assert(!count || r->event.timestamp_ns >= rows[count - 1].event.timestamp_ns);
+        assert(r->batch_size > 0 && r->batch_size <= 128 && r->batch_index < r->batch_size);
+        ++count;
+    }
+    assert(!ferror(input));
+    fclose(input);
+    assert(count == 80 && gaps == 3 && first_gap == 6);
+    assert(previous_line[DATA] == 72 && previous_line[BUSY] == 8);
+
+    setup(0, 0);
+    if (warn) assert(setenv("XS8_GLOBAL_GAP_POLICY", "warn", 1) == 0);
+    struct xs8_monitor *monitor = NULL;
+    assert(xs8_monitor_start_manual(&bus, &monitor) == 0);
+    uint64_t cursor = xs8_monitor_checkpoint(monitor);
+    struct xs8_monitor_record decoded[16];
+    size_t decoded_count = 0, delivered = 0, batches = 0;
+    bool sequence_matches = true;
+    uint64_t last_batch = 0;
+    for (size_t i = 0; i < count;) {
+        const struct csv_edge *first = &rows[i];
+        size_t batch_size = first->batch_size;
+        assert(first->batch_index == 0 && first->batch > last_batch && i + batch_size <= count);
+        struct gpiod_edge_event events[128];
+        for (size_t j = 0; j < batch_size; ++j) {
+            const struct csv_edge *r = &rows[i + j];
+            assert(r->batch == first->batch && r->batch_index == j &&
+                   r->batch_size == batch_size && r->read_ns == first->read_ns);
+            events[j] = r->event; /* Preserve timestamp, GPIO, polarity and both counters. */
+        }
+        last_batch = first->batch;
+        queue(events, batch_size);
+        assert(xs8_monitor_poll(monitor, 0) == 0);
+        assert(fake.next == fake.queued);
+        i += batch_size;
+        delivered = i;
+        ++batches;
+        size_t copied = 0;
+        assert(decoded_count < 16);
+        assert(xs8_monitor_snapshot(monitor, &cursor, decoded + decoded_count,
+                                   16 - decoded_count, &copied) == 0);
+        decoded_count += copied;
+        if (!xs8_monitor_healthy(monitor)) {
+            assert(!warn && i - batch_size <= first_gap && i > first_gap);
+            assert(xs8_monitor_poll(monitor, 0) == -1 && errno == EIO);
+            break; /* Production manual mode stops consuming after the fatal batch. */
+        }
+    }
+    struct xs8_monitor_diagnostics info;
+    assert(xs8_monitor_get_diagnostics(monitor, &info));
+    if (warn) {
+        assert(info.healthy && info.global_gap_warnings == 3);
+        assert(delivered == count && decoded_count == 4);
+        /* Operator confirmed this captured experiment was UP, not DOWN. */
+        const uint8_t expected[] = {0x17, 0xF9, 0x09, 0x07};
+        uint64_t frame_warnings = 0;
+        for (size_t i = 0; i < decoded_count; ++i) {
+            const struct xs8_decoded *frame = &decoded[i].decoded;
+            frame_warnings += frame->global_gap_warnings;
+            printf("csv_frame policy=warn byte=0x%02X legacy=0x%02X start_ns=%" PRIu64
+                   " end_ns=%" PRIu64 " bits=%u global_warnings=%" PRIu64 "\n",
+                   frame->waveform_lsb, frame->legacy_msb_short1,
+                   frame->time_ns, decoded[i].end_ns, frame->bits, frame->global_gap_warnings);
+        }
+        fflush(stdout);
+        for (size_t i = 0; i < decoded_count; ++i) {
+            const struct xs8_decoded *frame = &decoded[i].decoded;
+            assert(frame->kind == XS8_FRAME && frame->valid && frame->bits == 8);
+            assert(!frame->reason);
+            if (frame->waveform_lsb != expected[i]) {
+                printf("csv_sequence_mismatch frame=%zu expected=0x%02X actual=0x%02X\n",
+                       i + 1, expected[i], frame->waveform_lsb);
+                sequence_matches = false;
+            }
+            assert(xs8_decoded_local_tx_tail_valid(frame));
+        }
+        assert(frame_warnings == 3);
+        struct xs8_monitor_record partial;
+        assert(!xs8_monitor_partial(monitor, rows[count - 1].read_ns, &partial));
+    } else {
+        assert(!info.healthy && info.global_gap_warnings == 0);
+        assert(delivered == first_gap + 1); /* This fixture has one event per batch. */
+        assert(xs8_monitor_verify_tx(monitor, 0, 0x17,
+            rows[0].event.timestamp_ns, rows[19].event.timestamp_ns, 1) == XS8_OBS_UNHEALTHY);
+    }
+    xs8_monitor_stop(monitor);
+    const char *log = teardown();
+    assert(count_of(log, "monitor FAILED") == (warn ? 0 : 1));
+    assert(count_of(log, "WARNING reason=GLOBAL_ONLY_SEQUENCE_GAP") == (warn ? 3 : 0));
+    if (warn) {
+        assert(!strstr(log, "status=INCOMPLETE"));
+        assert(strstr(log, "line_sequence_gaps=0 line_missing_events=0 line_sequence_regressions=0"));
+        assert(strstr(log, "global_sequence_gaps=3 missing_events=3"));
+    } else {
+        assert(strstr(log, "reason=SEQUENCE_GAP gpio=13 line=DATA expected_seqno=7 actual_seqno=8 line_seqno=6 event_index=7"));
+    }
+    printf("csv_replay policy=%s delivered=%zu/%zu batches=%zu health=%s global_warnings=%" PRIu64
+           " capture_fault=%s\n", warn ? "warn" : "strict", delivered, count, batches,
+           info.healthy ? "HEALTHY" : "FAILED", info.global_gap_warnings,
+           warn ? "NONE" : "SEQUENCE_GAP");
+    fflush(stdout);
+    assert(sequence_matches);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 1) {
+        if (argc != 5 || strcmp(argv[1], "--replay-csv") || strcmp(argv[3], "--policy") ||
+            (strcmp(argv[4], "strict") && strcmp(argv[4], "warn"))) {
+            fprintf(stderr, "Usage: %s [--replay-csv H12_CSV --policy strict|warn]\n", argv[0]);
+            return 2;
+        }
+        test_csv_replay(argv[2], !strcmp(argv[4], "warn"));
+        return 0;
+    }
     test_arming_logs_levels_and_clean_events_stay_healthy();
     test_cold_boot_gap_fails_closed_and_logs_once();
     test_sequence_regression_across_batches();
@@ -764,6 +927,8 @@ int main(void)
         test_frame_injection((enum injection)injection, false, true);
         test_frame_injection((enum injection)injection, true, true);
     }
+    test_csv_replay("tests/fixtures/h12-rx-replay.csv", false);
+    test_csv_replay("tests/fixtures/h12-rx-replay.csv", true);
     puts("xs8_monitor_test: OK");
     return 0;
 }
